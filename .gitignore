@@ -1,0 +1,9 @@
+*.o
+*.d
+robot_client
+map_cache/
+tools/send_order
+tools/place_obstacle
+tools/obstacle_zone
+logs/
+.run/
