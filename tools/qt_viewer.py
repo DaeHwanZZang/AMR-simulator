@@ -23,6 +23,7 @@ matplotlib 버전 대비 얻는 것
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,15 @@ ROBOT_PALETTE = [
 STALE_AFTER = 2.0          # 이 시간 동안 상태 보고가 없으면 흐리게
 EVENT_LOG_MAX_LINES = 14
 PATH_TICK_SPACING_PX = 14  # 경로선 눈금 간격 (화면 픽셀 아니라 scene 단위 — 아래 참고)
+
+# zone 타입별 색 — vendor zone_meta.json 을 그리는 용도 (표시 전용, 로봇 내비게이션엔
+# 관여 안 한다 — 그쪽은 fms_server 가 grid 에 구워서 각 로봇이 직접 받는다)
+ZONE_COLORS = {
+    "prohibit": QColor(255, 59, 48),   # 진입 금지 — 빨강
+    "slow": QColor(255, 159, 10),      # 감속 구역 — 주황
+    "oneway": QColor(10, 132, 255),    # 일방통행 — 파랑
+}
+ZONE_DEFAULT_COLOR = QColor(154, 160, 166)  # 모르는 타입 — 회색
 
 
 # -- 좌표 변환 ----------------------------------------------------------------
@@ -278,9 +288,13 @@ class MapCanvas(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#0b0b0d")))
         self.setMouseTracking(True)
 
+        self._show_zones = True
+        self._zone_items: list[QGraphicsPolygonItem] = []
+
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._build_map_layer()
+        self._build_zones()
         self._build_hud()
         self._fit_done = False
 
@@ -335,6 +349,48 @@ class MapCanvas(QGraphicsView):
         origin_item.setZValue(9)
         self._scene.addItem(origin_item)
 
+    def _build_zones(self) -> None:
+        """
+        `zone_meta.json` (벤더 원본, 맵 메타데이터와 같은 폴더) 을 읽어 다각형을
+        그린다. 좌표는 이미 world 프레임이다 (fms_server/mapkit/bake.py 가 origin
+        보정 없이 그대로 쓰는 것과 동일 — 검증됨). 파일이 없으면 조용히 건너뛴다.
+        **표시 전용** — 로봇 내비게이션(장애물 회피)은 이 파일을 안 보고, FMS 가
+        prohibit zone 을 grid 에 구워서 로봇에게 내려주는 별도 경로를 그대로 쓴다.
+        """
+        zone_path = self.map.base_dir / "zone_meta.json"
+        if not zone_path.is_file():
+            return
+        try:
+            data = json.loads(zone_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[zone] {zone_path} 읽기 실패, 건너뜀: {exc}")
+            return
+
+        m = self.map.metadata
+        for entry in data.get("zones", []):
+            polygon = entry.get("polygon") or []
+            if len(polygon) < 3:
+                continue
+            ztype = str(entry.get("type", "")).lower()
+            color = ZONE_COLORS.get(ztype, ZONE_DEFAULT_COLOR)
+
+            points = [world_to_scene(m, float(p[0]), float(p[1])) for p in polygon]
+            item = QGraphicsPolygonItem(QPolygonF(points))
+            fill = QColor(color)
+            fill.setAlpha(90)
+            item.setBrush(QBrush(fill))
+            pen = QPen(color)
+            pen.setWidthF(1.5)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            item.setZValue(2)  # 맵(0)/격자(1) 위, 로봇(3+) 아래
+            item.setToolTip(f"{entry.get('name', '')} ({ztype or 'unknown'})".strip())
+            self._scene.addItem(item)
+            self._zone_items.append(item)
+
+        if self._zone_items:
+            print(f"[zone] {zone_path.name} 에서 {len(self._zone_items)}개 zone 표시")
+
     def _refresh_map_pixmap(self) -> None:
         m = self.map.metadata
         if self._classified:
@@ -383,7 +439,10 @@ class MapCanvas(QGraphicsView):
         )
 
         self.legend_label = hud_label()
-        self.legend_label.setText("■ OCCUPIED   ■ UNKNOWN   ■ FREE")
+        legend = "■ OCCUPIED   ■ UNKNOWN   ■ FREE"
+        if self._zone_items:
+            legend += "     ▨ PROHIBIT   ▨ SLOW   ▨ ONEWAY  (z 토글)"
+        self.legend_label.setText(legend)
 
         self.event_label = hud_label()
         self.event_label.setText("")
@@ -563,6 +622,10 @@ class MapCanvas(QGraphicsView):
             self._refresh_map_pixmap()
         elif key == "t":
             self._show_planned_path = not self._show_planned_path
+        elif key == "z":
+            self._show_zones = not self._show_zones
+            for item in self._zone_items:
+                item.setVisible(self._show_zones)
         elif key == "r":
             self.reset_view()
         else:

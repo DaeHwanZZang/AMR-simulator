@@ -1,6 +1,6 @@
 {
   "name": "sample_map1",
-  "image": "edited_navi_gridmap.png",
+  "image": "grid.png",
   "resolution": 0.03125,
   "origin_x": -21.128462,
   "origin_y": -12.84741,
