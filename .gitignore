@@ -7,3 +7,6 @@ tools/place_obstacle
 tools/obstacle_zone
 logs/
 .run/
+
+# OS
+.DS_Store
