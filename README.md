@@ -1,8 +1,8 @@
 # AMR_client — 로봇 클라이언트 (C++)
 
-Python `robot_client` 의 1:1 C++ 재구현. 프로토콜(MQTT+JSON)이 언어 무관이라
-`MQTT_broker`, `AMR_viewer`, `fms_server` 와 그대로 섞어 쓴다. 이 폴더 하나만
-복사하면 독립적으로 빌드/실행된다 — `common/`, `maps/` 사본을 자체 보유.
+프로토콜(MQTT+JSON)이 언어 무관이라 `MQTT_broker`, `AMR_viewer`, `fms_server`
+와 그대로 섞어 쓴다. 이 폴더 하나만 복사하면 독립적으로 빌드/실행된다 —
+`common/`, `maps/` 사본을 자체 보유.
 
 ## 빌드
 
@@ -48,27 +48,21 @@ FMS 에 로봇이 등록돼 있으면, 접속 후 FMS 가 `fms/v1/{id}/instant` 
 
 Qt 는 메인스레드 전용이라 `--gui` 주면 tick/MQTT 루프를 백그라운드 스레드로
 보내고, `CommandQueue`(GUI→루프)와 `std::mutex`(공유 상태 읽기/쓰기)로 보호한다.
-Python 원본은 GIL 덕에 락이 필요 없었던 부분 — 유일하게 원본과 다르게 설계한 지점.
 
-## 알려진 차이
+## 구성
 
-- 난수 시드가 Python 과 값까지 같이 재현되진 않는다 (PRNG 알고리즘이 다름)
-- GUI 색/레이아웃은 원본을 따랐지만 위젯 여백은 Qt 기본값 기준 (픽셀 단위 동일 X)
-
-## 대응 관계 (Python → C++)
-
-| Python | C++ |
+| 영역 | 파일 |
 |---|---|
-| `common/schemas.py`, `map_model.py` | `include+src/schemas.*`, `map_model.*` |
-| `robot_client/{planner,executor,comm,clock}.py` | `include+src/{planner,executor,comm,clock}.*` |
-| `robot_client/sim/*.py` | `include+src/{kinematics,battery,dynamic_obstacles}.*` |
-| `robot_client/gui.py` (Tk) | `gui.hpp/cpp` (Qt Widgets) |
-| `tools/*.py` | `tools/*.cpp` |
-| (신규, Python 원본 없음) | `map_sync.hpp/cpp` — SET_MAP 번들 다운로더 |
+| 프로토콜/맵 계약 | `include+src/schemas.*`, `map_model.*` |
+| 경로계획/오더 실행/통신/시계 | `include+src/{planner,executor,comm,clock}.*` |
+| 물리 시뮬레이션 | `include+src/{kinematics,battery,dynamic_obstacles}.*` |
+| 로컬 제어판 | `gui.hpp/cpp` (Qt Widgets) |
+| CLI 도구 | `tools/*.cpp` |
+| SET_MAP 번들 다운로더 | `map_sync.hpp/cpp` |
 
-포팅 범위: MQTT(LWT/재접속), 오더 상태머신(released/order_update_id/거절 규칙),
+기능 범위: MQTT(LWT/재접속), 오더 상태머신(released/order_update_id/거절 규칙),
 4축 상태, e-stop/PAUSE, A* 경로계획, 사다리꼴 운동학, 배터리, 동적 장애물 회피,
-충돌 감지, 강제 재위치, Qt 로컬 제어판 — 전부 1:1.
+충돌 감지, 강제 재위치, Qt 로컬 제어판.
 
 
 ## known issue
