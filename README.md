@@ -6,10 +6,35 @@
 
 ## 빌드
 
+### macOS
+
 ```bash
-brew install mosquitto cjson qt     # macOS. Linux: apt install libmosquitto-dev libcjson-dev qt6-base-dev
+brew install mosquitto cjson qt
 make                                 # robot_client + tools/{send_order,place_obstacle,obstacle_zone}
 ```
+
+### Ubuntu (배포 타깃)
+
+```bash
+sudo apt install clang build-essential libmosquitto-dev libcjson-dev qt6-base-dev pkg-config jq curl unzip
+make
+```
+
+- `clang`/`build-essential`: `Makefile` 이 `CXX := clang++` 로 고정돼 있어 필요
+  (g++로 바꾸려면 `Makefile` 의 `CXX` 줄을 직접 수정 — 자동 분기 없음)
+- `libmosquitto-dev`/`libcjson-dev`: 브로커 패키지(`mosquitto`)나 런타임
+  라이브러리(`libmosquitto1`/`libcjson1`)만 깔려 있으면 헤더가 없어 `mosquitto.h`/
+  `cjson/cJSON.h` not found 로 빌드 실패한다
+- `qt6-base-dev`: `--gui` 제어판(Qt Widgets)용. 없으면
+  `QtWidgets/QApplication` not found
+- `pkg-config`: Linux 분기가 `pkg-config --cflags/--libs Qt6Widgets` 로 Qt
+  경로를 잡는 데 씀 (macOS 는 프레임워크라 불필요)
+- `jq`: 빌드엔 안 쓰지만 `launch.sh` 가 맵 폴더 안 메타데이터 json 자동탐지에
+  쓴다. 없으면 원인 설명 없이 "메타데이터 json 을 못 찾음" 만 뜬다
+- `curl`/`unzip`: 빌드엔 안 쓰지만 `map_sync.cpp` 가 SET_MAP 번들 다운로드에
+  fork+exec 로 호출. `unzip` 없으면 다운로드는 되는데 압축해제 단계서 조용히
+  실패 → Map Sync 상태 FAILED, `State.map_version` 계속 `None` 으로 보고돼
+  FMS 가 job dispatch 를 422(맵 버전 불일치)로 계속 거절한다
 
 cmake 없이 순수 Makefile (`Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux 분기).
 
