@@ -195,6 +195,17 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
     batteryBar->setTextVisible(false);
     infoLayout->addWidget(batteryBar);
 
+    auto* batteryBtnRow = new QHBoxLayout();
+    auto* battery100Btn = new QPushButton("Battery 100%");
+    auto* battery1Btn = new QPushButton("Battery 1%");
+    battery100Btn->setStyleSheet(QString("padding:4px;"));
+    battery1Btn->setStyleSheet(QString("padding:4px;"));
+    batteryBtnRow->addWidget(battery100Btn);
+    batteryBtnRow->addWidget(battery1Btn);
+    infoLayout->addLayout(batteryBtnRow);
+    QObject::connect(battery100Btn, &QPushButton::clicked, [&queue]() { queue.push(CmdSetBattery{100.0}); });
+    QObject::connect(battery1Btn, &QPushButton::clicked, [&queue]() { queue.push(CmdSetBattery{1.0}); });
+
     // -- 맵 동기화 (SET_MAP -> 번들 다운로드) --
     auto* mapBox = make_section(root, "  Map Sync  ");
     auto* mapLayout = new QVBoxLayout(mapBox);
@@ -232,6 +243,8 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
     QLineEdit* velEdit = labeled_entry(settingsLayout, "Max velocity (m/s)", QString::number(max_velocity, 'f', 3));
     QLineEdit* accelEdit =
         labeled_entry(settingsLayout, "Max acceleration (m/s\u00b2)", QString::number(max_acceleration, 'f', 3));
+    QLineEdit* sensorRangeEdit =
+        labeled_entry(settingsLayout, "Sensor range (m)", QString::number(executor.sensor_range, 'f', 2));
     auto* settingsBtnRow = new QHBoxLayout();
     settingsBtnRow->addStretch();
     auto* applyBtn = new QPushButton("Apply");
@@ -248,15 +261,17 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         auto length = parse_double(lengthEdit->text());
         auto vel = parse_double(velEdit->text());
         auto accel = parse_double(accelEdit->text());
+        auto sensorRange = parse_double(sensorRangeEdit->text());
         if (robot_id.empty()) {
             settingsStatus->setText("Robot ID cannot be empty");
             return;
         }
-        if (!width || *width <= 0 || !length || *length <= 0 || !vel || *vel <= 0 || !accel || *accel <= 0) {
-            settingsStatus->setText("Width/length/velocity/acceleration must be positive numbers");
+        if (!width || *width <= 0 || !length || *length <= 0 || !vel || *vel <= 0 || !accel || *accel <= 0 ||
+            !sensorRange || *sensorRange <= 0) {
+            settingsStatus->setText("Width/length/velocity/acceleration/sensor range must be positive numbers");
             return;
         }
-        queue.push(CmdConfigure{robot_id, *width, *length, *vel, *accel});
+        queue.push(CmdConfigure{robot_id, *width, *length, *vel, *accel, *sensorRange});
         settingsStatus->setText("Settings command sent");
     });
 
@@ -420,6 +435,7 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         lengthEdit->setEnabled(enabled);
         velEdit->setEnabled(enabled);
         accelEdit->setEnabled(enabled);
+        sensorRangeEdit->setEnabled(enabled);
         applyBtn->setEnabled(enabled);
         if (!enabled) settingsStatus->setText("Editable only when IDLE");
         else if (settingsStatus->text() == "Editable only when IDLE") settingsStatus->setText("");

@@ -83,8 +83,13 @@ std::string OrderExecutor::press_start() {
 }
 
 std::string OrderExecutor::press_stop() {
-    log::debug("[%s] stop button (no-op)", robot_id.c_str());
-    return "stop button has no function";
+    if (order_id_.empty()) {
+        log::debug("[%s] stop button: no active order", robot_id.c_str());
+        return "no active order";
+    }
+    log::info("[%s] stop button: cancelling order %s", robot_id.c_str(), order_id_.c_str());
+    clear_order();
+    return "order cancelled";
 }
 
 void OrderExecutor::set_estop(bool latched) {
@@ -358,6 +363,13 @@ void OrderExecutor::tick(double dt) {
             return;
         }
     }
+    nav_elapsed_ += dt;
+    if (nav_timeout_ > 0.0 && nav_elapsed_ > nav_timeout_) {
+        log::error("[%s] move timeout: %.1fs elapsed > %.1fs budget (3x estimate), cancelling order %s",
+                   robot_id.c_str(), nav_elapsed_, nav_timeout_, order_id_.c_str());
+        clear_order();
+        return;
+    }
     if (path_blocked_by(detected)) {
         auto kin_state = kinematics.hold(dt);
         battery.step(dt, kin_state.velocity);
@@ -502,6 +514,16 @@ void OrderExecutor::replan() {
         auto path = plan_segment_path();
         log::info("[%s] path planned: %zu waypoints", robot_id.c_str(), path.size());
         kinematics.set_path(path);
+
+        double length = 0.0;
+        double px = kinematics.x, py = kinematics.y;
+        for (auto& [x, y] : path) {
+            length += std::hypot(x - px, y - py);
+            px = x; py = y;
+        }
+        double estimated = kinematics.max_velocity > 0 ? length / kinematics.max_velocity : 0.0;
+        nav_timeout_ = estimated * 3.0;
+        nav_elapsed_ = 0.0;
     } catch (const PlanningError& e) {
         log::error("[%s] path planning failed: %s", robot_id.c_str(), e.what());
         segment_.clear();
@@ -605,6 +627,8 @@ void OrderExecutor::clear_order() {
     battery.charging = false;
     obstacle_blocked_total_ = 0.0;
     since_dynamic_replan_ = 0.0;
+    nav_timeout_ = 0.0;
+    nav_elapsed_ = 0.0;
     set_base(RobotState::IDLE);
 }
 

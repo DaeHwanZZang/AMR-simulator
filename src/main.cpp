@@ -3,6 +3,7 @@
 // 의 1:1 포팅, gui.cpp). Tk/Qt 둘 다 메인스레드에서 돌아야 하므로, --gui 일 때는
 // tick/MQTT 루프를 백그라운드 스레드로 보내고 메인 스레드가 Qt 이벤트루프를 돈다
 // (Python 쪽과 동일한 스레드 모델).
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
@@ -172,13 +173,18 @@ void dispatch_gui_command(OrderExecutor& exec, RobotComm& comm, MapSync& map_syn
                 exec.kinematics.max_acceleration = c.max_acceleration;
                 exec.kinematics.max_deceleration = c.max_acceleration;
                 exec.battery.max_velocity = c.max_velocity;
+                exec.sensor_range = c.sensor_range;
                 if (c.robot_id != exec.robot_id) {
                     comm.rebind_id(c.robot_id);
                     exec.robot_id = c.robot_id;
                 }
-                log::info("[%s] GUI settings applied: size=%.2fx%.2f max_velocity=%.3f max_acceleration=%.3f",
+                log::info("[%s] GUI settings applied: size=%.2fx%.2f max_velocity=%.3f max_acceleration=%.3f "
+                          "sensor_range=%.2f",
                           exec.robot_id.c_str(), exec.robot_width, exec.robot_length, c.max_velocity,
-                          c.max_acceleration);
+                          c.max_acceleration, c.sensor_range);
+            } else if constexpr (std::is_same_v<T, CmdSetBattery>) {
+                exec.battery.charge = std::max(0.0, std::min(100.0, c.charge));
+                log::info("[%s] GUI debug: battery set to %.0f%%", exec.robot_id.c_str(), exec.battery.charge);
             }
         },
         cmd);

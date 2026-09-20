@@ -22,12 +22,13 @@ struct CmdEstop { bool latched; };
 struct CmdMode { OperatingMode mode; };
 struct CmdConfigure {
     std::string robot_id;
-    double robot_width, robot_length, max_velocity, max_acceleration;
+    double robot_width, robot_length, max_velocity, max_acceleration, sensor_range;
 };
 struct CmdResyncMap {};  // 마지막 SET_MAP 을 다시 받는다 (다운로드 실패 복구용)
+struct CmdSetBattery { double charge; };  // GUI 디버그 버튼 (100% / 1%)
 
 using GuiCommand = std::variant<CmdMove, CmdRelocalize, CmdPressStart, CmdPressStop, CmdEstop, CmdMode,
-                                 CmdConfigure, CmdResyncMap>;
+                                 CmdConfigure, CmdResyncMap, CmdSetBattery>;
 
 class CommandQueue {
 public:
