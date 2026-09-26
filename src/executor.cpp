@@ -12,7 +12,6 @@ namespace fms {
 namespace {
 
 double _DYNAMIC_REPLAN_RETRY = 1.0;
-double _DYNAMIC_GIVE_UP_AFTER = 15.0;
 double _SENSOR_HYSTERESIS_MARGIN = 0.5;
 
 // Liang-Barsky: 선분 a->b 가 사각형 [rx0,rx1]x[ry0,ry1] 과 겹치는가.
@@ -363,32 +362,17 @@ void OrderExecutor::tick(double dt) {
             return;
         }
     }
-    nav_elapsed_ += dt;
-    if (nav_timeout_ > 0.0 && nav_elapsed_ > nav_timeout_) {
-        log::error("[%s] move timeout: %.1fs elapsed > %.1fs budget (3x estimate), cancelling order %s",
-                   robot_id.c_str(), nav_elapsed_, nav_timeout_, order_id_.c_str());
-        clear_order();
-        return;
-    }
     if (path_blocked_by(detected)) {
         auto kin_state = kinematics.hold(dt);
         battery.step(dt, kin_state.velocity);
         set_busy(BusySubState::WAITING);
-        obstacle_blocked_total_ += dt;
         since_dynamic_replan_ += dt;
         if (since_dynamic_replan_ >= _DYNAMIC_REPLAN_RETRY) {
             since_dynamic_replan_ = 0.0;
             try_dynamic_replan(detected);
         }
-        if (obstacle_blocked_total_ >= _DYNAMIC_GIVE_UP_AFTER) {
-            log::error("[%s] blocked by dynamic obstacle for over %.0fs, giving up", robot_id.c_str(), obstacle_blocked_total_);
-            ErrorInfo e; e.error_type = "NO_PATH"; e.level = ErrorLevel::FATAL;
-            e.description = "blocked by dynamic obstacle, could not find a detour";
-            raise_fatal(e);
-        }
         return;
     }
-    obstacle_blocked_total_ = 0.0;
     since_dynamic_replan_ = 0.0;
 
     double prev_x = kinematics.x, prev_y = kinematics.y;
@@ -514,16 +498,6 @@ void OrderExecutor::replan() {
         auto path = plan_segment_path();
         log::info("[%s] path planned: %zu waypoints", robot_id.c_str(), path.size());
         kinematics.set_path(path);
-
-        double length = 0.0;
-        double px = kinematics.x, py = kinematics.y;
-        for (auto& [x, y] : path) {
-            length += std::hypot(x - px, y - py);
-            px = x; py = y;
-        }
-        double estimated = kinematics.max_velocity > 0 ? length / kinematics.max_velocity : 0.0;
-        nav_timeout_ = estimated * 3.0;
-        nav_elapsed_ = 0.0;
     } catch (const PlanningError& e) {
         log::error("[%s] path planning failed: %s", robot_id.c_str(), e.what());
         segment_.clear();
@@ -625,10 +599,7 @@ void OrderExecutor::clear_order() {
     action_states_.clear();
     kinematics.set_path({});
     battery.charging = false;
-    obstacle_blocked_total_ = 0.0;
     since_dynamic_replan_ = 0.0;
-    nav_timeout_ = 0.0;
-    nav_elapsed_ = 0.0;
     set_base(RobotState::IDLE);
 }
 

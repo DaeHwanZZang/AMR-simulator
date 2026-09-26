@@ -101,15 +101,9 @@ private:
     double acting_elapsed_ = 0.0;
     std::vector<std::pair<std::string, ActionStatus>> action_states_;  // 삽입 순서 유지
 
-    double obstacle_blocked_total_ = 0.0;
     double since_dynamic_replan_ = 0.0;
     std::set<std::string> detected_obstacle_ids_;
     std::vector<DynamicObstacle> last_detected_;
-
-    // move 타임아웃: 세그먼트 계획 시 추정 소요시간(경로 길이 / max_velocity) 의
-    // 3배가 지나도 도착 못하면 오더를 취소한다. nav_timeout_ <= 0 이면 비활성.
-    double nav_timeout_ = 0.0;
-    double nav_elapsed_ = 0.0;
 
     void set_base(RobotState s) { base_state_ = s; sub_state_ = std::nullopt; }
     void set_busy(BusySubState sub) { base_state_ = RobotState::BUSY; sub_state_ = sub; }
