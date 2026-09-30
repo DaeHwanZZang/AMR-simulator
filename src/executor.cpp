@@ -446,6 +446,7 @@ void OrderExecutor::try_dynamic_replan(const std::vector<DynamicObstacle>& detec
     try {
         auto path = plan_segment_path(&obstacles);
         kinematics.set_path(path);
+        kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
         log::info("[%s] replanned around dynamic obstacle (%zu detected)", robot_id.c_str(), detected.size());
     } catch (const PlanningError& e) {
         log::debug("[%s] no detour around dynamic obstacle, keeping wait: %s", robot_id.c_str(), e.what());
@@ -498,6 +499,7 @@ void OrderExecutor::replan() {
         auto path = plan_segment_path();
         log::info("[%s] path planned: %zu waypoints", robot_id.c_str(), path.size());
         kinematics.set_path(path);
+        kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
     } catch (const PlanningError& e) {
         log::error("[%s] path planning failed: %s", robot_id.c_str(), e.what());
         segment_.clear();
