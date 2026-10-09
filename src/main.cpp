@@ -45,6 +45,7 @@ struct Args {
     double speed_noise = 0.05;
     std::string log_level = "INFO";
     bool gui = false;
+    bool path_refine = false;
 
     double sensor_range = 3.0;
     std::optional<Zone> obstacle_zone;
@@ -95,6 +96,7 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--speed-noise") a.speed_noise = std::stod(next(i));
         else if (k == "--log-level") a.log_level = next(i);
         else if (k == "--gui") a.gui = true;
+        else if (k == "--path-refine") a.path_refine = true;
         else if (k == "--sensor-range") a.sensor_range = std::stod(next(i));
         else if (k == "--obstacle-zone") a.obstacle_zone = parse_zone(next(i));
         else if (k == "--obstacle-sides") a.obstacle_sides = parse_sides(next(i));
@@ -111,6 +113,7 @@ bool parse_args(int argc, char** argv, Args& a) {
                 "  --map-cache DIR (SET_MAP 번들 저장 위치, 기본 map_cache)\n"
                 "  --robot-width --robot-length --max-velocity --max-acceleration --battery\n"
                 "  --seed N --speed-noise R --log-level LV --gui\n"
+                "  --path-refine (A* 경로를 PSO 로 다듬기, 기본 꺼짐)\n"
                 "  --sensor-range --obstacle-zone XMIN,YMIN,XMAX,YMAX --obstacle-sides E-X\n"
                 "  --obstacle-spawn-interval --obstacle-max-count --obstacle-width --obstacle-height\n"
                 "  --obstacle-speed --obstacle-seed\n";
@@ -237,6 +240,10 @@ int main(int argc, char** argv) {
     OrderExecutor executor(args.id, args.x, args.y, args.theta, max_velocity, args.max_acceleration,
                             battery, map_model ? &*map_model : nullptr, args.robot_width, args.robot_length,
                             std::move(obstacle_field), args.sensor_range);
+
+    executor.path_refine.enabled = args.path_refine;
+    executor.path_refine.seed = seed_from_string(args.seed ? (std::to_string(*args.seed) + "-" + args.id + "-refine")
+                                                           : (args.id + "-refine"));
 
     // SET_MAP 다운로더. 워커 스레드가 번들을 받아오면 robot_loop 가 회수해 executor.map 을 교체한다.
     MapSync map_sync(args.map_cache, args.id);

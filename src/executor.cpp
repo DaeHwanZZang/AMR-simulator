@@ -158,6 +158,7 @@ void OrderExecutor::resume_motion() {
 
 void OrderExecutor::set_map(const MapModel* new_map, std::string map_uid, std::string map_version) {
     map = new_map;
+    clearance_.reset();
     current_map_uid_ = std::move(map_uid);
     current_map_version_ = std::move(map_version);
     log::info("[%s] map switched: uid=%s version=%s", robot_id.c_str(), current_map_uid_.c_str(),
@@ -524,6 +525,11 @@ std::vector<std::pair<double, double>> OrderExecutor::plan_segment_path(
     std::pair<double, double> start = {kinematics.x, kinematics.y};
     for (auto& target : targets) {
         auto seg = plan_path(*map, start, target, robot_width, robot_length, dynamic_obstacles);
+        // 동적 장애물 회피 경로는 다듬지 않는다 (거리 장이 정적 맵 기준이라 장애물을 모름).
+        if (path_refine.enabled && !dynamic_obstacles && seg.size() >= 2) {
+            if (!clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
+            seg = refine_path(*map, *clearance_, start, seg, robot_width, path_refine);
+        }
         full_path.insert(full_path.end(), seg.begin(), seg.end());
         segment_wp_bounds_.push_back(full_path.size());
         start = target;

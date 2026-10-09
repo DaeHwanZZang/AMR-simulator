@@ -12,6 +12,7 @@
 #include "dynamic_obstacles.hpp"
 #include "kinematics.hpp"
 #include "map_model.hpp"
+#include "path_refine.hpp"
 #include "schemas.hpp"
 
 namespace fms {
@@ -28,6 +29,7 @@ public:
     BatterySim battery;
     const MapModel* map = nullptr;  // 없으면 경로계획/충돌감지 꺼짐 (소유하지 않음)
     MapSync* map_sync = nullptr;    // 없으면 SET_MAP 은 로깅만 (소유하지 않음)
+    PathRefineParams path_refine;   // enabled=false 가 기본 (A* 결과 그대로 사용)
 
     OrderExecutor(std::string robot_id_, double start_x, double start_y, double start_theta,
                   double max_velocity, double max_acceleration, BatterySim battery_,
@@ -79,6 +81,9 @@ private:
     std::optional<PauseSource> pause_source_;
     OperatingMode mode_ = OperatingMode::AUTO;
     std::vector<ErrorInfo> errors_;
+
+    // 경로 다듬기용 장애물 거리 장. 맵당 lazy 생성, set_map 에서 무효화.
+    std::unique_ptr<ClearanceField> clearance_;
 
     std::string current_map_uid_;      // 비어 있으면 State 에 map_id 안 실음
     std::string current_map_version_;

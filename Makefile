@@ -23,7 +23,7 @@ LDFLAGS := -L $(BREW)/opt/mosquitto/lib -L $(BREW)/opt/cjson/lib -lmosquitto -lc
 
 CORE_SRC := src/schemas.cpp src/map_model.cpp src/kinematics.cpp \
             src/dynamic_obstacles.cpp src/planner.cpp src/executor.cpp src/comm.cpp \
-            src/map_sync.cpp
+            src/map_sync.cpp src/path_refine.cpp
 CORE_OBJ := $(CORE_SRC:.cpp=.o)
 GUI_OBJ := src/gui.o
 
