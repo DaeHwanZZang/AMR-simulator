@@ -1,8 +1,18 @@
 # AMR_client — 로봇 클라이언트 (C++)
 
-프로토콜(MQTT+JSON)이 언어 무관이라 `MQTT_broker`, `AMR_viewer`, `fms_server`
-와 그대로 섞어 쓴다. 이 폴더 하나만 복사하면 독립적으로 빌드/실행된다 —
-`common/`, `maps/` 사본을 자체 보유.
+프로토콜(MQTT+JSON)이 언어 무관이라 `fms_server` 와 그대로 섞어 쓴다.
+
+## 리포 구성
+
+| 경로 | 내용 |
+|---|---|
+| (루트) `src/ include/ tools/ maps/` | C++ 로봇 클라이언트 (아래 문서) |
+| `viewer/` | 라이브 플릿 뷰어 (Python/Qt) -- `viewer/README.md` |
+| `broker/` | 개발용 mosquitto 설정 -- `broker/README.md` |
+
+세 폴더는 MQTT 로만 통신한다. `maps/` 는 클라이언트와 뷰어가 공유한다.
+빠른 실행: `mosquitto -c broker/mosquitto.conf -v` -> `./robot_client ...` ->
+`cd viewer && .venv/bin/python tools/fleet_monitor_qt.py ../maps/warehouse/warehouse.json`
 
 ## 빌드
 

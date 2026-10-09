@@ -1,7 +1,7 @@
 # AMR_viewer — 라이브 플릿 뷰어 (Python/Qt)
 
-MQTT 로 로봇들을 관측만 하는 뷰어. 이 폴더 하나만 복사하면 독립 실행된다
-(`common/`, `maps/` 자체 사본 보유). **순수 관측자** — 아무것도 발행하지 않고,
+MQTT 로 로봇들을 관측만 하는 뷰어. `common/` 은 자체 사본을 갖고, 맵은 리포
+루트 `../maps/` 를 공유한다. **순수 관측자** — 아무것도 발행하지 않고,
 로봇을 시뮬레이션하지 않는다. 어떤 언어의 로봇 클라이언트든(`AMR_client` 등)
 프로토콜만 지키면 그대로 보인다.
 
@@ -15,15 +15,16 @@ tools/
   fleet_monitor_qt.py    진입점
   map_viewer.py          정적 확인용 matplotlib (레거시)
 assets/icons/      창 아이콘
-maps/              맵 사본
 ```
 
 ## 설치/실행
 
 ```bash
+# 리포 루트가 아니라 viewer/ 에서 실행
+cd viewer
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python tools/fleet_monitor_qt.py maps/warehouse/warehouse.json --host <브로커 IP>
+.venv/bin/python tools/fleet_monitor_qt.py ../maps/warehouse/warehouse.json --host <브로커 IP>
 ```
 
 `--host`/`--port` 기본값은 localhost:1883. 로봇은 이 폴더와 무관한 별도
@@ -31,5 +32,6 @@ python3.11 -m venv .venv
 
 ## 맵 갱신
 
-`maps/`는 `AMR_master/maps/`의 사본. 원본 갱신되면 여기도 수동 재복사 (자동
-동기화 없음).
+맵은 리포 루트 `maps/` 하나를 로봇 클라이언트와 공유한다 (뷰어 전용 사본 없음).
+참고: 루트 `maps/641931.../fms_map.json` 의 `image` 는 `edited_navi_gridmap.png`
+이다. 예전 뷰어 사본은 `grid.png` 를 썼다 -- 표시 이미지가 달라 보이면 이 차이다.

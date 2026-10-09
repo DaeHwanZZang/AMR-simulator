@@ -1,6 +1,6 @@
 # MQTT_broker — FMS 브로커 설정
 
-`mosquitto.conf` 하나. 로봇(`AMR_client`)/뷰어(`AMR_viewer`)/`fms_server` 가
+`mosquitto.conf` 하나. 로봇 클라이언트(리포 루트)/뷰어(`../viewer`)/`fms_server` 가
 서로 통신하는 브로커 설정. 위치는 어디 PC든 상관없다 — 네트워크로 서로 도달만
 가능하면 된다.
 
