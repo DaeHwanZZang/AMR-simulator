@@ -4,7 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 개요
 
-AMR 로봇 클라이언트 (C++20). 프로세스 1개 = 로봇 1대. MQTT+JSON 프로토콜로 FMS(`fms_server`), `MQTT_broker`, `AMR_viewer` 와 통신한다. Python 원본(`robot_client/*.py`)의 포팅이라 주석에 원본 참조가 많다. 이 폴더는 독립 빌드/실행 가능해야 한다 (`maps/` 사본 자체 보유, 상위 폴더 참조 금지).
+AMR 시뮬레이터 모노레포. 세 부분이 MQTT+JSON 으로만 통신한다.
+
+| 경로 | 내용 |
+|---|---|
+| 루트 (`src/ include/ tools/ maps/`) | C++20 로봇 클라이언트. 프로세스 1개 = 로봇 1대. Python 원본(`robot_client/*.py`) 포팅이라 주석에 원본 참조가 많다 |
+| `viewer/` | 라이브 플릿 뷰어 (Python/PySide6). 순수 관측자, 아무것도 발행하지 않는다 |
+| `broker/` | 개발용 mosquitto 설정 (`mosquitto.conf`) |
+
+외부 `fms_server` 와도 같은 프로토콜로 붙는다 (이 리포에는 없음). `maps/` 는 클라이언트와 뷰어가 공유한다 — `viewer/maps` 사본은 없다.
+
+## Git 운영
+
+- 이 리포(`origin` = `DaeHwanZZang/AMR-simulator`, public)가 메인이다. 기존 org 리포 `GC-WAYPOINT/AMR_client` 는 `upstream` (fetch 전용, push URL `DISABLED`).
+- org 에 반영할 버전은 수동으로 가져간다 (cherry-pick/patch). 그래서 C++ 클라이언트는 루트 경로를 옮기지 않는다 — 옮기면 org 쪽과 충돌한다.
+- `viewer/`, `broker/` 는 `git subtree` 로 원본 이력을 보존해 합쳤다. 기준 태그 `v1.1` = PSO 작업 직전.
+- push, 태그, 공개 리포 대상 작업은 사용자 확인 후에 한다.
 
 ## 명령 (리포 루트에서 실행)
 
@@ -16,6 +31,14 @@ make clean
 ./robot_client --id AMR-003 --host <FMS IP>       # --map 없음: FMS 가 SET_MAP 으로 맵 전달
 ./launch.sh           # 인터랙티브 N대 실행 (PID 는 .run/pids, 로그는 logs/)
 ./stop.sh             # launch.sh 가 띄운 로봇 종료
+mosquitto -c broker/mosquitto.conf -v             # 브로커 (127.0.0.1:1883, 익명 허용 = 개발용)
+```
+
+뷰어 (`viewer/` 에서 실행, venv 는 직접 만든다):
+
+```bash
+python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python tools/fleet_monitor_qt.py ../maps/warehouse/warehouse.json --host <브로커 IP>
 ```
 
 - 테스트/린트 없음. 검증은 mosquitto 브로커를 띄우고 `robot_client` + `tools/send_order` 로 수동 확인.
@@ -31,10 +54,16 @@ make clean
 - **경로계획**: `planner.cpp` A* (로봇 크기 반영, 동적 장애물 사각형 입력). 장애물은 센서 범위(`sensor_range`) 안에서만 인식한다 — README 의 known issue(양 갈림길 막힘 시 왕복, 로봇끼리 장애물 미인식) 참고.
 - **프로토콜**: `schemas.hpp/cpp` 가 Order/InstantAction/State 와 토픽(`fms/v1/{id}/...`)·JSON 직렬화를 정의 (cJSON). `comm.cpp` 는 libmosquitto 래퍼 (LWT, 재접속, `connection` retained 토픽). 스키마 변경은 FMS 쪽과 맞춰야 한다.
 - **맵**: `map_model.cpp` 가 `fms_map.json`(+grid png, `stb_image`) 로드. `SET_MAP` 수신 시 `map_sync.cpp` 가 zip 을 받아 `map_cache/<map_uid>/` 에 풀고 `State.map_id/map_version` 으로 보고한다. FMS 는 이 값이 일치하는 로봇에만 job 을 배정한다.
+- **PSO 경로 다듬기 (`path_refine.cpp`, `--path-refine`, 기본 꺼짐)**: `plan_segment_path()` 에서 구간별 A* 결과의 중간 경유점을 PSO 로 미세 조정한다. 규칙: 경유점 **개수와 목표점은 바꾸지 않는다** (`segment_wp_bounds_` 진행도 추적 때문), 동적 장애물 회피 경로에는 적용하지 않는다 (거리 장이 정적 맵 기준), 충돌 샘플이 A* 보다 늘면 원본을 쓴다. 거리 장(`ClearanceField`)은 executor 가 lazy 생성하고 `set_map()` 에서 버린다. seed 는 `--seed` 와 로봇 id 에서 파생.
 - **`tools/`**: 별도 실행 파일(`send_order`, `place_obstacle`, `obstacle_zone`)로 `schemas.o` 만 링크. `mqtt_once.hpp` 는 1회 발행 헬퍼.
 
 ## 주의
 
 - `maps/` 는 `AMR_master/maps/` 의 수동 복사본이다. 원본이 바뀌면 직접 재복사.
+- 맵 이미지 불일치: `maps/641931.../fms_map.json` 의 `image` 는 `edited_navi_gridmap.png` 인데, 예전 뷰어 사본은 `grid.png` 를 썼다. 뷰어 표시가 예전과 다를 수 있다 (미결정).
+- 알려진 미해결 문제는 README 의 known issue (갈림길 왕복, 로봇끼리 장애물 미인식). PSO 는 이걸 해결하지 않는다 — 장애물 기억(시간 감쇠)이 필요하다.
+- Makefile 은 소스 자동 수집을 안 한다. `.cpp` 추가 시 `CORE_SRC` 에 직접 넣는다.
+- 셸이 zsh 라 변수 단어 분리가 안 된다 (`$VAR` 로 인자 목록 전개 불가, `${=VAR}` 사용).
+- `launch.sh`/`Makefile` 주석의 "CLAUDE.md 결정 4", "최종 타깃" 은 원래 org 상위 프로젝트 문서 참조다. 이 리포에는 해당 내용이 없다.
 - `.gitignore`: `*.o`, `*.d`, `robot_client`, `tools/` 바이너리, `map_cache/`, `logs/`, `.run/`.
 - 코드 주석/README 는 한국어. 같은 스타일을 따른다.
