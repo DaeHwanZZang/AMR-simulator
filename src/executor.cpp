@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include "log.hpp"
 #include "map_sync.hpp"
@@ -504,7 +505,9 @@ void OrderExecutor::replan() {
     } catch (const PlanningError& e) {
         log::error("[%s] path planning failed: %s", robot_id.c_str(), e.what());
         segment_.clear();
-        ErrorInfo err; err.error_type = "NO_PATH"; err.level = ErrorLevel::FATAL; err.description = e.what();
+        char at[64];
+        std::snprintf(at, sizeof at, " [robot at (%.2f, %.2f)]", kinematics.x, kinematics.y);
+        ErrorInfo err; err.error_type = "NO_PATH"; err.level = ErrorLevel::FATAL; err.description = std::string(e.what()) + at;
         raise_fatal(err);
     }
 }
@@ -616,6 +619,16 @@ bool OrderExecutor::force_relocalize(double x, double y, double theta) {
     kinematics.emergency_stop();
     kinematics.set_pose(x, y, &theta);
     log::warning("[%s] force relocalized: (%.2f, %.2f, %.2f)", robot_id.c_str(), x, y, theta);
+    // 벽/미탐색에서 주행 가능한 곳으로 빠져나왔으면 위치 때문에 난 오류(NO_PATH, COLLISION)를 푼다.
+    // 다른 오류(배터리 등)는 그대로 둔다. 여전히 주행 불가 위치면 오류도 그대로다.
+    if (map == nullptr || map->is_free(x, y)) {
+        size_t n = std::erase_if(errors_, [](const ErrorInfo& e) {
+            return e.error_type == "NO_PATH" || e.error_type == "COLLISION";
+        });
+        if (n) log::info("[%s] relocalized onto a free cell: cleared %zu position error(s)", robot_id.c_str(), n);
+    } else {
+        log::warning("[%s] relocalized position is not drivable: orders will fail with NO_PATH", robot_id.c_str());
+    }
     return true;
 }
 

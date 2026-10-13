@@ -219,12 +219,16 @@ int main(int argc, char** argv) {
             log::error("[%s] failed to load map: %s", args.id.c_str(), e.what());
             return 1;
         }
+        // 시작 위치가 벽/미탐색 위여도 실행은 한다. 오더를 받으면 경로계획이 NO_PATH 로 실패하고,
+        // 강제 위치지정(force_relocalize)으로 주행 가능한 곳에 옮기면 그 오류가 풀린다.
         CellType cell = map_model->cell_at(args.x, args.y);
         if (!drivable(cell)) {
-            log::error("[%s] start position (%.2f, %.2f) is not drivable", args.id.c_str(), args.x, args.y);
-            return 1;
+            log::warning("[%s] start position (%.2f, %.2f) is not drivable (%s) -- starting anyway; "
+                         "orders will fail with NO_PATH until the robot is relocalized onto a free cell",
+                         args.id.c_str(), args.x, args.y, cell == CellType::OCCUPIED ? "OCCUPIED" : "UNKNOWN");
+        } else {
+            log::info("[%s] map check passed (path planning + collision detection enabled)", args.id.c_str());
         }
-        log::info("[%s] map check passed (path planning + collision detection enabled)", args.id.c_str());
     }
 
     unsigned obstacle_seed = seed_from_string(
