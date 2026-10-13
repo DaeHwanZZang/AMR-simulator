@@ -10,21 +10,25 @@ grid.png 위에 흰색/검정/회색 도형(사각형·선분·자유형)을 얹
     .venv/bin/python tools/map_editor.py maps/gen_loop/fms_map.json    # 리포 루트에서
 
 - 맵 폴더에 grid.png 와 edited_navi_gridmap.png 가 모두 있어야 시작한다 (없으면 경고 후 종료).
-- 저장은 Ctrl+S 수동뿐이다: edits.json 과 edited_navi_gridmap.png 를 쓴다. fms_map.json 은 건드리지 않는다.
-- 조작: V 선택 / R 사각형 / L 선분 (Shift: 15° 단위) / P 자유형, 휠 줌, 가운데·오른쪽 버튼 또는 Space+드래그 이동,
+- 저장은 Ctrl+S 수동뿐이다: edits.json 과 edited_navi_gridmap.png 를 쓴다. fms_map.json 은 원점(O)을 바꿨을 때만
+  origin_x/origin_y 두 값을 고쳐 쓴다 (저장 전에 확인한다).
+- 조작: V 선택 / R 사각형 / L 선분 (Shift: 15° 단위) / P 자유형 / O 원점 지정, 휠 줌, 가운데·오른쪽 버튼 또는 Space+드래그 이동,
   F 전체 보기, Delete 삭제, Ctrl+Z 실행 취소, Ctrl+Shift+Z(또는 Ctrl+Y) 다시 실행.
+- 원점 지정: 클릭한 지점(가장 가까운 픽셀 모서리)이 world (0, 0) 이 된다. 이미지와 도형은 그대로이고 좌표계만 옮겨진다
+  (도형의 world 좌표는 같이 평행이동). 실행 취소 가능.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import signal
 import sys
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
@@ -74,8 +78,9 @@ class Canvas(QWidget):
         self.drag: dict | None = None
         self.pan_last: QPointF | None = None
         self.space = False
-        self.undo: list[tuple[list[M.Shape], int]] = []
-        self.redo: list[tuple[list[M.Shape], int]] = []
+        self.undo: list[tuple[list[M.Shape], int, tuple[float, float]]] = []
+        self.redo: list[tuple[list[M.Shape], int, tuple[float, float]]] = []
+        self.hover_corner: tuple[int, int] | None = None   # 원점 도구가 가리키는 픽셀 모서리
         self.dirty = False
         self.on_change = lambda: None       # 도형 목록/선택이 바뀌면 (패널 갱신)
         self.on_cursor = lambda s: None
@@ -106,8 +111,24 @@ class Canvas(QWidget):
             self.fit()
 
     # -- 변경 이력 ------------------------------------------------------------
-    def _snap(self) -> tuple[list[M.Shape], int]:
-        return [s.copy() for s in self.shapes], self.selected
+    def _snap(self) -> tuple[list[M.Shape], int, tuple[float, float]]:
+        return [s.copy() for s in self.shapes], self.selected, (self.geom.origin_x, self.geom.origin_y)
+
+    def _restore(self, snap) -> None:
+        self.shapes, self.selected, (self.geom.origin_x, self.geom.origin_y) = snap
+
+    def set_origin_px(self, cx: int, cy: int) -> None:
+        """이미지 위 픽셀 모서리 (cx, cy) 를 world (0, 0) 으로 만든다. 도형은 같은 픽셀에 남도록 world 좌표를 옮긴다."""
+        g = self.geom
+        nx, ny = round(-cx * g.resolution, 6), round(-cy * g.resolution, 6)
+        dx, dy = nx - g.origin_x, ny - g.origin_y
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return
+        self.push_undo()
+        for s in self.shapes:
+            M.move_shape(s, dx, dy)
+        g.origin_x, g.origin_y = nx, ny
+        self.changed()
 
     def push_undo(self, snap=None) -> None:
         self.undo.append(snap or self._snap())
@@ -123,13 +144,13 @@ class Canvas(QWidget):
     def do_undo(self) -> None:
         if self.undo:
             self.redo.append(self._snap())
-            self.shapes, self.selected = self.undo.pop()
+            self._restore(self.undo.pop())
             self.changed()
 
     def do_redo(self) -> None:
         if self.redo:
             self.undo.append(self._snap())
-            self.shapes, self.selected = self.redo.pop()
+            self._restore(self.redo.pop())
             self.changed()
 
     def select(self, idx: int) -> None:
@@ -226,6 +247,24 @@ class Canvas(QWidget):
             for h in self._handles(s):
                 sp = self.world_to_screen(*h)
                 p.drawRect(QRectF(sp.x() - 4, sp.y() - 4, 8, 8))
+        # 원점 (world 0,0) 표시: 화면 크기 고정. x 는 오른쪽(빨강), y 는 아래쪽(초록)
+        p.resetTransform()
+        o = self.ipx_to_screen(*g.to_px(0.0, 0.0))
+        p.setPen(QPen(QColor(255, 70, 70), 2))
+        p.drawLine(o, o + QPointF(36, 0))
+        p.drawText(o + QPointF(40, 4), "x")
+        p.setPen(QPen(QColor(70, 220, 70), 2))
+        p.drawLine(o, o + QPointF(0, 36))
+        p.drawText(o + QPointF(-3, 50), "y")
+        p.setPen(QPen(QColor(255, 0, 255), 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(o, 5, 5)
+        p.drawText(o + QPointF(8, -8), "(0, 0)")
+        if self.tool == "origin" and self.hover_corner:  # 클릭하면 원점이 될 위치 미리보기
+            h = self.ipx_to_screen(*self.hover_corner)
+            p.setPen(QPen(QColor(255, 255, 0), 1, Qt.DashLine))
+            p.drawLine(QPointF(h.x() - 14, h.y()), QPointF(h.x() + 14, h.y()))
+            p.drawLine(QPointF(h.x(), h.y() - 14), QPointF(h.x(), h.y() + 14))
         p.end()
 
     def _handles(self, s: M.Shape) -> list[tuple[float, float]]:
@@ -282,6 +321,10 @@ class Canvas(QWidget):
         s = max(abs(dx), abs(dy))
         return [a[0] + math.copysign(s, dx or 1), a[1] + math.copysign(s, dy or 1)]
 
+    def _corner_at(self, pos: QPointF) -> tuple[int, int]:
+        """화면 위치에서 가장 가까운 픽셀 모서리 (이미지 픽셀 좌표)."""
+        return (round((pos.x() - self.off.x()) / self.zoom), round((pos.y() - self.off.y()) / self.zoom))
+
     def _pick_handle(self, pos: QPointF) -> int:
         if not (0 <= self.selected < len(self.shapes)):
             return -1
@@ -306,6 +349,9 @@ class Canvas(QWidget):
             self.pan_last = pos
             return
         if e.button() != Qt.LeftButton:
+            return
+        if self.tool == "origin":
+            self.set_origin_px(*self._corner_at(pos))
             return
         w = list(self.screen_to_world(pos))
         if self.tool == "select":
@@ -334,6 +380,10 @@ class Canvas(QWidget):
         if self.pan_last is not None:
             self.off += pos - self.pan_last
             self.pan_last = pos
+            self.update()
+            return
+        if self.tool == "origin":
+            self.hover_corner = self._corner_at(pos)
             self.update()
             return
         w = list(self.screen_to_world(pos))
@@ -405,6 +455,7 @@ class Editor(QMainWindow):
         self.free_thresh = int(meta.get("free_thresh", 192))
         self.needs_confirm = needs_confirm  # 디스크의 edited 가 grid+edits 렌더와 달라서 첫 저장 때 확인
         self.baseline_comps = drivable_components(M.render(base, shapes, geom), self.free_thresh)
+        self.saved_origin = (geom.origin_x, geom.origin_y)  # 디스크 fms_map.json 의 값
         self.canvas = Canvas(geom, base, shapes)
         self.canvas.on_change = self.refresh_panel
         self.canvas.on_cursor = lambda s: self.cursor_label.setText(s)
@@ -427,6 +478,18 @@ class Editor(QMainWindow):
             if key == "select":
                 b.setChecked(True)
         v.addLayout(row)
+        row = QHBoxLayout()
+        b = QPushButton("원점 지정(O)")
+        b.setCheckable(True)
+        b.setProperty("tool", "origin")
+        b.setFocusPolicy(Qt.NoFocus)
+        b.setToolTip("클릭한 픽셀 모서리를 world (0, 0) 으로 만든다. 이미지/도형은 그대로, 좌표계만 옮긴다.")
+        self.tool_group.addButton(b)
+        row.addWidget(b)
+        v.addLayout(row)
+        self.origin_label = QLabel()
+        self.origin_label.setWordWrap(True)
+        v.addWidget(self.origin_label)
         self.tool_group.buttonClicked.connect(lambda b: self.set_tool(b.property("tool")))
 
         v.addWidget(QLabel("색"))
@@ -503,7 +566,7 @@ class Editor(QMainWindow):
         act("Ctrl+Z", self.canvas.do_undo)
         act("Ctrl+Shift+Z", self.canvas.do_redo)
         act("Ctrl+Y", self.canvas.do_redo)
-        for key, tool in (("V", "select"), ("R", "rect"), ("L", "line"), ("P", "path")):
+        for key, tool in (("V", "select"), ("R", "rect"), ("L", "line"), ("P", "path"), ("O", "origin")):
             act(key, lambda t=tool: self.pick_tool(t))
         self.refresh_panel()
         self.resize(1280, 800)
@@ -517,8 +580,11 @@ class Editor(QMainWindow):
 
     def set_tool(self, tool: str) -> None:
         self.canvas.tool = tool
+        self.canvas.hover_corner = None
+        self.canvas.setCursor(Qt.CrossCursor if tool == "origin" else Qt.ArrowCursor)
         if tool != "select":
             self.canvas.select(-1)
+        self.canvas.update()
 
     def on_color(self, key: str) -> None:
         if self._building:
@@ -569,6 +635,11 @@ class Editor(QMainWindow):
                     self.filled.setChecked(s.filled)
         finally:
             self._building = False
+        g = self.geom
+        ox, oy = -g.origin_x / g.resolution, -g.origin_y / g.resolution
+        moved = (g.origin_x, g.origin_y) != self.saved_origin
+        self.origin_label.setText(f"원점 (0,0) = 픽셀 ({ox:g}, {oy:g})\norigin_x/y = ({g.origin_x:g}, {g.origin_y:g}) m"
+                                  + ("  [저장 전]" if moved else ""))
         self.setWindowTitle(f"맵 편집기 - {self.meta.get('name', self.dir.name)}{' *' if c.dirty else ''}")
 
     # -- 저장 -----------------------------------------------------------------
@@ -582,6 +653,20 @@ class Editor(QMainWindow):
             if r != QMessageBox.Yes:
                 return
             self.needs_confirm = False
+        g = self.geom
+        origin = (g.origin_x, g.origin_y)
+        if origin != self.saved_origin:
+            r = QMessageBox.question(
+                self, "원점 변경 확인",
+                f"fms_map.json 의 origin 을 ({self.saved_origin[0]:g}, {self.saved_origin[1]:g}) 에서 ({origin[0]:g}, {origin[1]:g}) 로 바꾼다.\n"
+                "이 맵의 world 좌표를 쓰는 곳(로봇 시작 위치, 오더/구역 좌표, FMS 쪽 저장값)은 같이 바꿔야 한다. 계속할까?")
+            if r != QMessageBox.Yes:
+                return
+            try:
+                self.write_origin(origin)
+            except (OSError, ValueError, KeyError) as ex:
+                QMessageBox.critical(self, "fms_map.json 저장 실패", str(ex))
+                return
         img = M.render(self.base, c.shapes, self.geom)
         M.save_edits(self.dir / "edits.json", self.geom, c.shapes)
         Image.fromarray(img, "L").save(self.dir / "edited_navi_gridmap.png")
@@ -595,6 +680,17 @@ class Editor(QMainWindow):
                                 "벽이 통로를 막았는지 확인해라. 저장은 이미 끝났다.")
         self.baseline_comps = comps
         self.statusBar().showMessage(msg, 8000)
+
+    def write_origin(self, origin: tuple[float, float]) -> None:
+        """fms_map.json 의 origin_x/origin_y 두 값만 고쳐 원자적으로 쓴다 (다른 키는 디스크에 있는 그대로)."""
+        path = self.dir / "fms_map.json"
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["origin_x"], meta["origin_y"] = origin
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        self.meta["origin_x"], self.meta["origin_y"] = origin
+        self.saved_origin = origin
 
     def closeEvent(self, e) -> None:
         if self.canvas.dirty:
@@ -655,6 +751,13 @@ def main() -> int:
                             "로봇/뷰어가 이 결과를 쓰려면 image 를 edited_navi_gridmap.png 로 바꿔야 한다. (편집기는 수정하지 않는다.)")
     w = Editor(meta_path, meta, geom, base, shapes, needs_confirm)
     w.show()
+    # 런처가 보내는 SIGTERM/SIGINT 는 창 닫기로 바꾼다 -> closeEvent 의 "저장 안 됨" 확인이 그대로 뜬다.
+    # 취소하면 계속 실행된다. 빈 타이머는 Qt 루프 중에도 파이썬 시그널 핸들러가 돌 기회를 주려는 것.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: QTimer.singleShot(0, w.close))
+    tick = QTimer()
+    tick.timeout.connect(lambda: None)
+    tick.start(200)
     return app.exec()
 
 

@@ -93,7 +93,15 @@ def load_edits(path: Path, geom: MapGeom) -> list[Shape]:
         raise ValueError(f"edits.json version {d.get('version')} 은 지원하지 않는다 (지원: {VERSION})")
     if d.get("size_px") != [geom.width_px, geom.height_px] or abs(d.get("resolution", 0) - geom.resolution) > 1e-9:
         raise ValueError(f"edits.json 의 맵 크기/해상도가 fms_map.json 과 다르다: {d.get('size_px')} / {d.get('resolution')}")
-    return [Shape.from_dict(s) for s in d["shapes"]]
+    shapes = [Shape.from_dict(s) for s in d["shapes"]]
+    # edits.json 의 origin 은 도형을 저장했을 때의 좌표계다. 맵 origin 이 그동안 바뀌었으면(원점 재지정)
+    # 도형이 이미지 위 같은 픽셀에 있도록 world 좌표를 평행이동한다.
+    ox, oy = d.get("origin", [geom.origin_x, geom.origin_y])
+    dx, dy = geom.origin_x - ox, geom.origin_y - oy
+    if abs(dx) > 1e-9 or abs(dy) > 1e-9:
+        for sh in shapes:
+            move_shape(sh, dx, dy)
+    return shapes
 
 
 def save_edits(path: Path, geom: MapGeom, shapes: list[Shape], base_image: str = "grid.png") -> None:
