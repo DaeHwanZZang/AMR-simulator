@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import os
 import random
+import signal
 import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QSettings, Qt
+from PySide6.QtCore import QProcess, QSettings, Qt, QTimer
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
@@ -287,6 +288,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e) -> None:
         self.save_settings()
+        if self.proc:  # 생성 중에 닫으면 자식 스크립트도 같이 끝낸다 (고아 프로세스 방지)
+            self.proc.kill()
+            self.proc.waitForFinished(2000)
         super().closeEvent(e)
 
     # -- 동작 --
@@ -373,6 +377,12 @@ def main() -> int:
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
+    # 런처가 보내는 SIGTERM/SIGINT 는 창 닫기로 바꾼다 (옵션 저장 + 자식 정리가 closeEvent 에 있다)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: QTimer.singleShot(0, win.close))
+    tick = QTimer()
+    tick.timeout.connect(lambda: None)
+    tick.start(200)
     return app.exec()
 
 

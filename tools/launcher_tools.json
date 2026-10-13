@@ -1,0 +1,110 @@
+{
+  "_설명": [
+    "런처(tools/launcher.py)가 관리할 툴 목록. 새 툴은 여기에 항목만 추가하면 붙는다.",
+    "mode: single(하나, 목록에 항상 있음) / per_map(맵마다 하나) / multi(여러 개, 폼으로 추가) / oneshot(한 번 실행하고 끝남)",
+    "cmd: 문자열 또는 {\"if\": 키, \"args\": [...]} (키 값이 참일 때만 args 포함). {키} 는 폼 값/공통 값으로 치환.",
+    "공통 값: {python}(런처 인터프리터) {repo}(리포 루트) {host} {port} {map}(fms_map.json 절대경로, 맵 없음이면 빈 문자열)",
+    "cwd: 리포 루트 기준 상대경로. requires: [\"broker\"]. needs_map: 맵 필수. needs_build: 없으면 make 를 권하는 바이너리.",
+    "stop_timeout_s: SIGTERM 후 기다리는 시간. 넘으면 강제 종료할지 묻는다.",
+    "params: type = str / int / float / bool / choice(choices), group 이 바뀌면 폼에 구분 제목이 들어간다.",
+    "multi: id_param(이름으로 쓸 키), id_fmt(자동 이름), step({키: 대수마다 더할 값})"
+  ],
+  "tools": [
+    {
+      "id": "broker",
+      "name": "브로커 (mosquitto)",
+      "mode": "single",
+      "cmd": ["mosquitto", "-c", "broker/mosquitto.conf", "-v"],
+      "listens": 1883,
+      "stop_timeout_s": 5
+    },
+    {
+      "id": "robot",
+      "name": "로봇 클라이언트",
+      "mode": "multi",
+      "cmd": [
+        "./robot_client", "--id", "{id}", "--host", "{host}", "--port", "{port}",
+        "--x", "{x}", "--y", "{y}", "--theta", "{theta}",
+        {"if": "map", "args": ["--map", "{map}"]},
+        "--robot-width", "{robot_width}", "--robot-length", "{robot_length}",
+        "--max-velocity", "{max_velocity}", "--max-acceleration", "{max_acceleration}",
+        "--battery", "{battery}", "--speed-noise", "{speed_noise}",
+        "--sensor-range", "{sensor_range}", "--log-level", "{log_level}",
+        {"if": "gui", "args": ["--gui"]},
+        {"if": "path_refine", "args": ["--path-refine"]},
+        {"if": "obstacle_zone", "args": [
+          "--obstacle-zone", "{obstacle_zone}",
+          "--obstacle-spawn-interval", "{obstacle_spawn_interval}",
+          "--obstacle-max-count", "{obstacle_max_count}",
+          "--obstacle-width", "{obstacle_width}", "--obstacle-height", "{obstacle_height}",
+          "--obstacle-speed", "{obstacle_speed}"]},
+        {"if": "obstacle_sides", "args": ["--obstacle-sides", "{obstacle_sides}"]}
+      ],
+      "requires": ["broker"],
+      "needs_build": "robot_client",
+      "stop_timeout_s": 5,
+      "multi": {"id_param": "id", "id_fmt": "AMR-{n:03d}", "step": {"y": 1.0}},
+      "params": [
+        {"key": "id", "label": "로봇 ID", "type": "str", "default": "AMR-001"},
+        {"key": "x", "label": "시작 x (m)", "type": "float", "default": 0.0},
+        {"key": "y", "label": "시작 y (m)", "type": "float", "default": 0.0},
+        {"key": "theta", "label": "시작 theta (rad)", "type": "float", "default": 0.0},
+        {"key": "gui", "label": "제어판(GUI) 창", "type": "bool", "default": false},
+        {"key": "path_refine", "label": "PSO 경로 다듬기", "type": "bool", "default": false},
+        {"group": "물리", "key": "robot_width", "label": "로봇 폭 (m)", "type": "float", "default": 0.5},
+        {"group": "물리", "key": "robot_length", "label": "로봇 길이 (m)", "type": "float", "default": 0.7},
+        {"group": "물리", "key": "max_velocity", "label": "최대 속도 (m/s)", "type": "float", "default": 1.2},
+        {"group": "물리", "key": "max_acceleration", "label": "최대 가속도 (m/s²)", "type": "float", "default": 0.6},
+        {"group": "물리", "key": "battery", "label": "시작 배터리 (%)", "type": "float", "default": 100.0},
+        {"group": "물리", "key": "speed_noise", "label": "속도 노이즈 비율", "type": "float", "default": 0.05},
+        {"group": "물리", "key": "sensor_range", "label": "장애물 감지 반경 (m)", "type": "float", "default": 3.0},
+        {"group": "물리", "key": "log_level", "label": "로그 레벨", "type": "choice", "choices": ["DEBUG", "INFO", "WARNING"], "default": "INFO"},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_zone", "label": "구역 XMIN,YMIN,XMAX,YMAX", "type": "str", "default": ""},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_sides", "label": "진입-이탈 면 (예 4-2, 빈값=랜덤)", "type": "str", "default": ""},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_spawn_interval", "label": "스폰 주기 (초)", "type": "float", "default": 5.0},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_max_count", "label": "동시 최대 개수", "type": "int", "default": 3},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_width", "label": "가로 (m)", "type": "float", "default": 0.4},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_height", "label": "세로 (m)", "type": "float", "default": 0.4},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_speed", "label": "속도 (m/s)", "type": "float", "default": 0.5}
+      ]
+    },
+    {
+      "id": "viewer",
+      "name": "뷰어",
+      "mode": "single",
+      "cmd": [
+        "{python}", "tools/fleet_monitor_qt.py", "{map}", "--host", "{host}", "--port", "{port}",
+        {"if": "no_orders", "args": ["--no-orders"]}
+      ],
+      "cwd": "viewer",
+      "requires": ["broker"],
+      "needs_map": true,
+      "stop_timeout_s": 5,
+      "params": [
+        {"key": "no_orders", "label": "order 토픽 구독 안 함", "type": "bool", "default": false}
+      ]
+    },
+    {
+      "id": "map_editor",
+      "name": "맵 편집기",
+      "mode": "per_map",
+      "cmd": ["{python}", "tools/map_editor.py", "{map}"],
+      "needs_map": true,
+      "stop_timeout_s": 30
+    },
+    {
+      "id": "map_gen",
+      "name": "맵 생성기",
+      "mode": "single",
+      "cmd": ["{python}", "tools/map_gen_gui.py"],
+      "stop_timeout_s": 10
+    },
+    {
+      "id": "make",
+      "name": "빌드 (make)",
+      "mode": "oneshot",
+      "cmd": ["make"],
+      "stop_timeout_s": 10
+    }
+  ]
+}
