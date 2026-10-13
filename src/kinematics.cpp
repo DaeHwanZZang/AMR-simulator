@@ -56,13 +56,15 @@ double TrapezoidalKinematics::rotate_step(double target_theta, double dt) {
     if (abs_error < 1e-9) { angular_velocity_ = 0.0; return 0.0; }
     double sign = error > 0 ? 1.0 : -1.0;
     double speed = std::abs(angular_velocity_);
-    double stop_angle = max_angular_acceleration > 0 ? (speed * speed) / (2 * max_angular_acceleration) : 0.0;
+    double stop_angle = max_angular_acceleration > 0 ? (speed * speed) / (2 * max_angular_acceleration) : 0.0; //지금 속도에서 최대로 감속했을 때 멈출 때까지 도는 각도
     double accel_mag;
     if (abs_error <= stop_angle) accel_mag = -max_angular_acceleration;
     else if (speed < max_angular_velocity) accel_mag = max_angular_acceleration;
     else accel_mag = 0.0;
     double new_speed = std::max(0.0, std::min(max_angular_velocity, speed + accel_mag * dt));
-    double turn = std::min((speed + new_speed) / 2 * dt, abs_error);
+
+    double turn = std::min((speed + new_speed) / 2 * dt, abs_error); //이번 틱 회전량
+
     theta = normalize_angle(theta + sign * turn);
     angular_velocity_ = sign * new_speed;
     return normalize_angle(target_theta - theta);
@@ -81,10 +83,13 @@ RobotKinematicState TrapezoidalKinematics::step(double dt) {
     bool has_target = false;
     double heading_error = 0.0;
 
+
+    //경로가 남았을 때 목적지까지의 방향으로 회전
     if (remaining_dist > 1e-9) {
         double dx = remaining_[0].first - x, dy = remaining_[0].second - y;
         heading_error = rotate_step(std::atan2(dy, dx), dt);
         has_target = true;
+    //경로가 남지 않았을 때 최종각도까지 회전
     } else if (final_theta_) {
         heading_error = rotate_step(*final_theta_, dt);
         has_target = true;
