@@ -36,6 +36,7 @@ mosquitto -c broker/mosquitto.conf -v             # 브로커 (127.0.0.1:1883, �
 .venv/bin/python tools/clean_map.py maps/gen_loop/fms_map.json --out DIR --level normal   # 맵 노이즈 정리 (gen_map.py --clean 으로도)
 .venv/bin/python tools/synth_map.py tools/map_layouts/loop.txt --out maps/synth_loop   # 원본 조각 없이 벽+질감 노이즈로 한 번에 그리기
 .venv/bin/python tools/map_gen_gui.py   # 맵 생성 GUI (PySide6). synth_map/gen_map 을 QProcess 로 실행
+.venv/bin/python tools/launcher.py   # 통합 런처 (PySide6). 브로커/로봇/뷰어/편집기/생성기 실행·정지. 의존성은 루트 requirements.txt
 .venv/bin/python tools/map_editor.py maps/gen_loop/fms_map.json   # 맵 편집기 (PySide6). 도형을 edits.json 에 저장 -> edited_navi_gridmap.png 렌더
 ```
 
@@ -63,7 +64,8 @@ python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
 - **`tools/`**: 별도 실행 파일(`send_order`, `place_obstacle`, `obstacle_zone`)로 `schemas.o` 만 링크. `mqtt_once.hpp` 는 1회 발행 헬퍼.
 - **`tools/gen_map.py`**: 레이아웃 텍스트(`tools/map_layouts/`, `.`/`#`, 1 글자 = 1 m)를 marching squares 로 타일링하고 각 타일에 `grid.png` 실제 조각을 붙인다. 벽은 항상 타일 가운데 선. 검사는 `planner.cpp` 의 inflate 규칙(비-FREE 전부 로봇 반폭 팽창)을 Python 으로 재현한 것 (`clean_map.py` 의 `inflate_free`) — planner 규칙이 바뀌면 같이 고친다. 통로 사분면에 노이즈 픽셀을 허용하지 않는 이유도 이 팽창 때문. 사방 회색 여백(기본 10 타일)을 붙이고 origin 을 -여백 으로 둬서 칸 중심 world 좌표는 양수 그대로 (`send_order` 가 음수 좌표를 못 받음). 출력은 `grid.png` + `edited_navi_gridmap.png`(최초 생성 때만 복사, 이후 보존 — 편집기/FMS 웹 UI 수정용)이고 메타의 image 는 후자.
 - **`tools/synth_map.py`**: 같은 레이아웃을 픽셀 마스크로 펴서(칸 중심 = 타일 모서리, gen_map 과 같은 배치) 경계 양쪽 `wall-px/2` 에 벽을 긋고 질감 노이즈를 맵 전체에 한 번에 깐다. 조각 경계가 없어서 이음매가 없다. 저장/검사/레이아웃 파싱은 `gen_map.py` 의 `save_map`/`check`/`load_layout` 을 import.
-- **`tools/map_editor.py` / `map_edit_model.py`**: grid.png + `edits.json`(world 좌표 도형: rect/line/path, 흰·검·회 3값) → `edited_navi_gridmap.png`. 모델(GUI 없음)이 렌더 규칙(픽셀 중심이 도형 안이면 칠함, AA 없음)을 가지고 편집기는 UI 만 한다. 시작 시 grid.png/edited_navi_gridmap.png 둘 다 필요, 저장은 수동. 통로 끊김 검사는 `clean_map.inflate_free`/`label` 재사용 (로봇 반폭 8 px).
+- **`tools/map_editor.py` / `map_edit_model.py`**: grid.png + `edits.json`(world 좌표 도형: rect/line/path, 흰·검·회 3값) → `edited_navi_gridmap.png`. 모델(GUI 없음)이 렌더 규칙(픽셀 중심이 도형 안이면 칠함, AA 없음)을 가지고 편집기는 UI 만 한다. 시작 시 grid.png/edited_navi_gridmap.png 둘 다 필요, 저장은 수동. 원점(O 도구) 재지정 시 도형 world 좌표를 평행이동하고 저장 때만 `fms_map.json` 의 origin 을 쓴다 (`edits.json.origin` 이 도형 저장 당시 좌표계라 `load_edits` 가 맵 origin 과 다르면 보정). 통로 끊김 검사는 `clean_map.inflate_free`/`label` 재사용 (로봇 반폭 8 px).
+- **`tools/launcher.py` / `launcher_core.py` / `launcher_tools.json`**: 하위 프로세스 관리 GUI. 툴 목록은 `launcher_tools.json`(mode: single/per_map/multi/oneshot, cmd 템플릿, requires, stop_timeout_s)이고 코드는 툴 이름을 모른다 (예외: 브로커를 `listens` 키로 식별). 프로세스는 `Popen(start_new_session=True)` + `logs/<이름>.log` 로 띄워서 런처가 죽어도 살아남고, `.run/launcher.json` 의 PID 와 명령 대조로 다시 붙는다. 정지는 SIGTERM, 제한 시간 후 사용자 확인으로 SIGKILL. 그래서 파이썬 Qt 툴(`map_editor.py`, `map_gen_gui.py`)은 SIGTERM 을 `window.close()` 로 바꿔 closeEvent 를 타게 해 뒀다 — 새 Qt 툴을 추가하면 같은 처리를 넣는다. `core` 는 Qt 없음.
 - **`tools/clean_map.py`**: 맵 노이즈 후처리 (통로 구멍 메움 → FREE opening → 작은 FREE 섬 삭제 → FREE 에서 먼 비-FREE 를 128 로 → 선택: 실선 벽, 값 평탄화). 프리셋 light/normal/strong. scipy 없이 morphology 와 run-length 라벨링을 직접 구현했고 `gen_map.py` 가 이 모듈을 import 한다 (`tools/` 에서 같은 폴더 import).
 
 ## 주의

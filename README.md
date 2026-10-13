@@ -61,6 +61,23 @@ cmake 없이 순수 Makefile (`Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux
 localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다 —
 `AMR_master/maps/` 갱신되면 여기도 수동 재복사 필요.
 
+### 통합 런처 (`tools/launcher.py`)
+
+브로커, 로봇 클라이언트, 뷰어, 맵 편집기, 맵 생성기를 한 창에서 켜고 끈다.
+
+```bash
+# 리포 루트에서 (최초 1회: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
+.venv/bin/python tools/launcher.py
+```
+
+- 각 프로그램은 별도 프로세스로 뜨고 자기 창은 따로 뜬다. 출력은 `logs/<이름>.log` 에 남고 화면에는 마지막 2000줄만 보인다.
+- 위쪽 브로커 host/port/맵은 공통 값이다. 로봇·뷰어는 브로커가 꺼져 있으면 먼저 켤지 묻는다.
+- `추가 ▾` 에서 로봇(대수 지정, 이름은 AMR-NNN 자동, y 는 대수마다 1 m 씩 증가), 맵 편집기(선택한 맵, 맵당 1개), 빌드(make)를 추가한다.
+- 정지는 SIGTERM 이다. 맵 편집기는 저장 안 한 수정이 있으면 확인 창이 뜨고, 제한 시간(편집기 30 초)이 지나면 강제 종료할지 묻는다.
+- 런처를 닫을 때 "전부 정지 / 그대로 두고 종료 / 취소" 를 고른다. 그대로 두고 종료하거나 비정상 종료하면 다음 실행 때 `.run/launcher.json` 으로 프로세스를 다시 찾아 붙는다.
+- 로봇 시작 위치가 벽/미탐색이어도 실행은 된다 (`start position ... is not drivable` 경고). 대신 오더를 받으면 `NO_PATH` 오류가 나고, 제어판(GUI)의 강제 위치지정으로 주행 가능한 칸에 옮기면 `NO_PATH`/`COLLISION` 오류가 풀린다. 레이아웃 맵은 칸 (r,c) 중심이 world ((c+1) m, (r+1) m).
+- 새 툴은 `tools/launcher_tools.json` 에 항목만 추가하면 붙는다 (파일 안 `_설명` 참고). `launch.sh`/`stop.sh` 는 따로 그대로 쓸 수 있다 (`.run/pids` 는 런처가 쓰지 않는다).
+
 ## 테스트 맵 생성 (`tools/gen_map.py`)
 
 손으로 그린 맵(`maps/warehouse`)은 너무 정형화돼 있어서, 실제 SLAM 맵
@@ -125,7 +142,8 @@ python3.11 -m venv .venv && .venv/bin/pip install numpy pillow   # 리포 루트
 색/굵기 변경·삭제할 수 있고 줌해도 모양이 그대로다. 색은 255/0/128 세 값뿐이고 안티앨리어싱이 없다 (중간 회색값은 UNKNOWN 장애물이 되기 때문).
 
 - 맵 폴더에 `grid.png` 와 `edited_navi_gridmap.png` 가 둘 다 없으면 경고를 띄우고 시작하지 않는다.
-- 저장은 Ctrl+S 수동뿐이다. `edits.json` + `edited_navi_gridmap.png` 를 쓰고 `fms_map.json` 은 건드리지 않는다.
+- 저장은 Ctrl+S 수동뿐이다. `edits.json` + `edited_navi_gridmap.png` 를 쓴다. `fms_map.json` 은 원점을 바꿨을 때만 `origin_x`/`origin_y` 두 값을 고친다 (저장 전 확인).
+- **원점 지정 (O)**: 클릭한 지점(가장 가까운 픽셀 모서리)을 world (0, 0) 으로 만든다. 이미지와 도형은 그대로이고 좌표계만 옮겨진다 (도형 world 좌표는 같이 평행이동, 실행 취소 가능). 화면에 보라색 원 + x(빨강)/y(초록) 축으로 현재 원점이 표시된다. 원점이 바뀌면 로봇 시작 위치, 오더/구역 좌표처럼 이 맵의 world 좌표를 쓰는 값도 같이 바뀌어야 한다. 주의: 맵 생성기로 같은 폴더에 다시 생성하면 origin 이 -여백 으로 되돌아간다.
   저장 직후 주행 가능 영역(로봇 반폭 8 px 팽창 기준)이 늘어났으면 통로 끊김 경고를 띄운다.
 - 디스크의 `edited_navi_gridmap.png` 가 `grid.png + edits.json` 렌더와 다르면(다른 도구로 수정) 첫 저장 때 덮어쓸지 묻는다.
 - `gen_map`/`synth_map` 이 `grid.png` 를 다시 만들어도 `edits.json` 은 남는다. 새 `grid.png` 위에 같은 도형이 다시 얹힌다.
