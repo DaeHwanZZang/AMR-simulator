@@ -61,6 +61,105 @@ cmake 없이 순수 Makefile (`Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux
 localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다 —
 `AMR_master/maps/` 갱신되면 여기도 수동 재복사 필요.
 
+## 테스트 맵 생성 (`tools/gen_map.py`)
+
+손으로 그린 맵(`maps/warehouse`)은 너무 정형화돼 있어서, 실제 SLAM 맵
+(`maps/641931.../grid.png`) 에서 1 m 타일 조각을 잘라 레이아웃대로 이어붙인다.
+점선 벽, 벽 너머 회색(미탐색), 레이저 줄무늬가 원본 그대로 남는다.
+
+```bash
+python3.11 -m venv .venv && .venv/bin/pip install numpy pillow   # 리포 루트. viewer/.venv 를 써도 된다
+.venv/bin/python tools/gen_map.py tools/map_layouts/loop.txt --out maps/gen_loop --seed 1
+./robot_client --id AMR-001 --map maps/gen_loop/fms_map.json --x 1.0 --y 1.0
+```
+
+- 레이아웃은 텍스트 한 글자 = 1 m: `.` 통로, `#` 막힘, `;` 주석. 바깥 1칸은 자동으로 막힌다
+- 출력 파일: `grid.png`(생성 결과, 다시 생성하면 덮어씀), `edited_navi_gridmap.png`(편집기/FMS 웹 UI
+  수정용. **최초 생성 때만** `grid.png` 복사본으로 만들고 이후엔 건드리지 않음 -- 새 레이아웃으로 다시
+  만들려면 이 파일을 지우고 생성), `fms_map.json`(image 가 `edited_navi_gridmap.png` 를 가리킴)
+- 여백: 사방에 `--margin-tiles`(기본 10 = 320 px = 10 m) 만큼 회색(미탐색) 여백. 검사는 여백 전 이미지로 한다
+- 좌표: origin = (-여백 m, -여백 m) 이라 여백과 상관없이 레이아웃 (행 r, 열 c) 칸 중심 =
+  world (c+1, r+1) m. 칸 중심 좌표는 전부 양수라 `send_order --path` 로 바로 보낼 수 있다
+  (`send_order` 는 음수 좌표를 못 받음)
+- 생성 후 planner 와 같은 규칙(비-FREE 를 로봇 반폭만큼 팽창)으로 모든 통로 칸이
+  주행 가능하고 하나로 이어지는지 검사한다. 실패하면 seed 를 바꿔 `--tries` 번 재시도
+- 원본에 모서리 조각이 드물어서 일부 모서리는 일자벽 조각 두 장으로 합성된다.
+  타일 경계(1 m 격자)에서 줄무늬가 끊기는 건 남아 있다 — 표시 문제, 주행 영향 없음
+- 대각선으로만 맞닿은 통로는 이어지지 않는다 (planner 도 못 지나간다)
+
+### 원본 없이 한 번에 그리기 (`tools/synth_map.py`)
+
+조각을 이어붙이면 조각 경계마다 벽 위치와 노이즈가 어긋난다. `synth_map.py` 는 같은
+레이아웃으로 맵 전체에 벽(경계 양쪽 1 px 씩 = 32 px 타일의 16, 17 번째 픽셀)을 긋고
+질감 노이즈를 맵 단위로 깔아서 이음매가 없다. 좌표, 검사, 출력 파일은 `gen_map.py` 와 같다.
+
+```bash
+.venv/bin/python tools/synth_map.py tools/map_layouts/loop.txt --out maps/synth_loop --seed 1   # 리포 루트에서
+```
+
+- 질감: 통로 247~255 저주파, 벽 20~60, 벽에서 `--fringe-px`(기본 2) 안에 회색 테두리
+  (`--fringe-prob`). 통로 쪽 테두리는 비-FREE 라 planner 기준 통로가 테두리 폭만큼 좁아진다
+- 불규칙성 (기본 켜짐, 0 으로 끄면 실선 직선 벽):
+  - `--wobble-px 1.0` 벽 흔들림. 0 이 아니면 벽이 정확히 16, 17 번째 픽셀이 아니다
+  - `--dash-gap 0.25 --dash-px 5` 점선 벽. 벽 픽셀의 25% 를 128 로 끊는다 (128 도 비-FREE 라 주행 영향 없음)
+  - `--fur-prob 0.06 --fur-len 10` 털. 끊긴 곳에서 막힘 쪽으로 가는 1 px FREE 선. planner 팽창으로 지워진다
+  - `--ray-prob 0.012 --ray-len 150` 긴 광선. 끊긴 곳에서 부채꼴로 최대 150 px, 일부는 옅은 회색.
+    여백도 같이 그려서 회색 영역으로 길게 뻗는다 (통로/다른 벽을 만나면 멈춤). 검사는 여백을 잘라낸 이미지로 한다
+
+### 생성 GUI (`tools/map_gen_gui.py`)
+
+레이아웃 편집, 방식 선택(합성 / 실제 조각), 옵션 입력, 생성 버튼, 결과 미리보기와 로그가
+한 창에 있다. 내부에서는 `synth_map.py` / `gen_map.py` 를 그대로 실행하므로 CLI 와 결과가 같다.
+`seed 랜덤 재생성` 버튼은 옵션은 그대로 두고 seed 만 무작위로 바꿔 바로 다시 생성한다 (덮어쓰기 확인 없음).
+마지막으로 쓴 옵션과 레이아웃 텍스트는 `QSettings` 로 저장돼 다음 실행 때 복원된다 (생성 시, 창 닫을 때 저장).
+
+```bash
+.venv/bin/pip install PySide6                 # 리포 루트. numpy, pillow 와 같이 필요
+.venv/bin/python tools/map_gen_gui.py         # 기본 출력 maps/gui_map (이미 있으면 덮어쓸지 묻는다)
+```
+
+### 맵 편집기 (`tools/map_editor.py`)
+
+`grid.png` 위에 흰색/검정/회색 도형(사각형·선분·자유형)을 얹어 `edited_navi_gridmap.png` 를 만든다.
+이미지에 직접 그리지 않고 도형을 world 좌표(m)로 `edits.json` 에 저장하므로, 다시 열어 도형을 선택·이동·꼭짓점 수정·
+색/굵기 변경·삭제할 수 있고 줌해도 모양이 그대로다. 색은 255/0/128 세 값뿐이고 안티앨리어싱이 없다 (중간 회색값은 UNKNOWN 장애물이 되기 때문).
+
+- 맵 폴더에 `grid.png` 와 `edited_navi_gridmap.png` 가 둘 다 없으면 경고를 띄우고 시작하지 않는다.
+- 저장은 Ctrl+S 수동뿐이다. `edits.json` + `edited_navi_gridmap.png` 를 쓰고 `fms_map.json` 은 건드리지 않는다.
+  저장 직후 주행 가능 영역(로봇 반폭 8 px 팽창 기준)이 늘어났으면 통로 끊김 경고를 띄운다.
+- 디스크의 `edited_navi_gridmap.png` 가 `grid.png + edits.json` 렌더와 다르면(다른 도구로 수정) 첫 저장 때 덮어쓸지 묻는다.
+- `gen_map`/`synth_map` 이 `grid.png` 를 다시 만들어도 `edits.json` 은 남는다. 새 `grid.png` 위에 같은 도형이 다시 얹힌다.
+- 조작: V 선택 / R 사각형 / L 선분(Shift 15° 단위) / P 자유형, 휠 줌, 가운데·오른쪽 버튼 또는 Space+드래그 이동,
+  F 전체 보기, Delete 삭제, Ctrl+Z / Ctrl+Shift+Z 실행 취소·다시 실행. `결과 미리보기` 는 저장될 실제 픽셀을 보여 준다.
+- 렌더 규칙은 GUI 없는 `tools/map_edit_model.py` 에 있다 (FMS 웹 UI 도 같은 규칙을 쓰게 하려는 것). 로봇/뷰어는 시작할 때 이미지를 읽으므로 저장 후 재시작해야 반영된다.
+
+```bash
+.venv/bin/python tools/map_editor.py maps/gen_loop/fms_map.json   # 리포 루트에서 (PySide6, numpy, pillow)
+```
+
+### 노이즈 정리 (`tools/clean_map.py`)
+
+생성 맵(또는 아무 맵)의 레이저 줄무늬, 벽 바깥 털, 통로 점을 지운다. 생성할 때
+`--clean` 으로 붙이거나, 이미 있는 맵에 따로 돌린다 (리포 루트에서):
+
+```bash
+.venv/bin/python tools/gen_map.py tools/map_layouts/loop.txt --out maps/gen_loop --seed 1 --clean normal
+.venv/bin/python tools/clean_map.py maps/gen_loop/fms_map.json --out maps/gen_loop_clean --level normal
+```
+
+| 프리셋 | 지우는 것 | 남는 것 |
+|---|---|---|
+| `light` | 통로 점, 막힘 영역 줄무늬, 멀리 튄 점 | 벽 털, 점선 벽, 질감 |
+| `normal` | + 벽 틈으로 삐져나간 털 | 점선 벽, 벽 앞 회색 테두리, 통로 질감 |
+| `strong` | + 원래 벽 (통로 경계에 실선 벽을 새로 긋고 값 평탄화) | 통로 모양만. 손으로 그린 맵에 가깝다 |
+
+- 단계별 값은 `--fill-hole-px`, `--open-px`, `--min-free-px`, `--wall-reach-px`,
+  `--[no-]solid-walls`, `--[no-]flatten` 로 덮어쓴다 (`gen_map.py` 에서는 `--clean-` 접두사)
+- 정리 전후 planner 기준 주행 가능 면적을 출력한다. 통로 점을 메우면 면적이 늘고,
+  털 깎기(opening)는 줄인다. `gen_map.py --clean` 은 정리 뒤에 레이아웃 검사를 돈다
+- 원본 SLAM 맵에서 벽 틈으로 넓게 퍼진 부채꼴 FREE 는 통로와 이어져 있고 폭도 넓어서
+  안 지워진다 (생성 맵에는 조각 추출 단계에서 걸러져 거의 없다)
+
 ## 맵 동기화 (SET_MAP 다운로더)
 
 FMS 에 로봇이 등록돼 있으면, 접속 후 FMS 가 `fms/v1/{id}/instant` 로 `SET_MAP`
@@ -92,7 +191,7 @@ Qt 는 메인스레드 전용이라 `--gui` 주면 tick/MQTT 루프를 백그라
 | 경로계획/오더 실행/통신/시계 | `include+src/{planner,executor,comm,clock}.*` |
 | 물리 시뮬레이션 | `include+src/{kinematics,battery,dynamic_obstacles}.*` |
 | 로컬 제어판 | `gui.hpp/cpp` (Qt Widgets) |
-| CLI 도구 | `tools/*.cpp` |
+| CLI 도구 | `tools/*.cpp`, 테스트 맵 생성/정리 `tools/{gen_map,synth_map,clean_map}.py` |
 | SET_MAP 번들 다운로더 | `map_sync.hpp/cpp` |
 
 기능 범위: MQTT(LWT/재접속), 오더 상태머신(released/order_update_id/거절 규칙),
