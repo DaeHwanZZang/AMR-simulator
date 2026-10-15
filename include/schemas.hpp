@@ -31,7 +31,8 @@ enum class RobotState { IDLE, BUSY, CHARGING, ERROR, EMERGENCY };
 enum class BusySubState { MOVING, WAITING, ACTING };
 enum class OperatingMode { AUTO, MANUAL };
 enum class PauseSource { LOCAL, FMS };
-enum class ActionType { PICK, DROP, CHARGE, WAIT };
+// STRAIGHT/DOCK/PARK 는 Action.params 가 필요하다 (Action::from_json 이 검증).
+enum class ActionType { PICK, DROP, CHARGE, WAIT, STRAIGHT, DOCK, PARK };
 enum class ActionStatus { WAITING, RUNNING, FINISHED, FAILED };
 enum class ErrorLevel { WARNING, FATAL };
 enum class ConnectionState { ONLINE, OFFLINE, CONNECTION_BROKEN };
@@ -70,11 +71,30 @@ struct Pose {
     cJSON* to_json() const;
 };
 
+// Action/InstantAction 의 params 값 (JSON float|str|bool)
+using ParamValue = std::variant<double, std::string, bool>;
+using Params = std::map<std::string, ParamValue>;
+
+// params 헬퍼 (문자열/숫자 어느 쪽으로 와도 관대하게 읽는다 — tools/*.py 가 JSON
+// number 로 보내는 값도, 문자열로 보내는 값도 있다)
+double param_double(const Params& p, const std::string& key, double def);
+std::string param_string(const Params& p, const std::string& key, const std::string& def);
+inline bool param_has(const Params& p, const std::string& key) { return p.find(key) != p.end(); }
+
+// 노드 도착 후 동작. params 는 액션 종류별:
+//   STRAIGHT : distance (m, 필수, 0 아님. + 전진 / - 후진), speed (m/s, 선택)
+//              노드 theta 방향으로 경로계획 없이 직선 이동한다.
+//   DOCK     : entry (FORWARD|BACKWARD, 필수), undock_distance (m > 0, 필수),
+//              min_charge (% 0~100, 필수), speed (선택)
+//   PARK     : entry, undock_distance (필수), speed (선택)
+//   DOCK/PARK 의 노드 position 은 도킹(주차) 완료 자세다. 로봇은 그 앞 undock_distance 지점까지
+//   A* 로 간 뒤 직선으로 들어간다. 빠져나올 때도 같은 직선을 되짚는다.
 struct Action {
     std::string action_id;
     ActionType action_type = ActionType::WAIT;
     double duration = 0.0;
     std::optional<std::string> payload_id;
+    Params params;
     cJSON* to_json() const;
     static Action from_json(cJSON* obj);  // throws ValidationError
 };
@@ -212,8 +232,6 @@ struct Connection {
 // InstantAction : FMS -> Robot
 // =============================================================================
 
-using ParamValue = std::variant<double, std::string, bool>;
-
 struct InstantAction {
     std::string version = PROTOCOL_VERSION;
     long long header_id = 0;
@@ -222,13 +240,12 @@ struct InstantAction {
 
     std::string action_id;
     InstantActionType action_type = InstantActionType::PAUSE;
-    std::map<std::string, ParamValue> params;
+    Params params;
 
     static InstantAction from_json_string(const std::string& payload);
     std::string to_json_string() const;  // 로봇 클라이언트가 만들 일은 없지만 CLI 툴에서 쓴다
 
-    // params 헬퍼 (문자열/숫자 어느 쪽으로 와도 관대하게 읽는다 — tools/*.py 가 JSON
-    // number 로 보내는 값도, 문자열로 보내는 값도 있다)
+    // params 헬퍼 (param_double 등의 얇은 래퍼)
     double get_double(const std::string& key, double def) const;
     std::string get_string(const std::string& key, const std::string& def) const;
     int get_int(const std::string& key, int def) const;

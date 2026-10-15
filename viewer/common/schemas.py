@@ -132,6 +132,9 @@ class ActionType(str, Enum):
     DROP = "DROP"
     CHARGE = "CHARGE"
     WAIT = "WAIT"
+    STRAIGHT = "STRAIGHT"   # 경로계획 없이 노드 theta 방향 직선 이동. params: distance(+전진/-후진), speed
+    DOCK = "DOCK"           # 충전기 도킹 후 충전하며 대기. params: entry, undock_distance, min_charge, speed
+    PARK = "PARK"           # 정밀 주차 후 대기. params: entry, undock_distance, speed
 
 
 class ActionStatus(str, Enum):
@@ -198,6 +201,43 @@ class Action(BaseModel):
     action_type: ActionType
     duration: float = Field(default=0.0, ge=0, description="예상 소요 시간(초)")
     payload_id: Optional[str] = Field(default=None, description="적재물 식별자")
+    params: dict[str, float | str | bool] = Field(
+        default_factory=dict,
+        description=(
+            "액션별 인자. STRAIGHT: distance(m, 0 아님, +전진/-후진), speed(m/s, 선택). "
+            "DOCK/PARK: entry(FORWARD|BACKWARD), undock_distance(m > 0), speed(선택), "
+            "DOCK 은 min_charge(% 0~100, 이 이상 충전돼야 다음 job 을 받는다) 추가. "
+            "DOCK/PARK 의 노드 position 은 진입 완료 자세이고, 로봇은 그 앞 undock_distance "
+            "지점까지 경로계획으로 간 뒤 직선으로 들어간다. 빠져나올 때도 같은 직선을 되짚는다."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_params(self) -> "Action":
+        # C++ check_action_params (src/schemas.cpp) 와 같은 규칙
+        def num(key: str) -> float:
+            v = self.params.get(key)
+            if isinstance(v, bool) or v is None:
+                raise ValueError(f"{self.action_type.value} 는 숫자 params.{key} 가 필요하다")
+            try:
+                return float(v)
+            except ValueError:
+                raise ValueError(f"{self.action_type.value} 는 숫자 params.{key} 가 필요하다") from None
+
+        t = self.action_type
+        if t in (ActionType.STRAIGHT, ActionType.DOCK, ActionType.PARK):
+            if "speed" in self.params and not num("speed") > 0:
+                raise ValueError("params.speed 는 0 보다 커야 한다")
+        if t == ActionType.STRAIGHT and num("distance") == 0:
+            raise ValueError("STRAIGHT params.distance 는 0 이 아니어야 한다")
+        if t in (ActionType.DOCK, ActionType.PARK):
+            if self.params.get("entry") not in ("FORWARD", "BACKWARD"):
+                raise ValueError(f"{t.value} params.entry 는 FORWARD|BACKWARD")
+            if not num("undock_distance") > 0:
+                raise ValueError(f"{t.value} params.undock_distance 는 0 보다 커야 한다")
+            if t == ActionType.DOCK and not 0 <= num("min_charge") <= 100:
+                raise ValueError("DOCK params.min_charge 는 0~100")
+        return self
 
 
 class TimeWindow(BaseModel):

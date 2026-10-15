@@ -32,7 +32,17 @@ public:
     void set_path(std::vector<std::pair<double, double>> waypoints) {
         remaining_ = std::move(waypoints);
         final_theta_.reset();
+        straight_.reset();
     }
+    // 경로계획 없이 (tx, ty) 까지 직선 이동 (전/후진, DOCK/PARK 진입·탈출, STRAIGHT 액션).
+    // 회전하지 않고 지금 heading 을 그대로 유지한다. 목표가 등 뒤면 후진이 된다.
+    // 최고 속도는 min(max_speed, max_velocity). set_path 와 배타적이다 (서로를 지운다).
+    void set_straight(double tx, double ty, double max_speed) {
+        remaining_.clear();
+        final_theta_.reset();
+        straight_ = Straight{tx, ty, max_speed};
+    }
+    bool straight_active() const { return straight_.has_value(); }
     // 경로 마지막 지점 도착 후 이 각도로 정렬해야 is_path_complete() 가 true 가 된다.
     void set_final_theta(double target_theta) { final_theta_ = target_theta; }
     void set_pose(double nx, double ny, const double* ntheta = nullptr) {
@@ -41,7 +51,7 @@ public:
     }
     void emergency_stop() {
         velocity_ = 0.0; acceleration_ = 0.0; angular_velocity_ = 0.0;
-        remaining_.clear(); final_theta_.reset();
+        remaining_.clear(); final_theta_.reset(); straight_.reset();
     }
     bool is_path_complete() const;
 
@@ -55,11 +65,14 @@ private:
     double angular_velocity_ = 0.0;
     std::vector<std::pair<double, double>> remaining_;
     std::optional<double> final_theta_;
+    struct Straight { double tx, ty, max_speed; };
+    std::optional<Straight> straight_;
 
     double remaining_length() const;
     void advance(double dist);
     // target_theta 로 사다리꼴 각가속도 프로파일을 따라 회전. 회전 후 남은 각도 오차 반환.
     double rotate_step(double target_theta, double dt);
+    RobotKinematicState step_straight(double dt);
 };
 
 }  // namespace fms

@@ -104,6 +104,24 @@ private:
     size_t segment_wp_total_ = 0;
     std::optional<Action> acting_;
     double acting_elapsed_ = 0.0;
+
+    // 경로계획 없는 직선 이동 (STRAIGHT 액션, DOCK/PARK 진입, 언도킹). 있으면 tick 이 이것만 돌린다.
+    // kinematics 쪽 직선 목표는 PAUSE/E-STOP 에서 지워지므로 여기 목표를 들고 있다가 재개 때 다시 건다.
+    enum class StraightPurpose { ACTION, DOCK_IN, UNDOCK };
+    struct StraightMotion { double tx, ty, speed; StraightPurpose purpose; };
+    std::optional<StraightMotion> straight_;
+
+    // 도킹/주차 상태. DOCK/PARK 진입을 시작할 때 생기고 언도킹이 끝나야 사라진다.
+    // 진입이나 언도킹 도중에 오더가 취소돼도 남아 있어서, 다음 이동 전에 exit 지점까지 먼저 빠져나온다
+    // (도크 안쪽은 planner 팽창 영역이라 A* 로는 못 나온다).
+    struct Docked {
+        bool charger;            // DOCK = true (충전), PARK = false
+        double exit_x, exit_y;   // 진입 직전 자세 = 언도킹 목표
+        double min_charge;       // 이 충전량(%) 이상이어야 새 job 을 받는다 (DOCK 만)
+        double speed;
+        bool contact = false;    // 진입 완료 (충전 접점 연결)
+    };
+    std::optional<Docked> docked_;
     std::vector<std::pair<std::string, ActionStatus>> action_states_;  // 삽입 순서 유지
 
     double since_dynamic_replan_ = 0.0;
@@ -119,6 +137,14 @@ private:
     void try_dynamic_replan(const std::vector<DynamicObstacle>& detected);
     bool check_collision(double x, double y, double prev_x, double prev_y);
     void tick_action(double dt);
+    void tick_straight(double dt, const std::vector<DynamicObstacle>& detected);
+    void finish_straight();
+    void start_undock();
+    bool docked_charging() const { return docked_ && docked_->charger && docked_->contact; }
+    // 충전기에 붙어 있고 min_charge 미달 -> CHARGING 으로 보고하고 job 을 받지 않는다
+    bool charge_hold() const { return docked_charging() && battery.charge < docked_->min_charge; }
+    RobotState idle_state() const { return charge_hold() ? RobotState::CHARGING : RobotState::IDLE; }
+    std::pair<double, double> approach_point(const OrderNode& node) const;
     void replan();
     std::vector<std::pair<double, double>> plan_segment_path(
         const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles = nullptr);

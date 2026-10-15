@@ -78,7 +78,37 @@ RobotKinematicState TrapezoidalKinematics::hold(double dt) {
     return get_state();
 }
 
+RobotKinematicState TrapezoidalKinematics::step_straight(double dt) {
+    // 회전 없이 목표점까지 사다리꼴 속도로 직선 이동. velocity_ 는 크기만 갖는다 (후진도 양수).
+    angular_velocity_ = 0.0;
+    double dx = straight_->tx - x, dy = straight_->ty - y;
+    double dist = std::hypot(dx, dy);
+    double vmax = std::min(max_velocity, straight_->max_speed);
+    double stop_dist = max_deceleration > 0 ? (velocity_ * velocity_) / (2 * max_deceleration) : 0.0;
+    double accel;
+    if (dist <= stop_dist) accel = -max_deceleration;
+    else if (velocity_ < vmax) accel = max_acceleration;
+    else accel = 0.0;
+    double new_velocity = std::max(0.0, std::min(vmax, velocity_ + accel * dt));
+    // 감속 끝에 속도가 0 이 되어 목표 직전에서 멈추는 일을 막는다 (최소 속도로 마저 들어간다)
+    double move = std::max((velocity_ + new_velocity) / 2 * dt, std::min(dist, 0.01 * dt));
+    if (move >= dist - 1e-9) {
+        x = straight_->tx;
+        y = straight_->ty;
+        straight_.reset();
+        velocity_ = 0.0;
+        acceleration_ = 0.0;
+        return get_state();
+    }
+    x += dx / dist * move;
+    y += dy / dist * move;
+    velocity_ = new_velocity;
+    acceleration_ = accel;
+    return get_state();
+}
+
 RobotKinematicState TrapezoidalKinematics::step(double dt) {
+    if (straight_) return step_straight(dt);
     double remaining_dist = remaining_length();
     bool has_target = false;
     double heading_error = 0.0;
@@ -119,13 +149,17 @@ RobotKinematicState TrapezoidalKinematics::step(double dt) {
 }
 
 bool TrapezoidalKinematics::is_path_complete() const {
+    if (straight_) return false;
     if (remaining_length() >= 1e-9) return false;
     if (final_theta_ && std::abs(normalize_angle(*final_theta_ - theta)) >= kHeadingTolerance) return false;
     return true;
 }
 
 RobotKinematicState TrapezoidalKinematics::get_state() const {
-    return RobotKinematicState{x, y, theta, velocity_, acceleration_, angular_velocity_, remaining_,
+    // 직선 이동 중에는 목표점 하나를 local_path 로 보고한다 (뷰어 표시, 동적 장애물 막힘 판정용)
+    std::vector<std::pair<double, double>> path = remaining_;
+    if (straight_) path = {{straight_->tx, straight_->ty}};
+    return RobotKinematicState{x, y, theta, velocity_, acceleration_, angular_velocity_, std::move(path),
                                 is_path_complete()};
 }
 

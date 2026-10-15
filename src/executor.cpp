@@ -14,6 +14,7 @@ namespace {
 
 double _DYNAMIC_REPLAN_RETRY = 1.0;
 double _SENSOR_HYSTERESIS_MARGIN = 0.5;
+double _STRAIGHT_SPEED = 0.2;  // m/s, STRAIGHT/DOCK/PARK 의 params.speed 기본값
 
 // Liang-Barsky: 선분 a->b 가 사각형 [rx0,rx1]x[ry0,ry1] 과 겹치는가.
 // planner.plan_path 와 같은 기준(사각형+robot_width/2 팽창)으로 막힘을 판정해야
@@ -199,6 +200,9 @@ bool OrderExecutor::accept_order(const Order& order) {
     }
 
     if (!can_accept_job()) {
+        if (charge_hold())
+            log::warning("[%s] docked: battery %.1f%% < min_charge %.1f%% -- not accepting jobs yet", robot_id.c_str(),
+                         battery.charge, docked_->min_charge);
         log::warning("[%s] rejecting order %s: state=%s mode=%s paused=%d active=%s", robot_id.c_str(),
                      order.order_id.c_str(), to_string(state()).c_str(), to_string(mode_).c_str(),
                      paused_, order_id_.c_str());
@@ -334,13 +338,17 @@ void OrderExecutor::tick(double dt) {
         battery.step(dt, 0.0);
         return;
     }
+    if (straight_) {
+        tick_straight(dt, detected);
+        return;
+    }
     if (acting_) {
         tick_action(dt);
         battery.step(dt, 0.0);
         return;
     }
     if (order_id_.empty()) {
-        set_base(RobotState::IDLE);
+        set_base(idle_state());
         battery.step(dt, 0.0);
         return;
     }
@@ -473,11 +481,80 @@ void OrderExecutor::tick_action(double dt) {
               to_string(acting_->action_type).c_str());
     acting_ = std::nullopt;
     acting_elapsed_ = 0.0;
-    battery.charging = false;
+    battery.charging = docked_charging();
     replan();
 }
 
+void OrderExecutor::tick_straight(double dt, const std::vector<DynamicObstacle>& detected) {
+    const StraightMotion m = *straight_;
+    if (!kinematics.straight_active()) kinematics.set_straight(m.tx, m.ty, m.speed);  // 시작, 또는 PAUSE 등에서 재개
+    if (path_blocked_by(detected)) {  // 직선 구간은 우회하지 않는다. 비켜날 때까지 기다린다
+        auto kin_state = kinematics.hold(dt);
+        battery.step(dt, kin_state.velocity);
+        set_busy(BusySubState::WAITING);
+        return;
+    }
+    set_busy(m.purpose == StraightPurpose::UNDOCK ? BusySubState::MOVING : BusySubState::ACTING);
+    double prev_x = kinematics.x, prev_y = kinematics.y;
+    auto kin_state = kinematics.step(dt);
+    battery.step(dt, kin_state.velocity);
+    if (check_collision(kin_state.x, kin_state.y, prev_x, prev_y)) return;
+    if (!kinematics.straight_active()) finish_straight();
+}
+
+void OrderExecutor::finish_straight() {
+    const StraightMotion m = *straight_;
+    straight_.reset();
+    switch (m.purpose) {
+        case StraightPurpose::ACTION:
+        case StraightPurpose::DOCK_IN:
+            if (m.purpose == StraightPurpose::DOCK_IN) {
+                docked_->contact = true;
+                battery.charging = docked_->charger;
+                if (docked_->charger)
+                    log::info("[%s] docked at (%.2f, %.2f): charging, jobs accepted from %.1f%% (now %.1f%%)",
+                              robot_id.c_str(), kinematics.x, kinematics.y, docked_->min_charge, battery.charge);
+                else
+                    log::info("[%s] parked at (%.2f, %.2f)", robot_id.c_str(), kinematics.x, kinematics.y);
+            }
+            if (acting_) {
+                set_action_status(acting_->action_id, ActionStatus::FINISHED);
+                log::info("[%s] action complete: %s (%s)", robot_id.c_str(), acting_->action_id.c_str(),
+                          to_string(acting_->action_type).c_str());
+            }
+            acting_ = std::nullopt;
+            acting_elapsed_ = 0.0;
+            break;
+        case StraightPurpose::UNDOCK:
+            log::info("[%s] undocked to (%.2f, %.2f)", robot_id.c_str(), kinematics.x, kinematics.y);
+            docked_.reset();
+            break;
+    }
+    replan();
+}
+
+void OrderExecutor::start_undock() {
+    Docked& d = *docked_;
+    d.contact = false;
+    battery.charging = false;
+    straight_ = StraightMotion{d.exit_x, d.exit_y, d.speed, StraightPurpose::UNDOCK};
+    kinematics.set_path({});
+    set_busy(BusySubState::MOVING);
+    log::info("[%s] undocking: straight to (%.2f, %.2f) before planning", robot_id.c_str(), d.exit_x, d.exit_y);
+}
+
+std::pair<double, double> OrderExecutor::approach_point(const OrderNode& node) const {
+    // DOCK/PARK 노드 position 은 진입 완료 자세. FORWARD 진입이면 그 뒤쪽(heading 반대),
+    // BACKWARD 진입이면 그 앞쪽에서 출발해야 heading 을 유지한 채 직선으로 들어간다.
+    const Action& a = *node.action;
+    double d = param_double(a.params, "undock_distance", 0.0);
+    double sign = param_string(a.params, "entry", "FORWARD") == "FORWARD" ? -1.0 : 1.0;
+    double th = node.position.theta;
+    return {node.position.x + sign * d * std::cos(th), node.position.y + sign * d * std::sin(th)};
+}
+
 void OrderExecutor::replan() {
+    if (straight_) return;  // 직선 이동 중 (끝나면 finish_straight 가 다시 부른다)
     segment_.clear();
     segment_wp_bounds_.clear();
     segment_wp_total_ = 0;
@@ -494,6 +571,11 @@ void OrderExecutor::replan() {
     if (segment_.empty()) {
         log::debug("[%s] skipping replan: no released nodes in this segment", robot_id.c_str());
         kinematics.set_path({});
+        return;
+    }
+    if (docked_) {  // 도크/주차 칸 안은 A* 로 못 나온다. 진입했던 직선을 되짚어 먼저 빠져나온다
+        segment_.clear();
+        start_undock();
         return;
     }
     log::info("[%s] planning path from (%.2f, %.2f)", robot_id.c_str(), kinematics.x, kinematics.y);
@@ -515,7 +597,11 @@ void OrderExecutor::replan() {
 std::vector<std::pair<double, double>> OrderExecutor::plan_segment_path(
     const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles) {
     std::vector<std::pair<double, double>> targets;
-    for (int i : segment_) targets.emplace_back(nodes_[i].position.x, nodes_[i].position.y);
+    for (int i : segment_) {
+        auto& n = nodes_[i];
+        bool docking = n.action && (n.action->action_type == ActionType::DOCK || n.action->action_type == ActionType::PARK);
+        targets.push_back(docking ? approach_point(n) : std::make_pair(n.position.x, n.position.y));
+    }
 
     segment_wp_bounds_.clear();
     if (map == nullptr) {
@@ -579,6 +665,31 @@ void OrderExecutor::on_segment_arrived() {
         acting_ = node.action;
         acting_elapsed_ = 0.0;
         set_action_status(node.action->action_id, ActionStatus::RUNNING);
+        const Action& a = *node.action;
+        double speed = param_double(a.params, "speed", _STRAIGHT_SPEED);
+        if (a.action_type == ActionType::STRAIGHT) {
+            // 노드 theta 방향으로 distance 만큼 (음수면 후진). 실제 heading 은 정렬 허용오차(~1도)만큼
+            // 어긋나 있을 수 있지만 도착 오차는 시뮬레이션하지 않으므로 지령 방향 기준 목표점으로 간다.
+            double d = param_double(a.params, "distance", 0.0);
+            double th = node.position.theta;
+            straight_ = StraightMotion{node.position.x + d * std::cos(th), node.position.y + d * std::sin(th), speed,
+                                       StraightPurpose::ACTION};
+            set_busy(BusySubState::ACTING);
+            log::info("[%s] action started: %s (STRAIGHT %+.2fm)", robot_id.c_str(), a.action_id.c_str(), d);
+            return;
+        }
+        if (a.action_type == ActionType::DOCK || a.action_type == ActionType::PARK) {
+            bool charger = a.action_type == ActionType::DOCK;
+            // 진입 직전 자세(= 지금 위치)가 언도킹 목표. 진입을 시작하는 순간부터 도킹 상태로 친다
+            docked_ = Docked{charger, kinematics.x, kinematics.y, charger ? param_double(a.params, "min_charge", 0.0) : 0.0,
+                             speed};
+            straight_ = StraightMotion{node.position.x, node.position.y, speed, StraightPurpose::DOCK_IN};
+            set_busy(BusySubState::ACTING);
+            log::info("[%s] action started: %s (%s %s, %.2fm straight in)", robot_id.c_str(), a.action_id.c_str(),
+                      to_string(a.action_type).c_str(), param_string(a.params, "entry", "").c_str(),
+                      std::hypot(node.position.x - kinematics.x, node.position.y - kinematics.y));
+            return;
+        }
         if (node.action->action_type == ActionType::CHARGE) {
             set_base(RobotState::CHARGING);
             battery.charging = true;
@@ -608,13 +719,15 @@ void OrderExecutor::clear_order() {
     acting_ = std::nullopt;
     acting_elapsed_ = 0.0;
     action_states_.clear();
+    straight_.reset();  // docked_ 는 남긴다 (다음 이동 때 먼저 언도킹)
     kinematics.set_path({});
-    battery.charging = false;
+    battery.charging = docked_charging();
     since_dynamic_replan_ = 0.0;
-    set_base(RobotState::IDLE);
+    set_base(idle_state());
 }
 
 bool OrderExecutor::force_relocalize(double x, double y, double theta) {
+    docked_.reset();  // 다른 곳으로 옮겼으니 도킹은 풀린다
     clear_order();
     kinematics.emergency_stop();
     kinematics.set_pose(x, y, &theta);

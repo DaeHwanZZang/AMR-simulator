@@ -34,6 +34,9 @@ std::string to_string(ActionType v) {
         case ActionType::DROP: return "DROP";
         case ActionType::CHARGE: return "CHARGE";
         case ActionType::WAIT: return "WAIT";
+        case ActionType::STRAIGHT: return "STRAIGHT";
+        case ActionType::DOCK: return "DOCK";
+        case ActionType::PARK: return "PARK";
     }
     return "WAIT";
 }
@@ -100,6 +103,9 @@ ActionType action_type_from(const std::string& s) {
     if (s == "DROP") return ActionType::DROP;
     if (s == "CHARGE") return ActionType::CHARGE;
     if (s == "WAIT") return ActionType::WAIT;
+    if (s == "STRAIGHT") return ActionType::STRAIGHT;
+    if (s == "DOCK") return ActionType::DOCK;
+    if (s == "PARK") return ActionType::PARK;
     throw ValidationError("unknown ActionType: " + s);
 }
 ActionStatus action_status_from(const std::string& s) {
@@ -213,6 +219,106 @@ static Pose pose_from_json(cJSON* obj) {
     return p;
 }
 
+// -- params (Action/InstantAction 공용) ------------------------------------
+
+namespace {
+
+Params parse_params(cJSON* params, const char* ctx) {
+    Params out;
+    if (!params || cJSON_IsNull(params)) return out;
+    if (!cJSON_IsObject(params)) throw ValidationError(std::string(ctx) + ".params must be an object");
+    for (cJSON* child = params->child; child; child = child->next) {
+        std::string key = child->string ? child->string : "";
+        if (cJSON_IsBool(child)) out[key] = (bool)cJSON_IsTrue(child);
+        else if (cJSON_IsNumber(child)) out[key] = child->valuedouble;
+        else if (cJSON_IsString(child)) out[key] = std::string(child->valuestring);
+        else throw ValidationError(std::string(ctx) + ".params values must be float|str|bool");
+    }
+    return out;
+}
+
+cJSON* params_to_json(const Params& params) {
+    cJSON* p = cJSON_CreateObject();
+    for (auto& [k, v] : params) {
+        if (std::holds_alternative<double>(v)) cJSON_AddNumberToObject(p, k.c_str(), std::get<double>(v));
+        else if (std::holds_alternative<bool>(v)) cJSON_AddBoolToObject(p, k.c_str(), std::get<bool>(v));
+        else cJSON_AddStringToObject(p, k.c_str(), std::get<std::string>(v).c_str());
+    }
+    return p;
+}
+
+// 숫자로 읽을 수 있는 필수 param 인가 (문자열 숫자도 허용 — param_double 과 같은 관대함)
+bool param_is_number(const Params& p, const std::string& key) {
+    auto it = p.find(key);
+    if (it == p.end()) return false;
+    if (std::holds_alternative<double>(it->second)) return std::isfinite(std::get<double>(it->second));
+    if (std::holds_alternative<std::string>(it->second)) {
+        try { size_t n; return std::isfinite(std::stod(std::get<std::string>(it->second), &n)) && n > 0; } catch (...) { return false; }
+    }
+    return false;
+}
+
+// STRAIGHT/DOCK/PARK 는 params 없이는 실행할 수 없다. 잘못된 오더는 통째로 버린다
+// (duration < 0 과 같은 취급 — 반쯤 실행하다 멈추는 것보다 받지 않는 게 안전하다).
+void check_action_params(const Action& a) {
+    auto need_number = [&](const char* key) {
+        if (!param_is_number(a.params, key))
+            throw ValidationError("Action " + to_string(a.action_type) + " requires numeric params." + key);
+        return param_double(a.params, key, 0.0);
+    };
+    auto check_speed = [&]() {
+        if (param_has(a.params, "speed") && !(need_number("speed") > 0))
+            throw ValidationError("Action params.speed must be > 0");
+    };
+    switch (a.action_type) {
+        case ActionType::STRAIGHT:
+            if (need_number("distance") == 0) throw ValidationError("STRAIGHT params.distance must not be 0");
+            check_speed();
+            break;
+        case ActionType::DOCK:
+        case ActionType::PARK: {
+            std::string entry = param_string(a.params, "entry", "");
+            if (entry != "FORWARD" && entry != "BACKWARD")
+                throw ValidationError(to_string(a.action_type) + " params.entry must be FORWARD|BACKWARD");
+            if (!(need_number("undock_distance") > 0))
+                throw ValidationError(to_string(a.action_type) + " params.undock_distance must be > 0");
+            if (a.action_type == ActionType::DOCK) {
+                double mc = need_number("min_charge");
+                if (mc < 0 || mc > 100) throw ValidationError("DOCK params.min_charge must be 0~100");
+            }
+            check_speed();
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+}  // namespace
+
+double param_double(const Params& params, const std::string& key, double def) {
+    auto it = params.find(key);
+    if (it == params.end()) return def;
+    if (std::holds_alternative<double>(it->second)) return std::get<double>(it->second);
+    if (std::holds_alternative<std::string>(it->second)) {
+        try { return std::stod(std::get<std::string>(it->second)); } catch (...) { return def; }
+    }
+    if (std::holds_alternative<bool>(it->second)) return std::get<bool>(it->second) ? 1.0 : 0.0;
+    return def;
+}
+
+std::string param_string(const Params& params, const std::string& key, const std::string& def) {
+    auto it = params.find(key);
+    if (it == params.end()) return def;
+    if (std::holds_alternative<std::string>(it->second)) return std::get<std::string>(it->second);
+    if (std::holds_alternative<double>(it->second)) {
+        double d = std::get<double>(it->second);
+        if (d == (long long)d) return std::to_string((long long)d);
+        return std::to_string(d);
+    }
+    return std::get<bool>(it->second) ? "true" : "false";
+}
+
 cJSON* Action::to_json() const {
     cJSON* o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "action_id", action_id.c_str());
@@ -220,12 +326,13 @@ cJSON* Action::to_json() const {
     cJSON_AddNumberToObject(o, "duration", duration);
     if (payload_id) cJSON_AddStringToObject(o, "payload_id", payload_id->c_str());
     else cJSON_AddNullToObject(o, "payload_id");
+    cJSON_AddItemToObject(o, "params", params_to_json(params));
     return o;
 }
 
 Action Action::from_json(cJSON* obj) {
     static const std::unordered_set<std::string> known = {"action_id", "action_type", "duration",
-                                                            "payload_id"};
+                                                            "payload_id", "params"};
     require_no_extra_fields(obj, known, "Action");
     Action a;
     a.action_id = get_str(obj, "action_id", "Action");
@@ -234,6 +341,8 @@ Action Action::from_json(cJSON* obj) {
     if (a.duration < 0) throw ValidationError("Action.duration must be >= 0");
     std::string pid = get_str_opt(obj, "payload_id", "\x01");
     if (pid != "\x01") a.payload_id = pid;
+    a.params = parse_params(cJSON_GetObjectItemCaseSensitive(obj, "params"), "Action");
+    check_action_params(a);
     return a;
 }
 
@@ -465,17 +574,7 @@ InstantAction InstantAction::from_json_string(const std::string& payload) {
     a.action_type = instant_action_type_from(get_str(root, "action_type", "InstantAction"));
 
     cJSON* params = cJSON_GetObjectItemCaseSensitive(root, "params");
-    if (params && cJSON_IsObject(params)) {
-        cJSON* child = params->child;
-        while (child) {
-            std::string key = child->string ? child->string : "";
-            if (cJSON_IsBool(child)) a.params[key] = (bool)cJSON_IsTrue(child);
-            else if (cJSON_IsNumber(child)) a.params[key] = child->valuedouble;
-            else if (cJSON_IsString(child)) a.params[key] = std::string(child->valuestring);
-            else throw ValidationError("InstantAction.params values must be float|str|bool");
-            child = child->next;
-        }
-    }
+    if (params && cJSON_IsObject(params)) a.params = parse_params(params, "InstantAction");
     return a;
 }
 
@@ -487,13 +586,7 @@ std::string InstantAction::to_json_string() const {
     cJSON_AddStringToObject(root, "robot_id", robot_id.c_str());
     cJSON_AddStringToObject(root, "action_id", action_id.c_str());
     cJSON_AddStringToObject(root, "action_type", to_string(action_type).c_str());
-    cJSON* p = cJSON_CreateObject();
-    for (auto& [k, v] : params) {
-        if (std::holds_alternative<double>(v)) cJSON_AddNumberToObject(p, k.c_str(), std::get<double>(v));
-        else if (std::holds_alternative<bool>(v)) cJSON_AddBoolToObject(p, k.c_str(), std::get<bool>(v));
-        else cJSON_AddStringToObject(p, k.c_str(), std::get<std::string>(v).c_str());
-    }
-    cJSON_AddItemToObject(root, "params", p);
+    cJSON_AddItemToObject(root, "params", params_to_json(params));
     char* txt = cJSON_PrintUnformatted(root);
     std::string result(txt);
     free(txt);
@@ -501,34 +594,17 @@ std::string InstantAction::to_json_string() const {
     return result;
 }
 
-double InstantAction::get_double(const std::string& key, double def) const {
-    auto it = params.find(key);
-    if (it == params.end()) return def;
-    if (std::holds_alternative<double>(it->second)) return std::get<double>(it->second);
-    if (std::holds_alternative<std::string>(it->second)) {
-        try { return std::stod(std::get<std::string>(it->second)); } catch (...) { return def; }
-    }
-    if (std::holds_alternative<bool>(it->second)) return std::get<bool>(it->second) ? 1.0 : 0.0;
-    return def;
-}
+double InstantAction::get_double(const std::string& key, double def) const { return param_double(params, key, def); }
 
 std::string InstantAction::get_string(const std::string& key, const std::string& def) const {
-    auto it = params.find(key);
-    if (it == params.end()) return def;
-    if (std::holds_alternative<std::string>(it->second)) return std::get<std::string>(it->second);
-    if (std::holds_alternative<double>(it->second)) {
-        double d = std::get<double>(it->second);
-        if (d == (long long)d) return std::to_string((long long)d);
-        return std::to_string(d);
-    }
-    return std::get<bool>(it->second) ? "true" : "false";
+    return param_string(params, key, def);
 }
 
 int InstantAction::get_int(const std::string& key, int def) const {
     return static_cast<int>(get_double(key, (double)def));
 }
 
-bool InstantAction::has(const std::string& key) const { return params.find(key) != params.end(); }
+bool InstantAction::has(const std::string& key) const { return param_has(params, key); }
 
 // -- 토픽 헬퍼 ------------------------------------------------------------
 

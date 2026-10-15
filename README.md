@@ -61,6 +61,39 @@ cmake 없이 순수 Makefile (`Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux
 localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다 —
 `AMR_master/maps/` 갱신되면 여기도 수동 재복사 필요.
 
+### 직선 이동 / 도킹 / 주차 액션
+
+오더 노드의 `action` 으로 지정한다. 셋 다 `params` 가 필수이고, 값이 틀리면 로봇이 오더를 통째로 버린다
+(`send_order` 가 보내기 전에 같은 검증을 한다).
+
+| action_type | params | 동작 |
+|---|---|---|
+| `STRAIGHT` | `distance` (m, + 전진 / - 후진), `speed` (선택, 기본 0.2 m/s) | 노드에 도착해 노드 theta 로 정렬한 뒤, 경로계획 없이 그 방향으로 직선 이동 |
+| `DOCK` | `entry` (`FORWARD`/`BACKWARD`), `undock_distance` (m), `min_charge` (%), `speed` (선택) | 충전기에 진입해 충전하며 대기 |
+| `PARK` | `entry`, `undock_distance`, `speed` (선택) | 정밀 주차 후 대기 (충전 없음) |
+
+- DOCK/PARK 의 노드 position 은 **진입을 마친 자세**다. 로봇은 그 앞 `undock_distance` 지점까지
+  A* 로 가서 theta 로 정렬하고 직선으로 들어간다. `FORWARD` 는 전진 진입, `BACKWARD` 는 후진 진입이다.
+  충전기가 벽에 붙어 있어 A* 로는 못 들어가는 칸이라도 된다 (진입 직선은 팽창 검사를 안 하고 중심점만 본다).
+  진입 시작 지점은 A* 가 닿는 곳이어야 하니 `undock_distance` 를 충분히 준다.
+- 빠져나오기(언도킹)는 별도 액션이 없다. 도킹/주차 상태에서 이동이 필요한 오더를 받으면 먼저 진입했던
+  직선을 되짚어 나온다. 전진 진입했으면 후진으로, 후진 진입했으면 전진으로 나온다. 진입이나 언도킹 도중
+  취소돼도 다음 오더에서 먼저 빠져나온다.
+- DOCK 후 충전량이 `min_charge` 미만이면 state 가 `CHARGING` 이고 새 job 을 거절한다. 넘으면 `IDLE` 로
+  바뀌어 job 을 받는다 (충전은 언도킹 전까지 계속, `battery.charging=true`).
+- 직선 이동 중에도 충돌 감지(COLLISION), 동적 장애물 대기(우회는 안 함), PAUSE/e-stop 정지·재개가 그대로 된다.
+  강제 위치지정을 하면 도킹 상태가 풀린다.
+- 위치·자세 도착 오차와 마커 보정은 시뮬레이션하지 않는다 (지령 자세에 그대로 도착).
+
+```bash
+# 리포 루트에서. theta 는 --path 의 세 번째 값 (라디안)
+tools/send_order AMR-001 --path 3,1.5,0 --order-id s1 --action STRAIGHT --param distance=-1.0
+tools/send_order AMR-001 --path 14.75,5,0 --order-id d1 --action DOCK \
+    --param entry=BACKWARD --param undock_distance=0.6 --param min_charge=80
+tools/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK \
+    --param entry=FORWARD --param undock_distance=0.6
+```
+
 ### 통합 런처 (`tools/launcher.py`)
 
 브로커, 로봇 클라이언트, 뷰어, 맵 편집기, 맵 생성기를 한 창에서 켜고 끈다.
