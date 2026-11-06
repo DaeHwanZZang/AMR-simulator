@@ -14,7 +14,14 @@
 
 namespace fms {
 
-using Incoming = std::variant<Order, InstantAction>;
+// 시뮬 전용 순간이동 (sim/v1/{id}/teleport). 프로토콜 밖: 실제 로봇은 엘리베이터가 옮겨 준다.
+// 참 자세만 옮기고 로봇은 UNLOCALIZED 가 된다 (이동한 줄 모른다).
+struct SimTeleport {
+    double x = 0, y = 0, theta = 0;
+    std::string map_id;  // 선택. 지금 맵 uid 와 다르면 무시
+};
+
+using Incoming = std::variant<Order, InstantAction, SimTeleport>;
 
 class RobotComm {
 public:

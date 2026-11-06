@@ -1,7 +1,7 @@
 """물리(MuJoCo) 통합 테스트. empty_hall1 에서 robot_client 를 실제로 띄워 MQTT 로 시험한다.
 
 리포 루트에서: .venv/bin/python tools/physics_test.py [시나리오 이름...]
-시나리오: move straight dock collision pause ghost lowfric slip loop longrun obstacle dockint gui topic estimate localization (생략하면 전부, 약 8분)
+시나리오: move straight dock collision pause ghost lowfric slip loop longrun obstacle dockint gui topic estimate localization unlocalized charger battery default (생략하면 전부)
 mosquitto 를 자체 포트(18851)로 띄우므로 이미 떠 있는 브로커와 부딪히지 않는다. 로봇 로그와 기록 CSV 는 임시 폴더에 남는다.
 """
 import csv, glob, json, math, os, shutil, signal, subprocess, sys, tempfile, threading, time
@@ -25,7 +25,7 @@ def check(name, ok, detail=""):
 
 
 class Robot:
-    def __init__(self, rid, x, y, theta=0.0, extra=(), record=True, mapfile=MAP):
+    def __init__(self, rid, x, y, theta=0.0, extra=(), record=True, mapfile=MAP, localize=True, require=True):
         self.rid = rid
         self.state = None
         self.states = []
@@ -36,6 +36,8 @@ class Robot:
             cmd += ["--map", mapfile]
         if record:
             cmd += ["--record", REC]
+        if require:  # B 시나리오는 힌트로 위치를 잡는 흐름. 기본(플래그 없음) 동작은 default_localized 가 따로 본다
+            cmd += ["--require-localization"]
         cmd += list(extra)
         self.log = open(f"{SCR}/{rid}.log", "w")
         self.p = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT, cwd=REPO)
@@ -46,6 +48,11 @@ class Robot:
         self.c.subscribe(f"fms/v1/{rid}/state")
         self.c.loop_start()
         self.wait(lambda s: True, 10, "first state")
+        if localize and mapfile:
+            # 켜자마자는 UNLOCALIZED. 시작 자세를 힌트로 줘서 스캔 매칭으로 위치를 잡는다
+            self.hint(x, y, theta)
+            if self.wait(lambda s: s["localization"] == "LOCALIZED", 10) is None:
+                print(f"  ({rid}: localization failed: {self.state and self.state.get('errors')})")
 
     def _on(self, c, u, msg):
         s = json.loads(msg.payload)
@@ -77,6 +84,10 @@ class Robot:
     def instant(self, kind):
         subprocess.run([f"{REPO}/tools/send_order", self.rid, "--port", str(PORT), "--instant", kind], capture_output=True)
 
+    def hint(self, x, y, theta=0.0):
+        subprocess.run([f"{REPO}/tools/send_order", self.rid, "--port", str(PORT), "--instant", "INIT_POSITION",
+                        "--param", f"x={x}", "--param", f"y={y}", "--param", f"theta={theta}"], capture_output=True)
+
     def pose(self):
         return self.state["pose"]
 
@@ -100,7 +111,8 @@ class Robot:
         files = sorted(glob.glob(f"{REC}/{self.rid}_*.csv"))
         if not files:
             return []
-        return list(csv.DictReader(open(files[-1])))
+        # 로봇이 쓰는 중에 읽으면 마지막 줄이 잘려 있다 (빈 칸 = None). 그런 줄은 버린다
+        return [r for r in csv.DictReader(open(files[-1])) if None not in r.values()]
 
 
 def dist(a, b):
@@ -161,7 +173,8 @@ def test_dock_park():
     r.order("d1", ["30,6,0"], "DOCK", ["entry=BACKWARD", "undock_distance=1.0", "min_charge=56"])
     s = r.idle_done("d1", 60)
     p = r.pose()
-    check("dock BACKWARD: docked at (30,6) heading 0", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.03 and abs(p["theta"]) < 0.03,
+    # 보고 방위 = 추정 (스캔 매칭 + 추적 노이즈 σθ 0.01 rad 가 섞인다). 충전 접점 허용 0.1 rad 보다 충분히 작으면 된다
+    check("dock BACKWARD: docked at (30,6) heading 0", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.03 and abs(p["theta"]) < 0.05,
           f"pose={p} state={s and s['state']}")
     check("dock: charging below min_charge -> CHARGING", s is not None and s["state"] == "CHARGING", f"state={s and s['state']} batt={s and s['battery']}")
     r.order("d2", ["35,6,0"])
@@ -190,6 +203,79 @@ def test_dock_park():
     s = r.idle_done("p2", 60)
     p = r.pose()
     check("park: then drives to next goal", s is not None and dist((p["x"], p["y"]), (45, 6)) < 0.03, f"pose={p}")
+    r.stop()
+
+
+def has_err(s, kind):
+    return s is not None and any(e["error_type"] == kind for e in s["errors"])
+
+
+def test_charger():
+    """충전기는 맵의 물리 설비 (maps/empty_hall1/chargers.json: CH-1 (30,6,0) 후진 진입)."""
+    r = Robot("H1", 20, 6, extra=["--battery", "50"])
+    r.order("h1", ["25,6,0"], "DOCK", ["entry=BACKWARD", "undock_distance=1.0", "min_charge=0"])
+    s = r.wait(lambda s: has_err(s, "DOCK_FAILED"), 40)
+    check("charger: DOCK where no charger -> DOCK_FAILED", s is not None and s["state"] == "ERROR" and not s["battery"]["charging"],
+          f"state={s and (s['state'], s['errors'])}")
+    r.instant("RESET_ERROR")
+    r.order("h2", ["20,6,0"], "CHARGE")
+    s = r.wait(lambda s: has_err(s, "CHARGE_FAILED"), 30)
+    check("charger: CHARGE off the charger -> CHARGE_FAILED", s is not None, f"errors={s and s['errors']}")
+    r.instant("RESET_ERROR")
+    r.order("h3", ["30,6,0"], "DOCK", ["entry=FORWARD", "undock_distance=1.0", "min_charge=0"])
+    s = r.wait(lambda s: has_err(s, "DOCK_FAILED"), 60)
+    check("charger: wrong entry side -> DOCK_FAILED, not charging", s is not None and not s["battery"]["charging"],
+          f"errors={s and [e['description'] for e in s['errors']]}")
+    r.instant("RESET_ERROR")
+    r.order("h4", ["30,6,0"], "DOCK", ["entry=BACKWARD", "undock_distance=1.0", "min_charge=0"])
+    s = r.wait(lambda s: s["order_id"] is None and s["battery"]["charging"], 90)
+    p = r.pose()
+    check("charger: undocks, then docks BACKWARD and charges", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.04,
+          f"pose={p} batt={r.state['battery']} errors={r.state['errors']}")
+    b0 = r.state["battery"]["charge"]
+    time.sleep(2.0)
+    check("charger: battery rises while docked", r.state["battery"]["charge"] > b0, f"{b0} -> {r.state['battery']['charge']}")
+    r.stop()
+
+
+def test_battery():
+    r = Robot("B1", 3, 6, extra=["--battery", "20.3"])
+    r.order("b1", ["40,6"])
+    s = r.wait(lambda s: has_err(s, "LOW_BATTERY"), 30)
+    check("battery: LOW_BATTERY warning below 20%, order continues", s is not None and s["order_id"] == "b1",
+          f"state={s and (s['state'], s['battery'])}")
+    r.stop()
+
+    r = Robot("B2", 3, 6, extra=["--battery", "5.3"])
+    r.order("b2", ["40,6"])
+    s = r.wait(lambda s: has_err(s, "BATTERY_CRITICAL"), 30)
+    check("battery: crossing 5% -> FATAL BATTERY_CRITICAL, order dropped", s is not None and s["state"] == "ERROR" and s["order_id"] is None,
+          f"state={s and (s['state'], s['battery'])}")
+    r.instant("RESET_ERROR")
+    r.wait(lambda s: s["state"] == "IDLE", 5)
+    r.order("b3", ["10,6"])
+    time.sleep(1.0)
+    check("battery: below critical, normal order rejected", r.state["order_id"] is None and r.state["state"] == "IDLE",
+          f"state={r.state['state']} order={r.state['order_id']}")
+    r.order("b4", ["30,6,0"], "DOCK", ["entry=BACKWARD", "undock_distance=1.0", "min_charge=0"])
+    s = r.wait(lambda s: s["order_id"] is None and s["battery"]["charging"], 90)
+    check("battery: below critical, DOCK order accepted and charges", s is not None, f"state={r.state['state']} batt={r.state['battery']}")
+    r.stop()
+
+    r = Robot("B3", 3, 6, extra=["--battery", "0.15"])
+    r.order("b5", ["40,6"])
+    s = r.wait(lambda s: has_err(s, "BATTERY_EMPTY"), 30)
+    check("battery: empty -> FATAL BATTERY_EMPTY", s is not None and s["state"] == "ERROR", f"state={s and (s['state'], s['battery'])}")
+    time.sleep(1.0)
+    p0 = r.pose()
+    r.instant("RESET_ERROR")
+    time.sleep(1.0)
+    r.order("b6", ["10,6,0"], "DOCK", ["entry=BACKWARD", "undock_distance=1.0", "min_charge=0"])
+    time.sleep(2.0)
+    p1 = r.pose()
+    check("battery: empty robot cannot drive (even after reset / DOCK order)",
+          dist((p0["x"], p0["y"]), (p1["x"], p1["y"])) < 0.02 and has_err(r.state, "BATTERY_EMPTY"),
+          f"moved={dist((p0['x'], p0['y']), (p1['x'], p1['y'])):.3f} state={r.state['state']}")
     r.stop()
 
 
@@ -240,17 +326,45 @@ def test_pause_cancel():
 
 
 def test_ghost_start():
-    r = Robot("G1", 0.0, 0.0)  # 맵 여백(UNKNOWN) 위
+    r = Robot("G1", 0.0, 0.0, localize=False)  # 맵 여백(UNKNOWN) 위
     time.sleep(2.0)
     p = r.pose()
     check("ghost start: no ejection", abs(p["x"]) < 0.01 and abs(p["y"]) < 0.01, f"pose={p}")
+    # 벽 속에서는 라이다가 아무것도 못 본다 -> 힌트를 줘도 로컬라이징 실패, 오더는 거절
+    r.hint(0.0, 0.0)
+    s = r.wait(lambda s: any(e["error_type"] == "LOCALIZATION_FAILED" for e in s["errors"]), 10)
+    check("ghost start: localization fails inside the wall", s is not None and s["localization"] == "UNLOCALIZED",
+          f"state={s and (s['localization'], s['errors'])}")
     r.order("g1", ["5,5,0"])
-    s = r.wait(lambda s: any(e["error_type"] == "NO_PATH" for e in s["errors"]), 10)
-    check("ghost start: order fails with NO_PATH", s is not None, f"errors={s and s['errors']}")
+    time.sleep(1.0)
+    check("ghost start: order rejected while UNLOCALIZED", r.state["order_id"] is None)
     rows = r.csv_rows()
     check("ghost start: ghost flag recorded", any(x["ghost"] == "1" for x in rows))
     p = r.pose()
     check("ghost start: still at start", abs(p["x"]) < 0.01 and abs(p["y"]) < 0.01, f"pose={p}")
+    r.stop()
+
+
+def test_unlocalized():
+    """켜자마자 UNLOCALIZED: 오더 거절 -> 먼 힌트는 실패 -> 가까운 힌트(0.9 m, 11°)는 스캔 매칭으로 참 자세에 수렴."""
+    r = Robot("U2", 3, 3, localize=False)
+    check("unlocalized: starts UNLOCALIZED", r.state["localization"] == "UNLOCALIZED")
+    r.order("u1", ["5,3"])
+    time.sleep(1.0)
+    check("unlocalized: order rejected", r.state["order_id"] is None and r.state["state"] == "IDLE")
+    r.hint(8.0, 3.0, 0.3)  # 5 m 틀림 (창 ±1.5 m 밖)
+    s = r.wait(lambda s: any(e["error_type"] == "LOCALIZATION_FAILED" for e in s["errors"]), 10)
+    check("unlocalized: far hint fails", s is not None and s["localization"] == "UNLOCALIZED",
+          f"score={s and s['localization_score']}")
+    r.hint(3.8, 2.5, 0.2)
+    s = r.wait(lambda s: s["localization"] == "LOCALIZED", 10)
+    p = s and s["pose"]
+    check("unlocalized: near hint localizes", s is not None and not s["errors"], f"state={s and (s['localization'], s['errors'])}")
+    check("unlocalized: estimate snaps to true pose (< 3 cm, < 0.02 rad)",
+          p is not None and dist((p["x"], p["y"]), (3, 3)) < 0.03 and abs(adiff(p["theta"], 0.0)) < 0.02, f"pose={p}")
+    r.order("u2", ["5,3"])
+    s = r.idle_done("u2", 30)
+    check("unlocalized: drives after localization", s is not None and dist((s["pose"]["x"], s["pose"]["y"]), (5, 3)) < 0.03)
     r.stop()
 
 
@@ -397,8 +511,15 @@ def test_estimated_pose():
     last = rows[-1]
     tx, ty = float(last["x"]), float(last["y"])
     ox, oy = float(last["odom_x"]), float(last["odom_y"])
-    check("no localization: State.pose follows raw odometry", dist((p["x"], p["y"]), (ox, oy)) < 0.02,
-          f"state=({p['x']:.3f},{p['y']:.3f}) odom=({ox:.3f},{oy:.3f})")
+    # 처음 위치는 스캔 매칭이 정한다 (추정 = T∘오도메트리, T 는 매칭 결과). 보정이 없으니 그 뒤로 T 가 그대로여야 한다
+    first = rows[0]
+    th = float(first["est_theta"]) - float(first["odom_theta"])
+    c, sn = math.cos(th), math.sin(th)
+    tx0 = float(first["est_x"]) - (c * float(first["odom_x"]) - sn * float(first["odom_y"]))
+    ty0 = float(first["est_y"]) - (sn * float(first["odom_x"]) + c * float(first["odom_y"]))
+    px, py = c * ox - sn * oy + tx0, sn * ox + c * oy + ty0
+    check("no localization: State.pose follows raw odometry (fixed offset)", dist((p["x"], p["y"]), (px, py)) < 0.02,
+          f"state=({p['x']:.3f},{p['y']:.3f}) odom∘T=({px:.3f},{py:.3f})")
     check("no localization: arrives at goal by estimate", s is not None and dist((p["x"], p["y"]), (12, 9)) < 0.03)
     off = dist((tx, ty), (p["x"], p["y"]))
     check("no localization: true pose differs from estimate at low friction (> 3 cm)", off > 0.03, f"off={off * 100:.1f} cm")
@@ -441,10 +562,22 @@ def test_gui_offscreen():
     check("gui(offscreen): snapshot saved (physics panel renders)", os.path.exists(f"{SCR}/gui_U1.png"))
 
 
+def test_default_localized():
+    """--require-localization 없이 켜면 시작 자세에서 바로 LOCALIZED 이고 힌트 없이 오더가 돈다."""
+    r = Robot("D1", 3, 3, localize=False, require=False)
+    check("default: starts LOCALIZED", r.state["localization"] == "LOCALIZED", f"loc={r.state['localization']}")
+    r.order("d1", ["5,3"])
+    s = r.idle_done("d1", 40)
+    p = r.pose()
+    check("default: drives without a pose hint", s is not None and dist((p["x"], p["y"]), (5, 3)) < 0.05, f"pose={p}")
+    r.stop()
+
+
 ALL = {
     "move": test_move, "straight": test_straight, "dock": test_dock_park, "collision": test_collision,
+    "default": test_default_localized,
     "pause": test_pause_cancel, "ghost": test_ghost_start, "lowfric": test_low_friction, "slip": test_normal_slip_small,
-    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization,
+    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
 }
 
 if __name__ == "__main__":

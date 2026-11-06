@@ -70,8 +70,13 @@ public:
     double est_x() const;
     double est_y() const;
     double est_theta() const;
-    // 위치추정 보정 설정 (rate_hz = 0 이면 끔). 보정 오프셋은 지워진다
+    // 위치추정 보정 설정 (rate_hz = 0 이면 끔). 보정 오프셋과 추적 여부는 유지한다
     void set_localization(const LocalizerParams& params);
+    // 로봇이 아는 자세를 직접 정한다 (참 자세는 그대로). 위치 힌트 / 스캔 매칭 결과를 넣을 때
+    void set_estimate(double x, double y, double theta);
+    // 추적 보정 켬/끔. 로컬라이징 전에는 끈다 (localizer.hpp)
+    void set_tracking(bool on);
+    bool tracking() const;
     const LocalizerParams& localization() const;
     const LocalizerStats& loc_stats() const;
     double v_fwd() const;

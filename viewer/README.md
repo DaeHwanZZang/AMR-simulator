@@ -30,6 +30,14 @@ python3.11 -m venv .venv
 `--host`/`--port` 기본값은 localhost:1883. 로봇은 이 폴더와 무관한 별도
 프로세스/PC 에서 돌아도 된다.
 
+## 맵 따라가기
+
+맵 인자를 생략하거나 `--follow ROBOT_ID` 를 주면 로봇이 보고한 `State.map_id`/`map_version` 으로 맵을 고른다
+(`tools/map_follow.py`: 리포 루트 `map_cache/<uid>/` -> `--fms` 주소의 번들을 `viewer/.map_cache/` 로 받음).
+맵이 바뀌면 화면 맵도 바뀌고, 다른 맵(층)의 로봇은 그리지 않고 패널에만 적는다.
+`--map` 으로 띄운 로봇은 map_id 를 보고하지 않으므로 정적 맵 인자나 `--fallback-map JSON` 을 준다 (런처는 고른 맵을 넘긴다).
+FMS 가 없으면 `--fms ""` 로 다운로드를 끈다. 위치를 모르는 로봇(`State.localization` UNLOCALIZED/LOCALIZING)은 흐리게 점선으로 그린다.
+
 ## 조작 키 / 물리 디버그
 
 | 키 | 동작 |

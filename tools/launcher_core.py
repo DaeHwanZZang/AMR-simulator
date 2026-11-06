@@ -56,6 +56,9 @@ def load_registry(path: Path = REGISTRY) -> list[dict]:
         for p in t.get("params", []):
             if p.get("type") not in ("str", "int", "float", "bool", "choice") or "key" not in p:
                 raise ValueError(f"{t['id']}: 잘못된 param {p}")
+        env = t.get("env", {})
+        if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+            raise ValueError(f"{t['id']}: env 는 {{이름: 문자열}} 이어야 한다")
     return tools
 
 
@@ -75,6 +78,11 @@ def build_argv(spec: dict, values: dict[str, Any]) -> list[str]:
         elif values.get(item["if"]):
             out += [fmt(a) for a in item["args"]]
     return out
+
+
+def build_env(spec: dict, values: dict[str, Any]) -> dict[str, str]:
+    """등록표 env 를 값으로 치환한다 (설정을 환경변수로만 받는 툴용, 예: fms_server). 없는 키면 KeyError."""
+    return {k: v.format_map(values) for k, v in spec.get("env", {}).items()}
 
 
 def next_id(spec: dict, taken: set[str], start: int = 1) -> tuple[str, int]:

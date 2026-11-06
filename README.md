@@ -67,6 +67,20 @@ cmake 없이 순수 Makefile (`Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux
 localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다 —
 `AMR_master/maps/` 갱신되면 여기도 수동 재복사 필요.
 
+### 로컬라이징 / 충전기 / 배터리
+
+- 기본: 시작 자세에서 바로 LOCALIZED. `--require-localization` 이면 UNLOCALIZED 로 떠서 위치 힌트 전에는 오더를 거절한다.
+  ```bash
+  ./robot_client --id AMR-001 --map maps/empty_hall1/fms_map.json --x 3 --y 3 --require-localization
+  tools/send_order AMR-001 --instant INIT_POSITION --param x=3 --param y=3 --param theta=0   # ±1.5 m, ±30° 안
+  ```
+  제어판(`--gui`)에는 **Pose Hint**(같은 동작)와 **Force Localize**(디버그: 그 자리로 옮기고 바로 LOCALIZED)가 있다.
+  `State.localization` = `UNLOCALIZED | LOCALIZING | LOCALIZED`, `localization_score` 는 가상 라이다 스캔 매칭 점수 (0.8 미만이면 `LOCALIZATION_FAILED` 경고). 뷰어는 위치를 모르는 로봇을 흐린 빨간 점선으로 그린다.
+- 충전기: 맵 폴더의 `chargers.json` (예: `maps/empty_hall1/chargers.json`). 이 파일이 있는 맵에서만 DOCK 이 충전기 위치·진입 방향·자세를 검사하고 어긋나면 `DOCK_FAILED`.
+- 배터리: `--battery-low`(기본 20, 경고), `--battery-critical`(기본 5, 이후 DOCK 오더만 받음).
+- 복도 중앙 주행(기본 켜짐): `--no-center-path`, `--center-weight`, `--center-reach`. 재현용 `--seed`, `--obstacle-seed`, `--map-cache`.
+- 맵 `annotations.json` 의 점유 구역(occupancy)과 노드 `allowed_zone_ids` 가 있으면 허가 없는 구역을 피하고, 직선 이동이 막히면 `TRAFFIC_BLOCKED`.
+
 ### 직선 이동 / 도킹 / 주차 액션
 
 오더 노드의 `action` 으로 지정한다. 셋 다 `params` 가 필수이고, 값이 틀리면 로봇이 오더를 통째로 버린다

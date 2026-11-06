@@ -15,7 +15,8 @@
 namespace fms {
 
 struct CmdMove { double x, y; };
-struct CmdRelocalize { double x, y, theta; };
+struct CmdRelocalize { double x, y, theta; };    // 강제 로컬라이징 (로봇을 옮기고 바로 LOCALIZED)
+struct CmdLocalizeHint { double x, y, theta; };  // 위치 힌트 -> 스캔 매칭
 struct CmdPressStart {};
 struct CmdPressStop {};
 struct CmdEstop { bool latched; };
@@ -28,7 +29,7 @@ struct CmdConfigure {
 struct CmdResyncMap {};  // 마지막 SET_MAP 을 다시 받는다 (다운로드 실패 복구용)
 struct CmdSetBattery { double charge; };  // GUI 디버그 버튼 (100% / 1%)
 
-using GuiCommand = std::variant<CmdMove, CmdRelocalize, CmdPressStart, CmdPressStop, CmdEstop, CmdMode,
+using GuiCommand = std::variant<CmdMove, CmdRelocalize, CmdLocalizeHint, CmdPressStart, CmdPressStop, CmdEstop, CmdMode,
                                  CmdConfigure, CmdResyncMap, CmdSetBattery>;
 
 class CommandQueue {

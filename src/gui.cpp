@@ -339,27 +339,34 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         moveStatus->setText(QString::fromStdString(ss.str()));
     });
 
-    // -- 강제 로컬라이징 --
-    auto* relocBox = make_section(root, "  Force Relocalize (override pose)  ");
+    // -- 로컬라이징 (위치 힌트 / 강제) --
+    auto* relocBox = make_section(root, "  Localization  ");
     auto* relocLayout = new QVBoxLayout(relocBox);
-    auto* relocWarn = new QLabel("Debug-only feature, no physical robot has this. Drops the current order.");
+    auto* locLabel = new QLabel("UNLOCALIZED");
+    locLabel->setStyleSheet("font-weight:bold;");
+    relocLayout->addWidget(locLabel);
+    auto* relocWarn = new QLabel("Pose Hint: scan-match near (x, y, theta). Force: debug-only, moves the robot there "
+                                 "and drops the current order.");
     relocWarn->setWordWrap(true);
-    relocWarn->setStyleSheet("color:#d92d43; font-size:11px;");
+    relocWarn->setStyleSheet(QString("color:%1; font-size:11px;").arg(FG_DIM));
     relocLayout->addWidget(relocWarn);
     QLineEdit* relocX = labeled_entry(relocLayout, "x (m)");
     QLineEdit* relocY = labeled_entry(relocLayout, "y (m)");
     QLineEdit* relocTheta = labeled_entry(relocLayout, "theta (rad)", "0.0");
     auto* relocBtnRow = new QHBoxLayout();
     relocBtnRow->addStretch();
-    auto* relocBtn = new QPushButton("Force Apply");
-    relocBtn->setStyleSheet(QString("background:%1; color:white; font-weight:bold; padding:6px;").arg(ACCENT));
+    auto* hintBtn = new QPushButton("Pose Hint");
+    hintBtn->setStyleSheet(QString("background:%1; color:white; font-weight:bold; padding:6px;").arg(ACCENT));
+    relocBtnRow->addWidget(hintBtn);
+    auto* relocBtn = new QPushButton("Force Localize");
+    relocBtn->setStyleSheet("background:#d92d43; color:white; font-weight:bold; padding:6px;");
     relocBtnRow->addWidget(relocBtn);
     relocLayout->addLayout(relocBtnRow);
     auto* relocStatus = new QLabel("");
     relocStatus->setStyleSheet(QString("color:%1; font-size:11px;").arg(FG_DIM));
     relocLayout->addWidget(relocStatus);
 
-    QObject::connect(relocBtn, &QPushButton::clicked, [=, &queue]() {
+    auto send_pose = [=, &queue](bool force) {
         auto x = parse_double(relocX->text());
         auto y = parse_double(relocY->text());
         auto theta = parse_double(relocTheta->text());
@@ -367,11 +374,14 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
             relocStatus->setText("x, y, theta must be numbers");
             return;
         }
-        queue.push(CmdRelocalize{*x, *y, *theta});
+        if (force) queue.push(CmdRelocalize{*x, *y, *theta});
+        else queue.push(CmdLocalizeHint{*x, *y, *theta});
         std::ostringstream ss;
-        ss << "Relocalize command sent: (" << *x << ", " << *y << ", " << *theta << ")";
+        ss << (force ? "Force localize" : "Pose hint") << " sent: (" << *x << ", " << *y << ", " << *theta << ")";
         relocStatus->setText(QString::fromStdString(ss.str()));
-    });
+    };
+    QObject::connect(hintBtn, &QPushButton::clicked, [=]() { send_pose(false); });
+    QObject::connect(relocBtn, &QPushButton::clicked, [=]() { send_pose(true); });
 
     root->addStretch();
 
@@ -404,7 +414,18 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         if (snap.sub_state) display += "/" + to_string(*snap.sub_state);
         if (snap.paused && snap.pause_source) display += " (PAUSED:" + to_string(*snap.pause_source) + ")";
         if (snap.mode == OperatingMode::MANUAL) display += " [MANUAL]";
+        if (snap.localization != LocalizationState::LOCALIZED) display += " [" + to_string(snap.localization) + "]";
         statusLabel->setText(QString::fromStdString(display));
+        {
+            char buf[96];
+            std::snprintf(buf, sizeof buf, "%s  (score %.2f)", to_string(snap.localization).c_str(),
+                          snap.localization_score);
+            locLabel->setText(buf);
+            const char* color = snap.localization == LocalizationState::LOCALIZED    ? "#2f9e44"
+                                : snap.localization == LocalizationState::LOCALIZING ? "#e8a33d"
+                                                                                     : "#d92d43";
+            locLabel->setStyleSheet(QString("font-weight:bold; color:%1;").arg(color));
+        }
         statusLabel->setStyleSheet(
             QString("font-size:17px; font-weight:bold; color:%1;").arg(QString::fromStdString(state_color(st))));
 

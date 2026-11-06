@@ -2,19 +2,24 @@
 // 여기서는 구조만 요약한다. 상태머신 규칙은 CLAUDE.md/robot_client.md 문서 그대로다.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "battery.hpp"
+#include "chargers.hpp"
 #include "dynamic_obstacles.hpp"
 #include "kinematics.hpp"
 #include "map_model.hpp"
 #include "path_refine.hpp"
+#include "planner.hpp"
 #include "physics_world.hpp"
 #include "recorder.hpp"
+#include "scan_matcher.hpp"
 #include "schemas.hpp"
 
 namespace fms {
@@ -33,7 +38,19 @@ public:
     const MapModel* map = nullptr;  // 없으면 경로계획/충돌감지 꺼짐 (소유하지 않음)
     MapSync* map_sync = nullptr;    // 없으면 SET_MAP 은 로깅만 (소유하지 않음)
     PathRefineParams path_refine;   // enabled=false 가 기본 (A* 결과 그대로 사용)
+    CenterlineParams centerline;    // 복도 중앙 주행. enabled=true 가 기본 (--no-center-path 로 끔)
     std::unique_ptr<Recorder> recorder;  // 있으면 tick 마다 한 줄 기록 (--record)
+    // 로컬라이징 (가상 라이다 + 스캔 매칭). 힌트를 받고 localize_time 초 뒤에 매칭 결과로 끝난다
+    LidarParams lidar;
+    MatchParams match_params;
+    double localize_time = 1.0;
+    // false(기본): 시작/맵 교체/순간이동 뒤에도 위치를 안다고 본다. true: UNLOCALIZED 가 되어 힌트가 있어야 주행
+    bool require_localization = false;
+    // 배터리 임계값 (%). low 아래면 WARNING LOW_BATTERY, critical 아래로 내려가는 순간 FATAL BATTERY_CRITICAL
+    // (오더를 버린다), 0 이면 FATAL BATTERY_EMPTY + 구동 불가. critical 아래에서는 DOCK 오더만 받는다
+    double battery_low = 20.0;
+    double battery_critical = 5.0;
+    std::mt19937 lidar_rng{1};  // main 이 --seed/로봇 id 로 다시 시드한다
 
     OrderExecutor(std::string robot_id_, double start_x, double start_y, double start_theta,
                   double max_velocity, double max_acceleration, BatterySim battery_,
@@ -56,10 +73,20 @@ public:
     void reset_error();
 
     // -- 오더/명령 --
+    // 오더(또는 오더 업데이트)를 받아 order_id 를 바꾼 직후, 경로계획 전에 부른다.
+    // 큰 맵에서 A* 가 수 초~수십 초 걸려도 FMS 가 "오더 수신"(State.order_id)을 바로 확인하게 State 를 먼저 보낸다.
+    std::function<void()> on_order_received;
     bool accept_order(const Order& order);
     void handle_instant(const InstantAction& action);
     void raise_fatal(ErrorInfo error);
+    // 강제 로컬라이징: 로봇(참 자세)을 그 자세로 옮기고 바로 LOCALIZED (디버그/시뮬 전용, 오더를 버린다)
     bool force_relocalize(double x, double y, double theta = 0.0);
+    // 시뮬 전용 순간이동 (엘리베이터가 옮겨 준 것): 참 자세만 옮기고 UNLOCALIZED 로 만든다. 힌트가 있어야 다시 주행한다
+    bool sim_teleport(double x, double y, double theta, const std::string& map_uid = "");
+    // 위치 힌트: 추정을 힌트로 두고 LOCALIZING 을 시작한다 (참 자세는 그대로). 맵이 없거나 맵 밖이면 거절
+    bool localize_hint(double x, double y, double theta);
+    LocalizationState localization() const { return localization_; }
+    double localization_score() const { return loc_score_; }
 
     // 맵 교체 (map_sync 워커가 받아온 새 번들). 현재 위치 기준으로 경로 재계산.
     // uid/version 은 State 로 FMS 에 보고된다 (FMS 의 job 게이팅 기준).
@@ -91,8 +118,17 @@ private:
     OperatingMode mode_ = OperatingMode::AUTO;
     std::vector<ErrorInfo> errors_;
 
-    // 경로 다듬기용 장애물 거리 장. 맵당 lazy 생성, set_map 에서 무효화.
+    // 복도 중앙 주행·경로 다듬기용 장애물 거리 장. 맵당 lazy 생성, set_map 에서 무효화.
     std::unique_ptr<ClearanceField> clearance_;
+
+    // 로컬라이징 상태. UNLOCALIZED/LOCALIZING 이면 주행 억제 + 오더 거절 (motion_inhibited / can_accept_job)
+    LocalizationState localization_ = LocalizationState::UNLOCALIZED;
+    double loc_score_ = 0.0;
+    std::optional<Pose2> loc_hint_;
+    double loc_timer_ = 0.0;
+    std::unique_ptr<ScanMatcher> matcher_;  // 맵당 lazy 생성 (likelihood field), set_map 에서 버린다
+    void set_unlocalized(const char* why);
+    void tick_localization(double dt);
 
     std::string current_map_uid_;      // 비어 있으면 State 에 map_id 안 실음
     std::string current_map_version_;
@@ -125,6 +161,8 @@ private:
     // (도크 안쪽은 planner 팽창 영역이라 A* 로는 못 나온다).
     struct Docked {
         bool charger;            // DOCK = true (충전), PARK = false
+        std::optional<Charger> station;  // DOCK 대상 충전기 (chargers.json)
+        std::string entry;       // 진입 방향 (FORWARD|BACKWARD) — 충전기 접점 방향과 맞아야 한다
         double exit_x, exit_y;   // 진입 직전 자세 = 언도킹 목표
         double min_charge;       // 이 충전량(%) 이상이어야 새 job 을 받는다 (DOCK 만)
         double speed;
@@ -132,6 +170,12 @@ private:
     };
     std::optional<Docked> docked_;
     std::vector<std::pair<std::string, ActionStatus>> action_states_;  // 삽입 순서 유지
+
+    std::vector<Charger> chargers_;   // 지금 맵의 충전기 (맵 폴더 chargers.json, set_map 때 다시 읽는다)
+    double prev_charge_ = -1.0;       // 배터리 임계값 하향 통과 감지용 (음수 = 아직 모름)
+    void check_battery();
+    bool has_error(const char* type) const;
+    void fail_action(const char* error_type, const std::string& desc);
 
     double sim_time_ = 0.0;  // 시작 후 누적 tick 시간 (기록용)
     double since_dynamic_replan_ = 0.0;

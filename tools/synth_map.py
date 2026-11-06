@@ -33,6 +33,24 @@ gen_map.py 와 같다. 같은 레이아웃이면 두 결과를 겹쳐 비교할 
               길이 fur-len 이하, 1 px 폭, 방향은 벽 바깥쪽 ±25도. fur-prob 는 끊긴 픽셀마다의 확률.
               통로와 이어진 1 px 선이라 planner 팽창으로 지워져 주행에 영향이 없다
 
+사선 벽
+    --cut X1,Y1,X2,Y2  world 좌표(m) 직선 바깥을 막힘으로 자른다 (통로 칸 중심 평균 쪽이 남는다).
+    레이아웃은 1 m 격자라 사선이 계단이 되므로, 레이아웃은 직사각형으로 두고 이 옵션으로 픽셀 단위로 긋는다.
+    직선 쪽 벽은 일반 벽과 같은 질감/두께. 직선에 가까운 칸 중심은 통로 검사에서 제외한다.
+
+내부 벽
+    --walls FILE  줄마다 'X1 Y1 X2 Y2' (world m). 1 m 격자 칸 경계 위에 두께 1 px(+질감) 선분 벽을 긋는다.
+    '#' 칸은 1 m 두께 덩어리라서 얇은 벽은 이쪽으로 쓴다. 벽 선은 칸 중심에서 0.5 m 떨어진 칸 경계(x.5)에 두면
+    통로 검사를 통과한다. 문은 선분을 끊어서 낸다 (로봇 폭 0.5 m 이므로 1.5 m 이상 권장).
+
+회색 영역 (중정)
+    --void 'x,y x,y x,y ...'  다각형(world m)을 막힘(회색 128)으로 칠한다. 경계에는 일반 벽처럼 선이 생긴다.
+    여러 개는 ';'. 다각형 안/코앞의 칸 중심은 통로 검사에서 뺀다.
+
+통로 사각형 파기
+    --carve 'X1,Y1,X2,Y2;...'  --void 뒤에 적용한다. 회색 영역 안에 열린 칸(엘리베이터 홀 등)을 만든다.
+    복도와 닿는 변을 복도 쪽으로 조금 넘기면 그 변에는 벽이 안 생기고 나머지 세 변에는 벽선이 생긴다.
+
 의존성: numpy, Pillow
 """
 
@@ -79,6 +97,81 @@ def layout_mask(layout: np.ndarray, T: int) -> np.ndarray:
     up = padded.repeat(T, axis=0).repeat(T, axis=1)
     h = T // 2
     return up[h:-h, h:-h]
+
+
+def cut_mask(free: np.ndarray, line: tuple[float, float, float, float], res: float,
+             keep: tuple[float, float]) -> np.ndarray:
+    """통로 마스크를 world 좌표 직선 (x1,y1)-(x2,y2) 로 잘라 keep 점이 있는 쪽만 남긴다.
+    픽셀 (i,j) 의 중심은 world ((j+0.5)·res, (i+0.5)·res) (layout_mask 좌표 = 레이아웃 칸 중심 (c+1, r+1) m)."""
+    x1, y1, x2, y2 = line
+    nx, ny = y2 - y1, x1 - x2  # 직선 법선
+    norm = np.hypot(nx, ny)
+    if norm == 0:
+        raise SystemExit("--cut 의 두 점이 같다")
+    sign = np.sign(((keep[0] - x1) * nx + (keep[1] - y1) * ny) / norm)
+    if sign == 0:
+        raise SystemExit("--cut 직선이 통로 중심을 지난다. 어느 쪽을 남길지 알 수 없다")
+    yy, xx = np.indices(free.shape)
+    side = ((xx + 0.5) * res - x1) * nx + ((yy + 0.5) * res - y1) * ny
+    return free & (side * sign >= 0)
+
+
+def load_walls(path: Path) -> list[tuple[float, float, float, float]]:
+    """내부 벽 파일: 한 줄에 'X1 Y1 X2 Y2' (world m, 쉼표/공백 모두 가능). ';' 로 시작하면 주석."""
+    segs = []
+    for n, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.split(";")[0].replace(",", " ").split()
+        if not line:
+            continue
+        try:
+            assert len(line) == 4
+            segs.append(tuple(float(v) for v in line))
+        except (ValueError, AssertionError):
+            raise SystemExit(f"{path}:{n}: 'X1 Y1 X2 Y2' (world m) 형식이 아니다")
+    return segs
+
+
+def draw_walls(free: np.ndarray, segs, res: float) -> np.ndarray:
+    """통로 마스크에 선분(두께 1 px)을 막힘으로 긋는다. 벽 질감은 일반 벽과 같게 render 가 양옆으로 입힌다.
+    칸 안쪽 얇은 벽(칸 경계 위, 예: x=85.5)을 그릴 때 쓴다. 문은 선분을 끊어서 만든다."""
+    free = free.copy()
+    H, W = free.shape
+    for x1, y1, x2, y2 in segs:
+        a, b = np.array([x1, y1]) / res, np.array([x2, y2]) / res
+        x0, x_1 = int(max(0, min(a[0], b[0]) - 2)), int(min(W, max(a[0], b[0]) + 3))
+        y0, y_1 = int(max(0, min(a[1], b[1]) - 2)), int(min(H, max(a[1], b[1]) + 3))
+        yy, xx = np.mgrid[y0:y_1, x0:x_1]
+        px, py = xx + 0.5, yy + 0.5
+        d = b - a
+        t = np.clip(((px - a[0]) * d[0] + (py - a[1]) * d[1]) / max(float(d @ d), 1e-9), 0.0, 1.0)
+        dist = np.hypot(px - (a[0] + t * d[0]), py - (a[1] + t * d[1]))
+        free[y0:y_1, x0:x_1] &= dist > 0.5
+    return free
+
+
+def parse_void(text: str) -> list[list[tuple[float, float]]]:
+    """'x,y x,y x,y ...' 다각형. ';' 로 여러 개."""
+    polys = []
+    for part in text.split(";"):
+        if not part.strip():
+            continue
+        try:
+            pts = [tuple(float(v) for v in tok.split(",")) for tok in part.split()]
+            assert len(pts) >= 3 and all(len(p) == 2 for p in pts)
+        except (ValueError, AssertionError):
+            raise SystemExit("--void 는 'x,y x,y x,y ...' (world m, 꼭짓점 3개 이상, 여러 개는 ;)")
+        polys.append(pts)
+    return polys
+
+
+def void_mask(shape: tuple[int, int], polys, res: float) -> np.ndarray:
+    """world 좌표 다각형들을 픽셀 마스크로 채운다."""
+    from PIL import ImageDraw
+    img = Image.new("1", (shape[1], shape[0]), 0)
+    d = ImageDraw.Draw(img)
+    for pts in polys:
+        d.polygon([(x / res - 0.5, y / res - 0.5) for x, y in pts], fill=1)
+    return np.asarray(img, bool)
 
 
 def wobble(free: np.ndarray, amp: float, rng: np.random.Generator) -> np.ndarray:
@@ -172,6 +265,15 @@ def main() -> int:
     ap.add_argument("--fur-len", type=int, default=10, help="털 최대 길이 px")
     ap.add_argument("--ray-prob", type=float, default=0.012, help="긴 광선: 끊긴 픽셀마다 시작할 확률 (0 = 없음)")
     ap.add_argument("--ray-len", type=int, default=150, help="긴 광선 최대 길이 px (여백으로 뻗는다)")
+    ap.add_argument("--cut", metavar="X1,Y1,X2,Y2",
+                    help="world 좌표(m) 직선으로 통로를 잘라 통로 중심 쪽만 남긴다 (사선 벽). 칸 (r,c) 중심 = (c+1, r+1)")
+    ap.add_argument("--walls", type=Path, metavar="FILE",
+                    help="내부 벽 파일 (줄마다 'X1 Y1 X2 Y2' world m). 칸 경계 위에 1 px 얇은 벽을 긋는다. 문은 선분을 끊어서 낸다")
+    ap.add_argument("--void", metavar="POLY",
+                    help="가운데 뚫린 곳(중정) 등 회색(미탐색, 주행 불가)으로 칠할 다각형. 'x,y x,y x,y ...' world m, 여러 개는 ;")
+    ap.add_argument("--carve", metavar="RECTS",
+                    help="--void 등으로 막힌 곳에 통로(흰색) 사각형을 판다 (엘리베이터 홀 등). 'X1,Y1,X2,Y2' world m, 여러 개는 ;. "
+                         "복도와 이어질 변은 복도 쪽으로 조금 넘겨 그리면 벽이 안 생긴다")
     ap.add_argument("--margin-tiles", type=int, default=10, help="사방 회색(미탐색) 여백 타일 수 (10 = 320 px = 10 m)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tries", type=int, default=20, help="검사 실패 시 seed+1, +2... 로 다시 그리는 횟수")
@@ -187,14 +289,70 @@ def main() -> int:
 
     layout = load_layout(args.layout)
     m = args.margin_tiles * T
-    free = np.pad(layout_mask(layout, T), m, constant_values=False)  # 여백도 같이 그려서 광선이 이어진다
+    base = layout_mask(layout, T)
     radius_px = int(np.ceil((args.robot_width / 2) / args.resolution))
+    check_layout = layout
+    if args.cut:
+        try:
+            line = tuple(float(v) for v in args.cut.split(","))
+            assert len(line) == 4
+        except (ValueError, AssertionError):
+            raise SystemExit("--cut 은 X1,Y1,X2,Y2 (world m)")
+        rr, cc = np.nonzero(layout)
+        keep = (cc.mean() + 1, rr.mean() + 1)  # 통로 칸 중심의 평균점 쪽을 남긴다
+        base = cut_mask(base, line, args.resolution, keep)
+        # 잘린 쪽이나 사선 코앞(로봇 반폭 + 벽/테두리)에 중심이 있는 칸은 검사 대상에서 뺀다
+        x1, y1, x2, y2 = line
+        nx, ny = y2 - y1, x1 - x2
+        sign = np.sign((keep[0] - x1) * nx + (keep[1] - y1) * ny)
+        dist = sign * ((cc + 1 - x1) * nx + (rr + 1 - y1) * ny) / np.hypot(nx, ny)
+        need = (radius_px + args.wall_px / 2 + args.fringe_px + args.wobble_px + 1) * args.resolution
+        check_layout = layout.copy()
+        check_layout[rr[dist < need], cc[dist < need]] = False
+    if args.walls:
+        segs = load_walls(args.walls)
+        base = draw_walls(base, segs, args.resolution)
+        # 칸 경계(x.5)가 아닌 곳에 그은 벽 코앞에 중심이 있는 칸도 검사 대상에서 뺀다
+        need = (radius_px + args.wall_px / 2 + args.fringe_px + args.wobble_px + 1) * args.resolution
+        rr, cc = np.nonzero(check_layout)
+        near = np.zeros(len(rr), bool)
+        for x1, y1, x2, y2 in segs:
+            d = np.array([x2 - x1, y2 - y1])
+            t = np.clip(((cc + 1 - x1) * d[0] + (rr + 1 - y1) * d[1]) / max(float(d @ d), 1e-9), 0.0, 1.0)
+            near |= np.hypot(cc + 1 - (x1 + t * d[0]), rr + 1 - (y1 + t * d[1])) < need
+        if near.any():
+            check_layout = check_layout.copy()
+            check_layout[rr[near], cc[near]] = False
+    if args.void:
+        vm = void_mask(base.shape, parse_void(args.void), args.resolution)
+        base = base & ~vm
+        # 구멍 안이나 코앞(로봇 반폭 + 벽/테두리)에 중심이 있는 칸은 검사 대상에서 뺀다
+        need_px = int(np.ceil(radius_px + args.wall_px / 2 + args.fringe_px + args.wobble_px + 1))
+        near = dilate(vm, need_px)
+        rr, cc = np.nonzero(check_layout)
+        hit = near[(rr + 1) * T, (cc + 1) * T]
+        if hit.any():
+            check_layout = check_layout.copy()
+            check_layout[rr[hit], cc[hit]] = False
+    if args.carve:
+        for part in args.carve.split(";"):
+            if not part.strip():
+                continue
+            try:
+                x1, y1, x2, y2 = (float(v) for v in part.split(","))
+            except ValueError:
+                raise SystemExit("--carve 는 'X1,Y1,X2,Y2' (world m, 여러 개는 ;)")
+            res = args.resolution
+            j0, j1 = int(round(min(x1, x2) / res)), int(round(max(x1, x2) / res))
+            i0, i1 = int(round(min(y1, y2) / res)), int(round(max(y1, y2) / res))
+            base[i0:i1, j0:j1] = True  # 회색 영역에 통로 사각형을 판다. 통로와 닿는 변은 벽 없이 이어진다
+    free = np.pad(base, m, constant_values=False)  # 여백도 같이 그려서 광선이 이어진다
 
     img, problems, seed = None, [], args.seed
     for i in range(max(1, args.tries)):
         seed = args.seed + i
         img = render(free, args, np.random.default_rng(seed))
-        problems = check(img[m:img.shape[0] - m, m:img.shape[1] - m], layout, T, FREE_THRESH, radius_px)
+        problems = check(img[m:img.shape[0] - m, m:img.shape[1] - m], check_layout, T, FREE_THRESH, radius_px)
         if not problems:
             break
         print(f"seed {seed}: 검사 실패 ({problems[0]}{' 외' if len(problems) > 1 else ''})")
@@ -210,6 +368,10 @@ def main() -> int:
         "tile_m": T * args.resolution,
         "tile_px": T,
         "check_passed": not problems,
+        "cut": args.cut,
+        "walls": str(args.walls) if args.walls else None,
+        "void": args.void,
+        "carve": args.carve,
         "params": {k: getattr(args, k) for k in ("robot_width", "wall_px", "fringe_px", "fringe_prob", "wobble_px", "dash_gap",
                                                             "dash_px", "fur_prob", "fur_len", "ray_prob", "ray_len")},
     }

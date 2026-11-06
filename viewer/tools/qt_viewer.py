@@ -70,6 +70,8 @@ ODOM_COLOR = "#ffd60a"     # 보정 전 순수 오도메트리 표시 색
 # 관여 안 한다 — 그쪽은 fms_server 가 grid 에 구워서 각 로봇이 직접 받는다)
 ZONE_COLORS = {
     "prohibit": QColor(255, 59, 48),   # 진입 금지 — 빨강
+    "occupancy": QColor(89, 200, 190),  # 한 대씩 통과하는 점유 존
+    "elevator": QColor(171, 154, 238), # 엘리베이터 구역 — 보라 (표시 전용)
     "slow": QColor(255, 159, 10),      # 감속 구역 — 주황
     "oneway": QColor(10, 132, 255),    # 일방통행 — 파랑
 }
@@ -115,6 +117,7 @@ class RobotView:
     planned_path: list[tuple[float, float]] = field(default_factory=list)
     detected_obstacles: list[tuple[float, float, float, float]] = field(default_factory=list)
     has_pose: bool = False
+    map_uid: Optional[str] = None           # 로봇이 보고한 State.map_id (FMS 맵 uid). None = 로컬 --map / 모름
     # -- 물리 디버그 (fms/v1/{id}/physics, 로봇이 tick 마다(20 Hz) 발행). 없으면 State 값만 쓴다 --
     physics: Optional[dict] = None
     physics_at: float = 0.0
@@ -209,6 +212,11 @@ class _RobotItem:
         self.body = QGraphicsRectItem()
         self.body.setBrush(QBrush(color))
         self.body.setPen(pen)
+        self._pen = pen
+        self._unloc_pen = QPen(QColor("#d92d43"))  # 위치를 모름: 빨간 점선 윤곽 + 흐리게
+        self._unloc_pen.setWidthF(1.6)
+        self._unloc_pen.setCosmetic(True)
+        self._unloc_pen.setStyle(Qt.DashLine)
         self.body.setZValue(5)
         scene.addItem(self.body)
 
@@ -352,7 +360,10 @@ class _RobotItem:
         self.body.setPos(pos)
         # world 도 y-down 이라 atan2(dy,dx) 가 Qt 의 "양수=시계방향" 규약과 그대로 맞는다
         self.body.setRotation(math.degrees(view.dth))
-        self.body.setOpacity(alpha)
+        # display_state 는 LOCALIZED 가 아닐 때만 "[UNLOCALIZED]"/"[LOCALIZING]" 을 붙인다 (common/schemas.py)
+        unloc = "[UNLOCALIZED]" in view.state or "[LOCALIZING]" in view.state
+        self.body.setPen(self._unloc_pen if unloc else self._pen)
+        self.body.setOpacity(alpha * (0.4 if unloc else 1.0))
 
         self.label.setText(label_text)
         br = self.label.boundingRect()
@@ -534,9 +545,16 @@ def _ticked_path(points: list[QPointF]) -> QPainterPath:
 class MapCanvas(QGraphicsView):
     """맵 + 로봇을 그리는 캔버스. 확대/이동은 Qt 기본 기능을 그대로 쓴다."""
 
-    def __init__(self, map_model: MapModel, parent=None):
+    def __init__(self, map_model: MapModel, parent=None, *, map_uid: Optional[str] = None,
+                 map_label: Optional[str] = None):
         super().__init__(parent)
         self.map = map_model
+        # 지금 보여 주는 맵의 uid (FMS 맵일 때). None 이면 정적 맵: 모든 로봇을 그린다.
+        # 값이 있으면 다른 맵(층)을 보고한 로봇은 그리지 않고 패널에 "다른 층" 으로만 적는다
+        self.map_uid = map_uid
+        self.map_label = map_label or map_model.metadata.name
+        self.uid_labels: dict[str, str] = {}   # uid -> 표시 이름 (fleet_monitor_qt 가 채운다)
+        self.status_note = ""                  # 제목줄 끝에 붙는 상태 (맵 찾는 중 등)
         self.robots: dict[str, RobotView] = {}
         self._robot_items: dict[str, _RobotItem] = {}
         self._show_grid = True
@@ -627,7 +645,10 @@ class MapCanvas(QGraphicsView):
         **표시 전용** — 로봇 내비게이션(장애물 회피)은 이 파일을 안 보고, FMS 가
         prohibit zone 을 grid 에 구워서 로봇에게 내려주는 별도 경로를 그대로 쓴다.
         """
-        zone_path = self.map.base_dir / "zone_meta.json"
+        # FMS 번들(SET_MAP 캐시)은 annotations.json (polygon = [{x,y}]), 벤더 원본은 zone_meta.json ([[x,y]])
+        zone_path = self.map.base_dir / "annotations.json"
+        if not zone_path.is_file():
+            zone_path = self.map.base_dir / "zone_meta.json"
         if not zone_path.is_file():
             return
         try:
@@ -635,6 +656,9 @@ class MapCanvas(QGraphicsView):
         except (OSError, json.JSONDecodeError) as exc:
             print(f"[zone] {zone_path} 읽기 실패, 건너뜀: {exc}")
             return
+
+        def xy(p):
+            return (float(p["x"]), float(p["y"])) if isinstance(p, dict) else (float(p[0]), float(p[1]))
 
         m = self.map.metadata
         for entry in data.get("zones", []):
@@ -644,7 +668,7 @@ class MapCanvas(QGraphicsView):
             ztype = str(entry.get("type", "")).lower()
             color = ZONE_COLORS.get(ztype, ZONE_DEFAULT_COLOR)
 
-            points = [world_to_scene(m, float(p[0]), float(p[1])) for p in polygon]
+            points = [world_to_scene(m, *xy(p)) for p in polygon]
             item = QGraphicsPolygonItem(QPolygonF(points))
             fill = QColor(color)
             fill.setAlpha(90)
@@ -702,18 +726,10 @@ class MapCanvas(QGraphicsView):
             lbl.show()
             return lbl
 
-        m = self.map.metadata
         self.title_label = hud_label()
-        self.title_label.setText(
-            f"{m.name}  —  {m.width_m:g} x {m.height_m:g} m  @ {m.resolution:g} m/px"
-        )
-
         self.legend_label = hud_label()
-        legend = "■ OCCUPIED   ■ UNKNOWN   ■ FREE"
-        if self._zone_items:
-            legend += "     ▨ PROHIBIT   ▨ SLOW   ▨ ONEWAY  (z 토글)"
-        legend += "\n키: t 경로  p 물리패널  l 궤적  o GT(참 위치)  i 순수오도(노란)  f 시점고정  k 지우기  g 격자  r 보기초기화"
-        self.legend_label.setText(legend)
+        self._update_title()
+        self._update_legend()
 
         self.event_label = hud_label()
         self.event_label.setText("")
@@ -730,6 +746,63 @@ class MapCanvas(QGraphicsView):
         self.physics_label.setText("")
 
         self._layout_hud()
+
+    def _update_title(self) -> None:
+        m = self.map.metadata
+        text = f"{self.map_label}  —  {m.width_m:g} x {m.height_m:g} m  @ {m.resolution:g} m/px"
+        if self._follow:
+            text += f"   [follow {self._follow}]"
+        if self.status_note:
+            text += f"   {self.status_note}"
+        self.title_label.setText(text)
+
+    def _update_legend(self) -> None:
+        legend = "■ OCCUPIED   ■ UNKNOWN   ■ FREE"
+        if self._zone_items:
+            legend += "     ▨ PROHIBIT   ▨ ELEVATOR   ▨ SLOW   ▨ ONEWAY  (z 토글)"
+        legend += "\n키: t 경로  p 물리패널  l 궤적  o GT(참 위치)  i 순수오도(노란)  f 시점고정  k 지우기  g 격자  r 보기초기화"
+        self.legend_label.setText(legend)
+
+    def set_status(self, note: str) -> None:
+        if note != self.status_note:
+            self.status_note = note
+            self._update_title()
+            self._layout_hud()
+
+    def set_follow(self, robot_id: Optional[str]) -> None:
+        self._follow = robot_id
+        self._update_title()
+        self._layout_hud()
+
+    def set_map(self, map_model: MapModel, map_uid: Optional[str] = None, map_label: Optional[str] = None) -> None:
+        """다른 맵(층)으로 바꾼다. 로봇 데이터는 유지하고 그림/궤적은 새 맵 좌표로 다시 그린다."""
+        old_res = self.map.metadata.resolution
+        was_placeholder = not self.map.metadata.image   # placeholder_model() 에서 처음 실제 맵으로
+        self._scene.clear()          # 맵/격자/원점/구역/로봇 그림 전부 (C++ 객체가 지워진다)
+        self._robot_items.clear()    # 지워진 그림을 다시 만지지 않게 참조도 버린다
+        self._zone_items = []
+        self.map = map_model
+        self.map_uid = map_uid
+        self.map_label = map_label or map_model.metadata.name
+        for v in self.robots.values():   # 다른 층 좌표의 궤적은 의미가 없다
+            v.trail.clear()
+            v.gt_trail.clear()
+            v.trail_dirty = True
+        self._build_map_layer()
+        self._build_zones()
+        for item in self._zone_items:
+            item.setVisible(self._show_zones)
+        self._update_title()
+        self._update_legend()
+        self._layout_hud()
+        if was_placeholder or self._follow is None:
+            self.reset_view()   # 층 전체를 보여 준다 (따라가기 중이면 중심은 refresh 가 로봇에 맞춘다)
+        else:
+            f = old_res / map_model.metadata.resolution  # 화면 1 px 당 m 를 그대로 (층마다 해상도가 달라도 같은 줌)
+            self.scale(f, f)
+
+    def _on_this_map(self, view: RobotView) -> bool:
+        return self.map_uid is None or view.map_uid is None or view.map_uid == self.map_uid
 
     def _layout_hud(self) -> None:
         # setText() 는 크기를 자동으로 안 늘려준다 — 배치 전에 매번 다시 재야 한다
@@ -767,12 +840,18 @@ class MapCanvas(QGraphicsView):
         errors: Optional[list[str]] = None,
         planned_path: Optional[list[tuple[float, float]]] = None,
         detected_obstacles: Optional[list[tuple[float, float, float, float]]] = None,
+        map_id: Optional[str] = None,
         now: float = 0.0,
     ) -> None:
         view = self.robots.get(robot_id)
         if view is None:
             view = RobotView(robot_id=robot_id)
             self.robots[robot_id] = view
+        if map_id != view.map_uid:   # 층이 바뀌었다: 이전 층 궤적은 버린다
+            view.trail.clear()
+            view.gt_trail.clear()
+            view.trail_dirty = True
+        view.map_uid = map_id
         view.x, view.y, view.theta = x, y, theta
         view.velocity = velocity
         view.width, view.length = width, length
@@ -916,6 +995,12 @@ class MapCanvas(QGraphicsView):
                 lines.append(f"    conn {view.connection}")
                 lines.append("")
                 continue
+            if not self._on_this_map(view):
+                where = self.uid_labels.get(view.map_uid, view.map_uid)
+                lines.append(f"- {robot_id}  {view.state}")
+                lines.append(f"    다른 맵: {where}")
+                lines.append("")
+                continue
             seen.add(robot_id)
             color = self.robot_color(robot_id)
             stale = view.is_stale(now)
@@ -956,7 +1041,7 @@ class MapCanvas(QGraphicsView):
                 lines.append(f"    (no report for {now - view.last_seen:.0f}s)")
             lines.append("")
 
-        for robot_id in [r for r in self._robot_items if r not in seen and r not in self.robots]:
+        for robot_id in [r for r in self._robot_items if r not in seen]:
             self._robot_items.pop(robot_id).remove(self._scene)
 
         self.info_label.setText("\n".join(lines) if self.robots else "no robots")
@@ -980,16 +1065,13 @@ class MapCanvas(QGraphicsView):
         order = [None] + ids
         idx = order.index(self._follow) if self._follow in order else 0
         self._follow = order[(idx + 1) % len(order)]
-        m = self.map.metadata
-        base = f"{m.name}  —  {m.width_m:g} x {m.height_m:g} m  @ {m.resolution:g} m/px"
-        self.title_label.setText(base + (f"   [follow {self._follow}]" if self._follow else ""))
+        self._update_title()
         self._layout_hud()
 
     def mousePressEvent(self, event) -> None:
         if self._follow is not None:   # 드래그로 이동하려는 순간 고정을 푼다
             self._follow = None
-            m = self.map.metadata
-            self.title_label.setText(f"{m.name}  —  {m.width_m:g} x {m.height_m:g} m  @ {m.resolution:g} m/px")
+            self._update_title()
             self._layout_hud()
         super().mousePressEvent(event)
 
@@ -1046,12 +1128,13 @@ class MapCanvas(QGraphicsView):
 class FleetViewWindow(QMainWindow):
     """맵 전체를 채우는 창. 정보는 전부 그 위 오버레이다."""
 
-    def __init__(self, map_model: MapModel, title: str = "Fleet Viz"):
+    def __init__(self, map_model: MapModel, title: str = "Fleet Viz", *, map_uid: Optional[str] = None,
+                 map_label: Optional[str] = None):
         super().__init__()
         self.setWindowTitle(title)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
-        self.canvas = MapCanvas(map_model)
+        self.canvas = MapCanvas(map_model, map_uid=map_uid, map_label=map_label)
         self.setCentralWidget(self.canvas)
         self.resize(1280, 800)
 
@@ -1073,3 +1156,17 @@ class FleetViewWindow(QMainWindow):
 
     def refresh(self, now: float = 0.0) -> None:
         self.canvas.refresh(now)
+
+    def set_map(self, map_model: MapModel, map_uid: Optional[str] = None, map_label: Optional[str] = None) -> None:
+        self.canvas.set_map(map_model, map_uid, map_label)
+        self.setWindowTitle(f"Fleet Viz — {self.canvas.map_label}")
+
+
+def placeholder_model(name: str = "(로봇 맵 기다리는 중)") -> MapModel:
+    """맵 파일 없이 뜰 때 쓰는 빈 회색 맵 (20 x 12 m). 로봇 맵을 찾으면 set_map 으로 바뀐다."""
+    from common.map_model import MapMetadata
+
+    meta = MapMetadata(name=name, image="", resolution=0.1, width_px=200, height_px=120)
+    model = MapModel(meta)
+    model._grid = np.full((meta.height_px, meta.width_px), 128, dtype=np.uint8)
+    return model

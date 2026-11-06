@@ -116,6 +116,8 @@ void RobotComm::on_connect(mosquitto*, void* userdata, int rc) {
     std::string ot = topic_order(self->robot_id_), it = topic_instant(self->robot_id_);
     mosquitto_subscribe(self->mosq_, nullptr, ot.c_str(), 1);
     mosquitto_subscribe(self->mosq_, nullptr, it.c_str(), 1);
+    std::string tt = topic_sim_teleport(self->robot_id_);
+    mosquitto_subscribe(self->mosq_, nullptr, tt.c_str(), 1);
     self->publish_online();
     log::info("[%s] connected to broker %s:%d", self->robot_id_.c_str(), self->host_.c_str(), self->port_);
 }
@@ -140,6 +142,25 @@ void RobotComm::on_message(mosquitto*, void* userdata, const mosquitto_message* 
             InstantAction a = InstantAction::from_json_string(payload);
             std::lock_guard<std::mutex> lock(self->mutex_);
             self->inbox_.push_back(std::move(a));
+        } else if (topic == topic_sim_teleport(self->robot_id_)) {
+            cJSON* j = cJSON_Parse(payload.c_str());
+            if (!j) throw ValidationError("teleport: invalid JSON");
+            cJSON* x = cJSON_GetObjectItemCaseSensitive(j, "x");
+            cJSON* y = cJSON_GetObjectItemCaseSensitive(j, "y");
+            cJSON* th = cJSON_GetObjectItemCaseSensitive(j, "theta");
+            cJSON* mid = cJSON_GetObjectItemCaseSensitive(j, "map_id");
+            if (!cJSON_IsNumber(x) || !cJSON_IsNumber(y)) {
+                cJSON_Delete(j);
+                throw ValidationError("teleport: x/y required");
+            }
+            SimTeleport t;
+            t.x = x->valuedouble;
+            t.y = y->valuedouble;
+            t.theta = cJSON_IsNumber(th) ? th->valuedouble : 0.0;
+            if (cJSON_IsString(mid)) t.map_id = mid->valuestring;
+            cJSON_Delete(j);
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            self->inbox_.push_back(std::move(t));
         } else {
             log::debug("[%s] unsubscribed topic: %s", self->robot_id_.c_str(), topic.c_str());
         }

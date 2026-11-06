@@ -71,6 +71,10 @@ class FleetMonitor:
         self.on_event = on_event
         self._inbox: "queue.Queue[object]" = queue.Queue()
         self._seen_orders: dict[str, str] = {}
+        # robot_id -> (State.map_id, State.map_version). 뷰어가 로봇을 따라 맵을 바꿀 때 쓴다 (fleet_monitor_qt)
+        self.robot_maps: dict[str, tuple[Optional[str], Optional[str]]] = {}
+        # Qt 뷰어만 map_id 를 받는다 (matplotlib MapViewer.update_robot 엔 그 인자가 없다)
+        self._pass_map_id = hasattr(viewer, "set_map")
         self._last_errors: dict[str, tuple] = {}
 
         self._client = mqtt.Client(
@@ -141,6 +145,8 @@ class FleetMonitor:
                     update_physics(message[1]["robot_id"], message[1], now=now)
                 continue
             if isinstance(message, State):
+                self.robot_maps[message.robot_id] = (message.map_id, message.map_version)
+                extra = {"map_id": message.map_id} if self._pass_map_id else {}
                 self.viewer.update_robot(
                     message.robot_id,
                     message.pose.x, message.pose.y, message.pose.theta,
@@ -157,6 +163,7 @@ class FleetMonitor:
                         (o.x, o.y, o.width, o.height) for o in message.detected_obstacles
                     ],
                     now=now,
+                    **extra,
                 )
                 errors = tuple(e.error_type for e in message.errors)
                 if errors and errors != self._last_errors.get(message.robot_id):
@@ -172,6 +179,7 @@ class FleetMonitor:
                     # 떠 있지 않다는 뜻이다. 계속 "no state" 유령 항목으로 패널에
                     # 남기지 않고 아예 지운다 — 등록된 로봇 = 지금 떠 있는 로봇만
                     self.viewer.remove_robot(message.robot_id)
+                    self.robot_maps.pop(message.robot_id, None)
                     log.info("[%s] %s", message.robot_id, message.connection_state.value)
                     self._emit_event(message.robot_id, f"{message.robot_id} | {message.connection_state.value}")
             elif isinstance(message, Order):

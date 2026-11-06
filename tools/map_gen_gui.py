@@ -177,6 +177,19 @@ class MainWindow(QMainWindow):
         self.ray_len.setRange(10, 1000)
         self.ray_len.setValue(150)
         self.ray_len.setSuffix(" px")
+        self.cut = QLineEdit()
+        self.cut.setPlaceholderText("X1,Y1,X2,Y2 (비우면 없음)")
+        self.cut.setToolTip("world 좌표(m) 직선 바깥을 막힘으로 잘라 사선 벽을 만든다. 칸 (r,c) 중심 = (c+1, r+1).\n"
+                            "예: 0.5,24.5,100.5,0.5 (직사각형 레이아웃의 왼쪽 위를 사선으로 자름)")
+        self.walls = QLineEdit()
+        self.walls.setPlaceholderText("내부 벽 파일 경로 (비우면 없음)")
+        self.walls.setToolTip("줄마다 'X1 Y1 X2 Y2' (world m). 칸 경계 위에 얇은 선 벽을 긋는다 (예: tools/map_layouts/loop3.walls)")
+        self.void = QLineEdit()
+        self.void.setPlaceholderText("x,y x,y x,y ... (비우면 없음)")
+        self.void.setToolTip("가운데 뚫린 곳 등을 회색(주행 불가)으로 칠할 다각형. world m, 여러 개는 ;")
+        self.carve = QLineEdit()
+        self.carve.setPlaceholderText("X1,Y1,X2,Y2;... (비우면 없음)")
+        self.carve.setToolTip("회색 영역 안에 통로(흰색) 사각형을 판다. world m, 여러 개는 ;. 복도 쪽 변은 복도 안으로 조금 넘겨 그린다")
         self.synth_box = QGroupBox("합성 옵션")
         f = QFormLayout(self.synth_box)
         f.addRow("벽 두께", self.wall_px)
@@ -189,6 +202,10 @@ class MainWindow(QMainWindow):
         f.addRow("털 길이", self.fur_len)
         f.addRow("긴 광선 확률", self.ray_prob)
         f.addRow("긴 광선 길이", self.ray_len)
+        f.addRow("사선 자르기", self.cut)
+        f.addRow("내부 벽 파일", self.walls)
+        f.addRow("회색 영역", self.void)
+        f.addRow("통로 사각형", self.carve)
 
         self.clean = QComboBox()
         self.clean.addItems(["none", "light", "normal", "strong"])
@@ -245,7 +262,7 @@ class MainWindow(QMainWindow):
             "wall_px": self.wall_px, "fringe_px": self.fringe_px, "fringe_prob": self.fringe_prob,
             "wobble_px": self.wobble_px, "dash_gap": self.dash_gap, "dash_px": self.dash_px,
             "fur_prob": self.fur_prob, "fur_len": self.fur_len, "ray_prob": self.ray_prob,
-            "ray_len": self.ray_len, "clean": self.clean,
+            "ray_len": self.ray_len, "cut": self.cut, "walls": self.walls, "void": self.void, "carve": self.carve, "clean": self.clean,
         }
         self.load_settings()
         self.sync_mode()
@@ -344,6 +361,15 @@ class MainWindow(QMainWindow):
                      "--dash-gap", str(self.dash_gap.value()), "--dash-px", str(self.dash_px.value()),
                      "--fur-prob", str(self.fur_prob.value()), "--fur-len", str(self.fur_len.value()),
                      "--ray-prob", str(self.ray_prob.value()), "--ray-len", str(self.ray_len.value())]
+            if self.cut.text().strip():
+                args += ["--cut", self.cut.text().strip()]
+            if self.carve.text().strip():
+                args += ["--carve", self.carve.text().strip()]
+            if self.void.text().strip():
+                args += ["--void", self.void.text().strip()]
+            if self.walls.text().strip():
+                w = Path(self.walls.text().strip())
+                args += ["--walls", str(w if w.is_absolute() else REPO / w)]
         else:
             args += ["--clean", self.clean.currentText()]
 

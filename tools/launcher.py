@@ -281,7 +281,8 @@ class Launcher(QMainWindow):
                 "port": self.port.value(), "map": self.map_combo.currentData() or ""}
 
     def values_for(self, inst: Inst) -> dict[str, Any]:
-        v = {**inst.values, **self.common()}
+        # 기본값을 먼저 깐다: 등록표에 새 param 이 생겨도 예전에 저장/재부착한 값으로 KeyError 가 안 나게
+        v = {**C.default_values(self.spec[inst.tool]), **inst.values, **self.common()}
         if inst.map_path:
             v["map"] = inst.map_path
         return v
@@ -395,6 +396,7 @@ class Launcher(QMainWindow):
             return
         try:
             argv = C.build_argv(spec, v)
+            env = C.build_env(spec, v)
         except KeyError as ex:
             QMessageBox.critical(self, "등록표 오류", f"{inst.tool} 의 cmd 에 정의되지 않은 키: {ex}")
             return
@@ -425,12 +427,12 @@ class Launcher(QMainWindow):
             if QMessageBox.question(self, "브로커 응답 없음",
                                     f"{v['host']}:{v['port']} 응답이 없다. 그래도 {inst.name} 을(를) 시작할까?") != QMessageBox.Yes:
                 return
-        self.launch(inst, spec, argv, cwd)
+        self.launch(inst, spec, argv, cwd, env)
 
-    def launch(self, inst: Inst, spec: dict, argv: list[str], cwd: Path) -> None:
+    def launch(self, inst: Inst, spec: dict, argv: list[str], cwd: Path, env: dict[str, str]) -> None:
         inst.stop_timeout = float(spec.get("stop_timeout_s", 5))
         try:
-            inst.launch(argv, cwd, {"PATH": FULL_PATH})
+            inst.launch(argv, cwd, {"PATH": FULL_PATH, **env})
         except OSError as ex:
             inst.status, inst.bad = f"시작 실패: {ex}", True
             self.refresh_all()

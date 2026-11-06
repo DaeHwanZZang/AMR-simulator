@@ -6,6 +6,8 @@
     "공통 값: {python}(런처 인터프리터) {repo}(리포 루트) {host} {port} {map}(fms_map.json 절대경로, 맵 없음이면 빈 문자열)",
     "cwd: 리포 루트 기준 상대경로. requires: [\"broker\"]. needs_map: 맵 필수. needs_build: 없으면 make 를 권하는 바이너리.",
     "stop_timeout_s: SIGTERM 후 기다리는 시간. 넘으면 강제 종료할지 묻는다.",
+    "listens: 브로커 항목 전용(브로커 포트). 런처가 이 키가 있는 항목을 브로커로 다룬다. 웹 서버 포트에는 쓰지 않는다.",
+    "env: {이름: 값} 환경변수. 값도 {키} 치환한다 (설정을 환경변수로만 받는 툴용, 예: fms_server).",
     "params: type = str / int / float / bool / choice(choices), group 이 바뀌면 폼에 구분 제목이 들어간다.",
     "multi: id_param(이름으로 쓸 키), id_fmt(자동 이름), step({키: 대수마다 더할 값})"
   ],
@@ -28,11 +30,13 @@
         {"if": "map", "args": ["--map", "{map}"]},
         "--robot-width", "{robot_width}", "--robot-length", "{robot_length}",
         "--max-velocity", "{max_velocity}", "--max-acceleration", "{max_acceleration}",
-        "--battery", "{battery}", "--speed-noise", "{speed_noise}",
+        "--battery", "{battery}", "--battery-low", "{battery_low}", "--battery-critical", "{battery_critical}", "--speed-noise", "{speed_noise}",
         "--sensor-range", "{sensor_range}", "--log-level", "{log_level}",
         "--friction", "{friction}", "--mass", "{mass}",
         "--loc-rate", "{loc_rate}", "--loc-noise-xy", "{loc_noise_xy}", "--loc-noise-theta", "{loc_noise_theta}",
-        "--loc-gain", "{loc_gain}",
+        "--loc-gain", "{loc_gain}", "--loc-dropout", "{loc_dropout}",
+        {"if": "seed", "args": ["--seed", "{seed}"]},
+        {"if": "map_cache", "args": ["--map-cache", "{map_cache}"]},
         {"if": "record", "args": ["--record", "{record}"]},
         {"if": "gui", "args": ["--gui"]},
         {"if": "path_refine", "args": ["--path-refine"]},
@@ -42,7 +46,8 @@
           "--obstacle-max-count", "{obstacle_max_count}",
           "--obstacle-width", "{obstacle_width}", "--obstacle-height", "{obstacle_height}",
           "--obstacle-speed", "{obstacle_speed}"]},
-        {"if": "obstacle_sides", "args": ["--obstacle-sides", "{obstacle_sides}"]}
+        {"if": "obstacle_sides", "args": ["--obstacle-sides", "{obstacle_sides}"]},
+        {"if": "obstacle_seed", "args": ["--obstacle-seed", "{obstacle_seed}"]}
       ],
       "requires": ["broker"],
       "needs_build": "robot_client",
@@ -60,6 +65,8 @@
         {"group": "물리", "key": "max_velocity", "label": "최대 속도 (m/s)", "type": "float", "default": 1.2},
         {"group": "물리", "key": "max_acceleration", "label": "최대 가속도 (m/s²)", "type": "float", "default": 0.6},
         {"group": "물리", "key": "battery", "label": "시작 배터리 (%)", "type": "float", "default": 100.0},
+        {"group": "물리", "key": "battery_low", "label": "배터리 낮음 경고 (%)", "type": "float", "default": 20.0},
+        {"group": "물리", "key": "battery_critical", "label": "배터리 위험 (%, 아래면 DOCK 오더만)", "type": "float", "default": 5.0},
         {"group": "물리", "key": "speed_noise", "label": "속도 노이즈 비율", "type": "float", "default": 0.05},
         {"group": "물리", "key": "friction", "label": "바퀴-바닥 마찰계수 μ (낮으면 슬립)", "type": "float", "default": 0.8},
         {"group": "물리", "key": "mass", "label": "로봇 질량 (kg)", "type": "float", "default": 60.0},
@@ -67,6 +74,9 @@
         {"group": "위치추정", "key": "loc_noise_xy", "label": "측정 노이즈 위치 (m)", "type": "float", "default": 0.02},
         {"group": "위치추정", "key": "loc_noise_theta", "label": "측정 노이즈 방위 (rad)", "type": "float", "default": 0.01},
         {"group": "위치추정", "key": "loc_gain", "label": "보정 게인 (0~1)", "type": "float", "default": 0.15},
+        {"group": "위치추정", "key": "loc_dropout", "label": "측정 누락 확률 (0~1)", "type": "float", "default": 0.05},
+        {"group": "실험/FMS", "key": "seed", "label": "난수 시드 (비우면 로봇 ID 기반)", "type": "str", "default": ""},
+        {"group": "실험/FMS", "key": "map_cache", "label": "SET_MAP 맵 캐시 폴더 (비우면 map_cache)", "type": "str", "default": ""},
         {"group": "물리", "key": "record", "label": "데이터 기록 폴더 (비우면 꺼짐)", "type": "str", "default": ""},
         {"group": "물리", "key": "sensor_range", "label": "장애물 감지 반경 (m)", "type": "float", "default": 3.0},
         {"group": "물리", "key": "log_level", "label": "로그 레벨", "type": "choice", "choices": ["DEBUG", "INFO", "WARNING"], "default": "INFO"},
@@ -76,7 +86,8 @@
         {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_max_count", "label": "동시 최대 개수", "type": "int", "default": 3},
         {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_width", "label": "가로 (m)", "type": "float", "default": 0.4},
         {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_height", "label": "세로 (m)", "type": "float", "default": 0.4},
-        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_speed", "label": "속도 (m/s)", "type": "float", "default": 0.5}
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_speed", "label": "속도 (m/s)", "type": "float", "default": 0.5},
+        {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_seed", "label": "장애물 시드 (비우면 로봇 ID 기반)", "type": "str", "default": ""}
       ]
     },
     {
@@ -84,14 +95,18 @@
       "name": "뷰어",
       "mode": "single",
       "cmd": [
-        "{python}", "tools/fleet_monitor_qt.py", "{map}", "--host", "{host}", "--port", "{port}",
+        "{python}", "tools/fleet_monitor_qt.py", "--host", "{host}", "--port", "{port}",
+        {"if": "follow", "args": ["--follow", "{follow}"]},
+        {"if": "map", "args": ["--fallback-map", "{map}"]},
+        "--fms", "{fms}",
         {"if": "no_orders", "args": ["--no-orders"]}
       ],
       "cwd": "viewer",
       "requires": ["broker"],
-      "needs_map": true,
       "stop_timeout_s": 5,
       "params": [
+        {"key": "follow", "label": "따라갈 로봇 (비우면 맵을 보고하는 첫 로봇)", "type": "str", "default": ""},
+        {"key": "fms", "label": "맵 받을 FMS 주소", "type": "str", "default": "http://localhost:8000"},
         {"key": "no_orders", "label": "order 토픽 구독 안 함", "type": "bool", "default": false}
       ]
     },

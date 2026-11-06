@@ -47,7 +47,8 @@ void usage() {
         "          [--action PICK|DROP|CHARGE|WAIT|STRAIGHT|DOCK|PARK [--duration S] [--param KEY=VALUE ...]]\n"
         "        (--action 은 마지막 노드에 붙는다. 예: --action DOCK --param entry=BACKWARD\n"
         "         --param undock_distance=0.6 --param min_charge=80 / --action STRAIGHT --param distance=-1.0)\n"
-        "        send_order ROBOT_ID --instant CANCEL_ORDER|PAUSE|RESUME|RESET_ERROR|INJECT_FAULT [--fault NAME]\n";
+        "        send_order ROBOT_ID --instant CANCEL_ORDER|PAUSE|RESUME|RESET_ERROR|INJECT_FAULT [--fault NAME]\n"
+        "        send_order ROBOT_ID --instant INIT_POSITION --param x=X --param y=Y [--param theta=RAD]  (위치 힌트)\n";
 }
 
 }  // namespace
@@ -92,6 +93,7 @@ int main(int argc, char** argv) {
         a.action_id = "IA-" + std::to_string((long long)(now_epoch() * 1000));
         a.action_type = instant_action_type_from(instant_text);
         if (a.action_type == InstantActionType::INJECT_FAULT) a.params["fault"] = fault;
+        for (auto& [k, v] : params) a.params[k] = v;  // --param KEY=VALUE (예: INIT_POSITION 의 x, y, theta)
         pub.publish(topic_instant(robot_id), a.to_json_string());
         std::cout << "published -> " << topic_instant(robot_id) << "  " << instant_text << "\n";
         return 0;

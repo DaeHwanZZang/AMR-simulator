@@ -464,8 +464,14 @@ double PhysicsWorld::est_theta() const {
     return impl_->loc.estimate(Pose2{impl_->odom_x, impl_->odom_y, impl_->odom_th}).theta;
 }
 void PhysicsWorld::set_localization(const LocalizerParams& params) {
-    impl_->loc = Localizer(params);
+    impl_->loc.set_params(params);
 }
+void PhysicsWorld::set_estimate(double x, double y, double theta) {
+    Impl& s = *impl_;
+    s.loc.set_estimate(Pose2{s.odom_x, s.odom_y, s.odom_th}, Pose2{x, y, theta});
+}
+void PhysicsWorld::set_tracking(bool on) { impl_->loc.set_tracking(on); }
+bool PhysicsWorld::tracking() const { return impl_->loc.tracking(); }
 const LocalizerParams& PhysicsWorld::localization() const { return impl_->loc.params(); }
 const LocalizerStats& PhysicsWorld::loc_stats() const { return impl_->loc.stats(); }
 

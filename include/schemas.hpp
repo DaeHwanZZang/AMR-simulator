@@ -36,9 +36,13 @@ enum class ActionType { PICK, DROP, CHARGE, WAIT, STRAIGHT, DOCK, PARK };
 enum class ActionStatus { WAITING, RUNNING, FINISHED, FAILED };
 enum class ErrorLevel { WARNING, FATAL };
 enum class ConnectionState { ONLINE, OFFLINE, CONNECTION_BROKEN };
+// 위치를 아는가. UNLOCALIZED 면 주행/오더 수락을 안 한다 (시작 직후, 다른 맵으로 바뀐 직후).
+// 위치 힌트(INIT_POSITION / 제어판)를 받으면 LOCALIZING 동안 스캔 매칭을 하고 LOCALIZED 또는 UNLOCALIZED 로 끝난다.
+enum class LocalizationState { UNLOCALIZED, LOCALIZING, LOCALIZED };
 enum class InstantActionType {
     CANCEL_ORDER, PAUSE, RESUME, RESET_ERROR, SET_MAP, INJECT_FAULT,
     INJECT_OBSTACLE, CLEAR_OBSTACLE, START_OBSTACLE_ZONE, STOP_OBSTACLE_ZONE,
+    INIT_POSITION,  // 위치 힌트. params: x, y (필수), theta (기본 0), map_id (선택, 지금 맵 uid 와 다르면 무시)
 };
 
 std::string to_string(RobotState v);
@@ -49,6 +53,7 @@ std::string to_string(ActionType v);
 std::string to_string(ActionStatus v);
 std::string to_string(ErrorLevel v);
 std::string to_string(ConnectionState v);
+std::string to_string(LocalizationState v);
 std::string to_string(InstantActionType v);
 
 RobotState robot_state_from(const std::string& s);
@@ -59,6 +64,7 @@ ActionType action_type_from(const std::string& s);
 ActionStatus action_status_from(const std::string& s);
 ErrorLevel error_level_from(const std::string& s);
 ConnectionState connection_state_from(const std::string& s);
+LocalizationState localization_state_from(const std::string& s);
 InstantActionType instant_action_type_from(const std::string& s);
 
 // =============================================================================
@@ -153,6 +159,7 @@ struct OrderNode {
     Pose position;
     std::optional<Action> action;
     std::optional<TimeWindow> reserved_window;
+    std::vector<std::string> allowed_zone_ids;
     static OrderNode from_json(cJSON* obj);
 };
 
@@ -180,6 +187,7 @@ struct State {
     long long header_id = 0;
     double timestamp = 0.0;
     std::string robot_id;
+    bool traffic_control = true;
 
     RobotState state = RobotState::IDLE;
     std::optional<BusySubState> sub_state;
@@ -198,6 +206,10 @@ struct State {
     // 둘 다 값이 있거나 둘 다 비어 있어야 한다.
     std::optional<std::string> map_id;
     std::optional<std::string> map_version;
+
+    // 위치를 아는가 + 마지막 스캔 매칭 점수 (0~1). UNLOCALIZED 면 pose 는 믿을 수 없다
+    LocalizationState localization = LocalizationState::UNLOCALIZED;
+    double localization_score = 0.0;
 
     std::string last_node_id;
     int last_node_sequence_id = 0;
@@ -300,6 +312,7 @@ std::string topic_order(const std::string& robot_id);
 std::string topic_state(const std::string& robot_id);
 std::string topic_connection(const std::string& robot_id);
 std::string topic_instant(const std::string& robot_id);
+std::string topic_sim_teleport(const std::string& robot_id);  // sim/v1/{id}/teleport (시뮬 전용, 프로토콜 밖)
 std::string topic_physics(const std::string& robot_id);
 
 }  // namespace fms

@@ -52,6 +52,8 @@ public:
     void set_final_theta(double target_theta) { final_theta_ = target_theta; }
     // 위치 강제 지정. 물리 모드에서는 로봇을 그 자리로 옮기고 속도를 0 으로 만든다.
     void set_pose(double nx, double ny, const double* ntheta = nullptr);
+    // 물리 월드의 추정 자세를 다시 읽는다 (추정을 바깥에서 바꿨을 때: 위치 힌트/스캔 매칭)
+    void resync() { if (world_) sync_from_world(); }
     // 즉시 정지. 목표를 모두 지운다 (물리 모드에서는 속도도 0).
     void emergency_stop();
     bool is_path_complete() const;

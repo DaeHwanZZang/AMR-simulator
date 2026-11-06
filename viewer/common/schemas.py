@@ -155,6 +155,20 @@ class ConnectionState(str, Enum):
     CONNECTION_BROKEN = "CONNECTION_BROKEN"  # LWT 로 브로커가 대신 발행
 
 
+class LocalizationState(str, Enum):
+    """
+    로봇이 자기 위치를 아는가. state 와 별개 축이다 (paused 처럼).
+
+    켜자마자, 그리고 다른 맵(층)으로 바뀐 직후는 UNLOCALIZED 다. 위치 힌트(INIT_POSITION /
+    로봇 제어판)를 받으면 LOCALIZING 동안 라이다 스캔 매칭을 하고 LOCALIZED 또는 (실패하면)
+    UNLOCALIZED 로 돌아간다. LOCALIZED 가 아니면 주행하지 않고 오더도 받지 않는다.
+    """
+
+    UNLOCALIZED = "UNLOCALIZED"
+    LOCALIZING = "LOCALIZING"
+    LOCALIZED = "LOCALIZED"
+
+
 class InstantActionType(str, Enum):
     """
     FMS 가 보내는 즉시 명령.
@@ -178,6 +192,9 @@ class InstantActionType(str, Enum):
     CLEAR_OBSTACLE = "CLEAR_OBSTACLE"    # 개발용: 수동 배치 장애물 제거 (obstacle_id 없으면 전체)
     START_OBSTACLE_ZONE = "START_OBSTACLE_ZONE"  # 개발용: 구역 통과형 장애물 스폰 시작/재설정 (tools/obstacle_zone.py)
     STOP_OBSTACLE_ZONE = "STOP_OBSTACLE_ZONE"    # 개발용: 신규 스폰 중단 (이미 나온 장애물은 유지)
+    INIT_POSITION = "INIT_POSITION"  # 위치 힌트. params: x, y (필수), theta (기본 0), map_id (선택 —
+                                    #   지금 맵 uid 와 다르면 로봇이 무시한다. SET_MAP 다운로드보다 먼저 도착한 힌트 방지).
+                                    #   로봇은 그 근처에서 라이다 스캔 매칭으로 정밀 위치를 잡는다 (State.localization)
 
 
 # =============================================================================
@@ -273,6 +290,8 @@ class OrderNode(BaseModel):
         )
     )
     position: Pose
+    allowed_zone_ids: list[str] = Field(default_factory=list,
+        description="이 노드로 가는 구간에서 통과를 허가한 점유 존 ID")
     action: Optional[Action] = None
     reserved_window: Optional[TimeWindow] = None
 
@@ -376,6 +395,7 @@ class State(FmsMessage):
     """로봇 주기 상태 보고. FMS 가 아는 로봇의 유일한 진실."""
 
     state: RobotState
+    traffic_control: bool = Field(default=False, description="점유 존 경로 차단을 지원하는 클라이언트")
     sub_state: Optional[BusySubState] = Field(
         default=None, description="state == BUSY 일 때만 값이 있다. 그 외에는 반드시 None"
     )
@@ -401,6 +421,14 @@ class State(FmsMessage):
     map_version: Optional[str] = Field(
         default=None, description="그 맵의 버전 (번들 콘텐츠 해시). map_id 가 있으면 함께 있어야 한다. "
                                   "FMS 는 이 값이 배정 맵 활성 버전과 같은 로봇에게만 job 을 준다"
+    )
+
+    localization: LocalizationState = Field(
+        default=LocalizationState.UNLOCALIZED,
+        description="자기 위치를 아는가. LOCALIZED 가 아니면 pose 를 믿을 수 없고 job 도 받지 않는다",
+    )
+    localization_score: float = Field(
+        default=0.0, ge=0, le=1, description="마지막 스캔 매칭 점수 (0~1). 강제 로컬라이징이면 1"
     )
 
     local_path: list[Point] = Field(
@@ -458,6 +486,8 @@ class State(FmsMessage):
             label += f" (PAUSED:{self.pause_source.value})"
         if self.mode == OperatingMode.MANUAL:
             label += " [MANUAL]"
+        if self.localization != LocalizationState.LOCALIZED:
+            label += f" [{self.localization.value}]"
         return label
 
     @property
@@ -473,6 +503,7 @@ class State(FmsMessage):
             and self.mode == OperatingMode.AUTO
             and not self.paused
             and self.order_id is None
+            and self.localization == LocalizationState.LOCALIZED
             and not any(e.level == ErrorLevel.FATAL for e in self.errors)
         )
 
@@ -501,6 +532,18 @@ class InstantAction(FmsMessage):
     action_id: str
     action_type: InstantActionType
     params: dict[str, float | str | bool] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_params(self) -> "InstantAction":
+        if self.action_type == InstantActionType.INIT_POSITION:
+            for key in ("x", "y"):
+                v = self.params.get(key)
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(f"INIT_POSITION 은 숫자 params.{key} 가 필요하다")
+            th = self.params.get("theta", 0.0)
+            if isinstance(th, bool) or not isinstance(th, (int, float)):
+                raise ValueError("INIT_POSITION params.theta 는 숫자")
+        return self
 
 
 # =============================================================================

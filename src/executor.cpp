@@ -59,6 +59,7 @@ OrderExecutor::OrderExecutor(std::string robot_id_, double start_x, double start
       battery(std::move(battery_)), map(map_model) {
     kinematics.attach_physics(physics.get());
     physics->set_map(map);
+    if (map) chargers_ = load_chargers(map->base_dir);
 }
 
 void OrderExecutor::apply_robot_geometry(double friction, double mass) {
@@ -71,11 +72,13 @@ void OrderExecutor::apply_robot_geometry(double friction, double mass) {
 }
 
 bool OrderExecutor::motion_inhibited() const {
-    return estop_latched_ || paused_ || mode_ == OperatingMode::MANUAL || base_state_ == RobotState::ERROR;
+    return estop_latched_ || paused_ || mode_ == OperatingMode::MANUAL || base_state_ == RobotState::ERROR ||
+           localization_ != LocalizationState::LOCALIZED || (battery.charge <= 0.0 && !battery.charging);
 }
 
 bool OrderExecutor::can_accept_job() const {
-    if (state() != RobotState::IDLE || mode_ != OperatingMode::AUTO || paused_ || !order_id_.empty())
+    if (state() != RobotState::IDLE || mode_ != OperatingMode::AUTO || paused_ || !order_id_.empty() ||
+        localization_ != LocalizationState::LOCALIZED || (battery.charge <= 0.0 && !battery.charging))
         return false;
     for (auto& e : errors_)
         if (e.level == ErrorLevel::FATAL) return false;
@@ -175,9 +178,14 @@ void OrderExecutor::resume_motion() {
 }
 
 void OrderExecutor::set_map(const MapModel* new_map, std::string map_uid, std::string map_version) {
+    // 다른 맵(층)이면 좌표계가 다르다 -> 위치를 다시 잡아야 한다. 같은 맵의 버전만 바뀐 거면 유지
+    const bool other_map = map_uid != current_map_uid_;
     map = new_map;
     physics->set_map(new_map);
     clearance_.reset();
+    matcher_.reset();
+    chargers_ = new_map ? load_chargers(new_map->base_dir) : std::vector<Charger>{};
+    if (other_map && require_localization) set_unlocalized("map changed");
     current_map_uid_ = std::move(map_uid);
     current_map_version_ = std::move(map_version);
     log::info("[%s] map switched: uid=%s version=%s", robot_id.c_str(), current_map_uid_.c_str(),
@@ -220,10 +228,22 @@ bool OrderExecutor::accept_order(const Order& order) {
         if (charge_hold())
             log::warning("[%s] docked: battery %.1f%% < min_charge %.1f%% -- not accepting jobs yet", robot_id.c_str(),
                          battery.charge, docked_->min_charge);
-        log::warning("[%s] rejecting order %s: state=%s mode=%s paused=%d active=%s", robot_id.c_str(),
+        log::warning("[%s] rejecting order %s: state=%s mode=%s paused=%d active=%s localization=%s", robot_id.c_str(),
                      order.order_id.c_str(), to_string(state()).c_str(), to_string(mode_).c_str(),
-                     paused_, order_id_.c_str());
+                     paused_, order_id_.c_str(), to_string(localization_).c_str());
         return false;
+    }
+
+    if (battery.charge < battery_critical) {
+        // 위험 수준: 충전하러 가는 오더(DOCK 포함)만 받는다
+        bool to_charger = std::any_of(order.nodes.begin(), order.nodes.end(), [](const OrderNode& n) {
+            return n.action && n.action->action_type == ActionType::DOCK;
+        });
+        if (!to_charger) {
+            log::warning("[%s] rejecting order %s: battery %.1f%% < %.1f%% -- only DOCK orders accepted",
+                         robot_id.c_str(), order.order_id.c_str(), battery.charge, battery_critical);
+            return false;
+        }
     }
 
     order_id_ = order.order_id;
@@ -239,6 +259,7 @@ bool OrderExecutor::accept_order(const Order& order) {
     for (auto& n : nodes_) if (n.released) ++released_count;
     log::info("[%s] order received %s update=%d, %zu nodes (%d released)", robot_id.c_str(),
               order.order_id.c_str(), order.order_update_id, nodes_.size(), released_count);
+    if (on_order_received) on_order_received();  // 경로계획(수 초 걸릴 수 있음) 전에 수신을 알린다
     replan();
     return true;
 }
@@ -254,6 +275,7 @@ bool OrderExecutor::apply_order_update(const Order& order) {
         if (!known) set_action_status(n.action->action_id, ActionStatus::WAITING);
     }
 
+    if (on_order_received) on_order_received();
     if (!acting_) replan();
 
     int released_count = 0;
@@ -343,6 +365,21 @@ void OrderExecutor::handle_instant(const InstantAction& action) {
             obstacle_field.stop_zone();
             log::info("[%s] obstacle zone spawning stopped (existing obstacles kept)", robot_id.c_str());
             break;
+        case InstantActionType::INIT_POSITION: {
+            if (!action.has("x") || !action.has("y")) {
+                log::warning("[%s] INIT_POSITION ignored: x/y required", robot_id.c_str());
+                break;
+            }
+            std::string uid = action.get_string("map_id", "");
+            if (!uid.empty() && uid != current_map_uid_) {
+                // 맵 교체(SET_MAP 다운로드)보다 먼저 온 힌트: 이 맵 좌표가 아니다
+                log::warning("[%s] INIT_POSITION ignored: hint is for map %s but current map is %s", robot_id.c_str(),
+                             uid.c_str(), current_map_uid_.empty() ? "(none)" : current_map_uid_.c_str());
+                break;
+            }
+            localize_hint(action.get_double("x", 0.0), action.get_double("y", 0.0), action.get_double("theta", 0.0));
+            break;
+        }
     }
 }
 
@@ -374,6 +411,8 @@ void OrderExecutor::record_sample(double dt) {
 }
 
 void OrderExecutor::tick_logic(double dt) {
+    tick_localization(dt);
+    check_battery();
     obstacle_field.tick(dt);
     auto detected = update_detections();
     last_detected_ = detected;
@@ -532,6 +571,44 @@ void OrderExecutor::raise_fatal(ErrorInfo error) {
     set_base(RobotState::ERROR);
 }
 
+bool OrderExecutor::has_error(const char* type) const {
+    return std::any_of(errors_.begin(), errors_.end(), [&](const ErrorInfo& e) { return e.error_type == type; });
+}
+
+void OrderExecutor::fail_action(const char* error_type, const std::string& desc) {
+    if (acting_) set_action_status(acting_->action_id, ActionStatus::FAILED);
+    log::error("[%s] %s: %s -- order %s aborted", robot_id.c_str(), error_type, desc.c_str(), order_id_.c_str());
+    raise_fatal(ErrorInfo{error_type, ErrorLevel::FATAL, desc});
+}
+
+void OrderExecutor::check_battery() {
+    const double c = battery.charge;
+    const double prev = prev_charge_ < 0 ? c : prev_charge_;
+    prev_charge_ = c;
+    // 낮음: 알림만 (FMS 가 충전 보낼 근거). 2% 히스테리시스로 깜빡임 방지
+    if (c < battery_low && !has_error("LOW_BATTERY")) {
+        errors_.push_back(ErrorInfo{"LOW_BATTERY", ErrorLevel::WARNING, "battery below " + std::to_string((int)battery_low) + "%"});
+        log::warning("[%s] LOW_BATTERY: %.1f%%", robot_id.c_str(), c);
+    } else if (c >= battery_low + 2.0 && has_error("LOW_BATTERY")) {
+        std::erase_if(errors_, [](const ErrorInfo& e) { return e.error_type == "LOW_BATTERY"; });
+    }
+    if (battery.charging) return;
+    if (c <= 0.0) {
+        if (!has_error("BATTERY_EMPTY")) {
+            log::error("[%s] BATTERY_EMPTY: cannot drive (order %s aborted)", robot_id.c_str(), order_id_.c_str());
+            raise_fatal(ErrorInfo{"BATTERY_EMPTY", ErrorLevel::FATAL, "battery empty: cannot drive"});
+        }
+        return;
+    }
+    // 위험: 내려가며 통과하는 순간 한 번만 (RESET_ERROR 뒤에는 DOCK 오더로 충전하러 갈 수 있게)
+    if (prev >= battery_critical && c < battery_critical) {
+        char desc[96];
+        std::snprintf(desc, sizeof desc, "battery %.1f%% < %.1f%%: send to a charger (DOCK)", c, battery_critical);
+        log::error("[%s] BATTERY_CRITICAL: %s (order %s aborted)", robot_id.c_str(), desc, order_id_.c_str());
+        raise_fatal(ErrorInfo{"BATTERY_CRITICAL", ErrorLevel::FATAL, desc});
+    }
+}
+
 void OrderExecutor::tick_action(double dt) {
     if (acting_->action_type == ActionType::CHARGE) set_base(RobotState::CHARGING);
     else set_busy(BusySubState::ACTING);
@@ -549,6 +626,21 @@ void OrderExecutor::tick_action(double dt) {
 
 void OrderExecutor::tick_straight(double dt, const std::vector<DynamicObstacle>& detected) {
     const StraightMotion m = *straight_;
+    if (map && !map->occupancy_zones.empty()) {
+        const std::vector<std::string> empty;
+        const auto& allowed = current_index_ < (int)nodes_.size() ? nodes_[current_index_].allowed_zone_ids : empty;
+        const double d = std::hypot(m.tx-kinematics.x, m.ty-kinematics.y);
+        const int count = std::max(1, (int)std::ceil(d / 0.02));
+        for (int i = 0; i <= count; ++i) {
+            const double t = (double)i / count;
+            if (map->traffic_blocked(kinematics.x+t*(m.tx-kinematics.x), kinematics.y+t*(m.ty-kinematics.y),
+                                     std::hypot(robot_width, robot_length)/2+0.1, allowed)) {
+                raise_fatal(ErrorInfo{"TRAFFIC_BLOCKED", ErrorLevel::FATAL, "직선 이동이 미허가 점유 존을 통과합니다"});
+                kinematics.brake(dt);
+                return;
+            }
+        }
+    }
     if (!kinematics.straight_active()) kinematics.set_straight(m.tx, m.ty, m.speed);  // 시작, 또는 PAUSE 등에서 재개
     if (path_blocked_by(detected)) {  // 직선 구간은 우회하지 않는다. 비켜날 때까지 기다린다
         auto kin_state = kinematics.hold(dt);
@@ -570,10 +662,32 @@ void OrderExecutor::finish_straight() {
     switch (m.purpose) {
         case StraightPurpose::ACTION:
         case StraightPurpose::DOCK_IN:
+            if (m.purpose == StraightPurpose::DOCK_IN && docked_->charger && docked_->station) {
+                // 접점은 실제 몸이 닿아야 한다: 참 자세로 본다 (추정 오차 + 도킹 오차가 허용 오차 안이어야)
+                const Charger& c = *docked_->station;
+                double off = std::hypot(physics->x() - c.x, physics->y() - c.y);
+                double dth = std::abs(std::atan2(std::sin(physics->theta() - c.theta), std::cos(physics->theta() - c.theta)));
+                bool side_ok = c.entry.empty() || c.entry == docked_->entry;
+                if (off > c.tol_xy || dth > c.tol_theta || !side_ok) {
+                    char desc[200];
+                    if (!side_ok)
+                        std::snprintf(desc, sizeof desc, "charger %s needs %s entry, robot entered %s", c.id.c_str(),
+                                      c.entry.c_str(), docked_->entry.c_str());
+                    else
+                        std::snprintf(desc, sizeof desc, "no contact with charger %s: off %.3f m / %.3f rad (tol %.3f m / %.3f rad)",
+                                      c.id.c_str(), off, dth, c.tol_xy, c.tol_theta);
+                    fail_action("DOCK_FAILED", desc);  // docked_ 는 남는다: 다음 이동 때 먼저 빠져나온다
+                    return;
+                }
+            }
             if (m.purpose == StraightPurpose::DOCK_IN) {
                 docked_->contact = true;
                 battery.charging = docked_->charger;
-                if (docked_->charger)
+                if (docked_->charger && docked_->station)
+                    log::info("[%s] docked on charger %s at (%.2f, %.2f): charging, jobs accepted from %.1f%% (now %.1f%%)",
+                              robot_id.c_str(), docked_->station->id.c_str(), kinematics.x, kinematics.y,
+                              docked_->min_charge, battery.charge);
+                else if (docked_->charger)
                     log::info("[%s] docked at (%.2f, %.2f): charging, jobs accepted from %.1f%% (now %.1f%%)",
                               robot_id.c_str(), kinematics.x, kinematics.y, docked_->min_charge, battery.charge);
                 else
@@ -675,10 +789,13 @@ std::vector<std::pair<double, double>> OrderExecutor::plan_segment_path(
     std::vector<std::pair<double, double>> full_path;
     std::pair<double, double> start = {kinematics.x, kinematics.y};
     for (auto& target : targets) {
-        auto seg = plan_path(*map, start, target, robot_width, robot_length, dynamic_obstacles);
+        const auto& allowed = nodes_[segment_[segment_wp_bounds_.size()]].allowed_zone_ids;
+        if ((centerline.enabled || path_refine.enabled) && !clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
+        // 복도 중앙 주행은 동적 장애물 회피 경로에도 쓴다 (장애물은 grid 에서 막히고, 거리 장은 벽 기준 선호만 준다).
+        auto seg = plan_path(*map, start, target, robot_width, robot_length, dynamic_obstacles, &allowed,
+                             clearance_.get(), &centerline);
         // 동적 장애물 회피 경로는 다듬지 않는다 (거리 장이 정적 맵 기준이라 장애물을 모름).
-        if (path_refine.enabled && !dynamic_obstacles && seg.size() >= 2) {
-            if (!clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
+        if (path_refine.enabled && !dynamic_obstacles && seg.size() >= 2 && map->occupancy_zones.empty()) {
             seg = refine_path(*map, *clearance_, start, seg, robot_width, path_refine);
         }
         full_path.insert(full_path.end(), seg.begin(), seg.end());
@@ -742,9 +859,23 @@ void OrderExecutor::on_segment_arrived() {
         }
         if (a.action_type == ActionType::DOCK || a.action_type == ActionType::PARK) {
             bool charger = a.action_type == ActionType::DOCK;
+            std::optional<Charger> station;
+            if (charger) {
+                // 충전기는 맵에 있는 물리 설비다 (chargers.json). 노드 근처에 없으면 들어가지 않는다
+                const Charger* c = find_charger(chargers_, node.position.x, node.position.y, node.position.theta);
+                // chargers.json 이 없는 맵은 검사하지 않는다 (충전기 없이 DOCK 을 허용하던 이전 동작)
+                if (c == nullptr && !chargers_.empty()) {
+                    char desc[160];
+                    std::snprintf(desc, sizeof desc, "no charger at (%.2f, %.2f, %.2f) (map has %zu)",
+                                  node.position.x, node.position.y, node.position.theta, chargers_.size());
+                    fail_action("DOCK_FAILED", desc);
+                    return;
+                }
+                if (c) station = *c;
+            }
             // 진입 직전 자세(= 지금 위치)가 언도킹 목표. 진입을 시작하는 순간부터 도킹 상태로 친다
-            docked_ = Docked{charger, kinematics.x, kinematics.y, charger ? param_double(a.params, "min_charge", 0.0) : 0.0,
-                             speed};
+            docked_ = Docked{charger, station, param_string(a.params, "entry", "FORWARD"), kinematics.x, kinematics.y,
+                             charger ? param_double(a.params, "min_charge", 0.0) : 0.0, speed};
             straight_ = StraightMotion{node.position.x, node.position.y, speed, StraightPurpose::DOCK_IN};
             set_busy(BusySubState::ACTING);
             log::info("[%s] action started: %s (%s %s, %.2fm straight in)", robot_id.c_str(), a.action_id.c_str(),
@@ -753,6 +884,11 @@ void OrderExecutor::on_segment_arrived() {
             return;
         }
         if (node.action->action_type == ActionType::CHARGE) {
+            // 제자리 충전은 충전기 접점에 붙어 있을 때만 된다 (DOCK 으로 들어간 뒤)
+            if (!docked_charging()) {
+                fail_action("CHARGE_FAILED", "not docked on a charger (DOCK first)");
+                return;
+            }
             set_base(RobotState::CHARGING);
             battery.charging = true;
         } else {
@@ -788,6 +924,72 @@ void OrderExecutor::clear_order() {
     set_base(idle_state());
 }
 
+void OrderExecutor::set_unlocalized(const char* why) {
+    localization_ = LocalizationState::UNLOCALIZED;
+    loc_score_ = 0.0;
+    loc_hint_.reset();
+    physics->set_tracking(false);
+    kinematics.emergency_stop();
+    log::warning("[%s] UNLOCALIZED (%s): send a pose hint (INIT_POSITION) before driving", robot_id.c_str(), why);
+}
+
+bool OrderExecutor::localize_hint(double x, double y, double theta) {
+    if (map == nullptr) {
+        log::warning("[%s] pose hint ignored: no map to match against (wait for SET_MAP or force localize)",
+                     robot_id.c_str());
+        return false;
+    }
+    if (!map->in_bounds(x, y)) {
+        log::warning("[%s] pose hint ignored: (%.2f, %.2f) is outside the map", robot_id.c_str(), x, y);
+        return false;
+    }
+    theta = std::atan2(std::sin(theta), std::cos(theta));
+    kinematics.emergency_stop();
+    physics->set_tracking(false);
+    physics->set_estimate(x, y, theta);  // 로봇이 아는 자세 = 힌트 (매칭이 끝나면 고친다)
+    kinematics.resync();
+    localization_ = LocalizationState::LOCALIZING;
+    loc_hint_ = Pose2{x, y, theta};
+    loc_timer_ = localize_time;
+    log::info("[%s] localizing around hint (%.2f, %.2f, %.2f)", robot_id.c_str(), x, y, theta);
+    return true;
+}
+
+void OrderExecutor::tick_localization(double dt) {
+    if (localization_ != LocalizationState::LOCALIZING) return;
+    loc_timer_ -= dt;
+    if (loc_timer_ > 0.0) return;
+    if (map == nullptr || !loc_hint_) {
+        set_unlocalized("map lost while localizing");
+        return;
+    }
+    if (!matcher_) matcher_ = std::make_unique<ScanMatcher>(*map, 0.05, match_params.sigma_hit);
+    // 가상 라이다는 참 자세에서 잰다. 매칭은 그 스캔만 보고 힌트 주변을 찾는다 (참 자세를 모른다)
+    Pose2 truth{physics->x(), physics->y(), physics->theta()};
+    auto scan = matcher_->simulate_scan(truth, lidar, lidar_rng);
+    MatchResult r = matcher_->match(scan, *loc_hint_, match_params);
+    loc_score_ = r.score;
+    std::erase_if(errors_, [](const ErrorInfo& e) { return e.error_type == "LOCALIZATION_FAILED"; });
+    if (r.ok) {
+        physics->set_estimate(r.pose.x, r.pose.y, r.pose.theta);
+        physics->set_tracking(true);
+        kinematics.resync();
+        localization_ = LocalizationState::LOCALIZED;
+        loc_hint_.reset();
+        log::info("[%s] LOCALIZED at (%.3f, %.3f, %.3f), score %.3f (%d scan points)", robot_id.c_str(), r.pose.x,
+                  r.pose.y, r.pose.theta, r.score, r.points);
+        resume_motion();
+        return;
+    }
+    char desc[200];
+    std::snprintf(desc, sizeof desc, "scan match failed near hint (%.2f, %.2f, %.2f): score %.2f < %.2f, %d points",
+                  loc_hint_->x, loc_hint_->y, loc_hint_->theta, r.score, match_params.min_score, r.points);
+    errors_.push_back(ErrorInfo{"LOCALIZATION_FAILED", ErrorLevel::WARNING, desc});
+    localization_ = LocalizationState::UNLOCALIZED;
+    loc_hint_.reset();
+    log::warning("[%s] %s -- still UNLOCALIZED, send a better hint", robot_id.c_str(), desc);
+}
+
 bool OrderExecutor::force_relocalize(double x, double y, double theta) {
     docked_.reset();  // 다른 곳으로 옮겼으니 도킹은 풀린다
     clear_order();
@@ -804,6 +1006,31 @@ bool OrderExecutor::force_relocalize(double x, double y, double theta) {
     } else {
         log::warning("[%s] relocalized position is not drivable: orders will fail with NO_PATH", robot_id.c_str());
     }
+    // 참 자세를 옮겼고 추정도 그 자세에서 시작한다 (teleport 가 보정 오프셋을 지운다) -> 바로 위치를 안다
+    std::erase_if(errors_, [](const ErrorInfo& e) { return e.error_type == "LOCALIZATION_FAILED"; });
+    localization_ = LocalizationState::LOCALIZED;
+    loc_score_ = 1.0;
+    loc_hint_.reset();
+    physics->set_tracking(true);
+    return true;
+}
+
+bool OrderExecutor::sim_teleport(double x, double y, double theta, const std::string& map_uid) {
+    if (!map_uid.empty() && map_uid != current_map_uid_) {
+        log::warning("[%s] teleport ignored: for map %s but current map is %s", robot_id.c_str(), map_uid.c_str(),
+                     current_map_uid_.empty() ? "(none)" : current_map_uid_.c_str());
+        return false;
+    }
+    docked_.reset();
+    clear_order();
+    kinematics.emergency_stop();
+    kinematics.set_pose(x, y, &theta);
+    // 엘리베이터가 옮겼다: 몸은 거기 있지만 로봇은 모른다
+    if (require_localization) set_unlocalized("moved by elevator (teleport)");
+    std::erase_if(errors_, [](const ErrorInfo& e) {
+        return e.error_type == "NO_PATH" || e.error_type == "COLLISION" || e.error_type == "LOCALIZATION_FAILED";
+    });
+    log::warning("[%s] teleported: (%.2f, %.2f, %.2f)", robot_id.c_str(), x, y, theta);
     return true;
 }
 
@@ -887,6 +1114,8 @@ State OrderExecutor::build_state(long long header_id, double timestamp) const {
         s.map_id = current_map_uid_;
         s.map_version = current_map_version_;
     }
+    s.localization = localization_;
+    s.localization_score = std::round(loc_score_ * 1000) / 1000;
     s.last_node_id = last_node_id_;
     s.last_node_sequence_id = last_node_sequence_id_;
     s.order_id = order_id_.empty() ? std::nullopt : std::optional(order_id_);

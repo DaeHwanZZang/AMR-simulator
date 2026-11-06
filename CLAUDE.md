@@ -85,7 +85,7 @@ tools/send_order AMR-001 --instant PAUSE          # CANCEL_ORDER|PAUSE|RESUME|RE
 4. `mosquitto_sub -t 'fms/v1/#' -v` 또는 뷰어로 State 를 확인한다.
 
 자동 회귀 테스트: `.venv/bin/python tools/physics_test.py [시나리오...]`. 자체 mosquitto(포트 18851)와 `empty_hall1` 으로 이동, STRAIGHT,
-DOCK/PARK, 충돌, 일시정지/취소, 벽 안 시작, 저마찰 슬립, 110 m 주행, 동적 장애물, GUI(offscreen) 기동과 스냅샷, physics 토픽, 위치추정 보정(켬/끔)을 시험한다 (전부 약 9분, 60 항목).
+DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, 저마찰 슬립, 110 m 주행, 동적 장애물, GUI(offscreen) 기동과 스냅샷, physics 토픽, 위치추정 보정(켬/끔), 로컬라이징(UNLOCALIZED/힌트/기본 LOCALIZED)을 시험한다. 시나리오 헬퍼 `Robot` 은 기본으로 `--require-localization` 을 붙이고 힌트로 위치를 잡는다 (플래그 없는 기본 동작은 `default` 시나리오). 교통 구역 시나리오는 FMS 가 필요해 이 리포에서 뺐다.
 `make` 로 바이너리를 먼저 만들어야 한다. 이동/도착/충돌/도킹 코드를 건드렸으면 돌린다.
 
 맵 도구는 출력 png/json 을 직접 열어 확인한다. GUI 는 `QT_QPA_PLATFORM=offscreen` 으로 띄우고 `grab()` 스크린샷을 찍어 볼 수 있다. 실제 클릭과 다이얼로그 흐름은 사용자가 확인해야 한다.
@@ -120,7 +120,7 @@ DOCK/PARK, 충돌, 일시정지/취소, 벽 안 시작, 저마찰 슬립, 110 m 
   - 시작 위치가 비-FREE 여도 프로세스는 경고 로그만 남기고 뜬다 (`main.cpp` 시작 검사).
   - 그 상태에서 오더를 받으면 `replan()` 이 `PlanningError` 를 잡아 FATAL `NO_PATH` 를 올리고 ERROR 상태가 된다 (설명에 로봇 좌표 포함).
   - `force_relocalize` 로 FREE 칸에 옮기면(또는 맵이 없으면) `NO_PATH`/`COLLISION` 오류를 지운다. 비-FREE 칸이면 경고만 남긴다.
-  - `force_relocalize` 는 현재 GUI 제어판(`CmdRelocalize`)에서만 부를 수 있다. MQTT instant action 에는 없다.
+  - `force_relocalize` 는 GUI 제어판(`CmdRelocalize`)에서 부르고, 플래그 없는 기본 시작 때 `main` 이 한 번 부른다. MQTT instant action 에는 없다 (대신 `INIT_POSITION` 힌트).
   - `COLLISION` 은 이동 중에만 검사한다 (물리: 몸체-벽 접촉, 위 "물리").
 - **물리 (MuJoCo, v1.4 이후)**:
   - 구조: `TrapezoidalKinematics` 는 이상 궤적을 내는 명령 생성기이고, 위치는 `PhysicsWorld` 가 정한다. `step()` 은 `sync_from_world()` 로 측정 자세를 읽고 → 이상 궤적을 한 걸음 내고 → 그 변위를 (v, w) 로 바꿔 `world.drive()` → `world.step(dt)` → 다시 측정한다. `kinematics.x/y/theta` 는 항상 마지막 **추정** 자세다 (오도메트리 + 위치추정 보정, 참 자세 아님). `executor` 는 이 값만 보면 된다.
@@ -137,8 +137,17 @@ DOCK/PARK, 충돌, 일시정지/취소, 벽 안 시작, 저마찰 슬립, 110 m 
   - **추정 자세 기반 제어 + 위치추정 보정 (기본 켜짐)**: `sync_from_world()` 가 `world.est_*` 를 읽는다. 추정 = `Localizer`(`localizer.hpp/cpp`)가 오도메트리(`odom_*`, 바퀴 엔코더 적분)에 얹는 보정 오프셋 `T` (`추정 = T ∘ 오도메트리`). `Localizer::update()` 는 `PhysicsWorld::step()` 끝에서 주기(`--loc-rate`, 기본 5 Hz)마다 `z = 참 자세 + 노이즈` 로 추정을 `gain` 만큼 당기고 `T` 를 다시 푼다 (한 번에 0.15 m/0.1 rad 상한, dropout 확률로 측정 누락). `--loc-rate 0` 이면 보정 없음(추정 = 순수 오도메트리). `Localizer` 는 엔진을 모른다 (참 자세는 호출자가 넘긴다) — 나중에 EKF 등으로 바꿀 때 이 클래스만 갈아낀다. 제어/경로계획/도착/`State.pose` 가 전부 추정으로 돈다. 참 자세(`world.x()` 등)는 충돌 판정(`check_collision`), 기록, `physics` 토픽(뷰어)에만 쓴다. `teleport`/`set_pose` 는 오도메트리를 그 자세로 맞추고 `T` 를 지운다. 경로선은 뷰어에서 추정 좌표로 그린다.
   - 추정에 노이즈가 있어서 `kinematics.cpp` `step_ideal` 이 5 cm 안의 경유점(마지막 제외)을 건너뛰고 2 cm 안이면 방위를 유지한다 (아니면 구간 경계의 겹친 경유점 방위가 노이즈로 흔들려 제자리 헌팅한다). 도착 허용(3 cm)보다 `kAimMinDist` 를 작게 해야 마지막 보정 접근(옆 3 cm 를 돌아서 가기)이 된다.
   - 기록: `--record DIR` → `recorder.cpp` CSV(+meta.json). 열 정의는 README "물리 시뮬레이션" 절. `State` 스키마는 바뀌지 않았다 (오도메트리 등은 State 가 아니라 기록 파일에만).
-  - 물리가 아닌 것: 동적 장애물(사각형 좌표), 로봇끼리 상호작용, 라이다/IMU. 위치 보정(맵 기반 위치추정)도 없다.
+  - 물리가 아닌 것: 동적 장애물(사각형 좌표), 로봇끼리 상호작용, IMU. 라이다는 로컬라이징용 가상 스캔(`scan_matcher`)뿐이고 장애물 감지에는 안 쓴다.
   - 디버깅: `AMR_PHYSICS_DUMP=파일` 로 마지막 MJCF 를 덤프해 파이썬 `mujoco` 로 재현할 수 있다. 서보/접촉 파라미터는 그렇게 스윕해서 정했다.
+- **로컬라이징 / 충전기 / 교통 구역** (makerton 에서 역이식):
+  - 기본은 시작 자세를 이미 아는 상태(LOCALIZED, 위치추정 보정 켜짐)로 뜬다. `--require-localization` 이면 UNLOCALIZED 로 떠서 `INIT_POSITION` 힌트(또는 GUI Pose Hint/Force Localize) 전에는 오더를 거절하고 움직이지 않는다 (`motion_inhibited`/`can_accept_job`). 플래그가 꺼져 있으면 `SET_MAP` 으로 다른 맵 uid 가 와도, 순간이동(`sim/v1/{id}/teleport`)을 받아도 LOCALIZED 를 유지한다 (`OrderExecutor::require_localization`).
+  - 힌트를 받으면 LOCALIZING -> `localize_time`(1 s) 뒤 가상 라이다 스캔 매칭(`scan_matcher.cpp`, 360빔/20 m/노이즈 0.02 m)으로 LOCALIZED 또는 WARNING `LOCALIZATION_FAILED`(UNLOCALIZED 로 남음). 힌트는 ±1.5 m, ±30° 안이어야 한다. 점수는 `State.localization_score`. `Localizer` 의 추적 보정(`set_tracking`)은 LOCALIZED 일 때만 켜진다. 시작 직후 기본 경로는 `force_relocalize` 한 번으로 이 상태를 만든다.
+  - `State.localization` 필드와 `INIT_POSITION` 액션(params x, y, theta, 선택 map_id)이 프로토콜에 추가됐다. `viewer/common/schemas.py` 도 같이 고쳤다. 외부 FMS 원본은 따로 맞춰야 한다.
+  - 충전기: 맵 폴더의 `chargers.json`(`chargers.cpp`). `chargers.json` 이 **있는 맵에서만** DOCK 이 충전기 근처(0.3 m/0.35 rad)·진입 방향·자세(0.06 m/0.1 rad)를 검사해 `DOCK_FAILED` 를 낸다. 없는 맵은 예전처럼 충전기 없이 DOCK 을 받는다. `CHARGE` 가 충전기 밖이면 `CHARGE_FAILED`.
+  - 배터리: `--battery-low`(기본 20, WARNING `LOW_BATTERY`), `--battery-critical`(기본 5, FATAL `BATTERY_CRITICAL` 이면 DOCK 오더만 받음), 0% 는 `BATTERY_EMPTY`.
+  - 교통 구역: 맵 폴더 `annotations.json` 의 `occupancy` 구역과 노드 `allowed_zone_ids`, `Order.traffic_control`. 허가 없는 구역은 재계획에서 막고 직선 이동은 `TRAFFIC_BLOCKED`(FATAL). 구역 정의는 FMS 가 만든 번들에서 온다 (이 리포에는 편집기가 없다).
+  - 복도 중앙 주행: planner A* 에 벽 근접 비용을 더한다. `--no-center-path`, `--center-weight`(6), `--center-reach`(1.5 m).
+  - 오더를 받으면 경로계획 전에 State 를 바로 한 번 발행한다 (`on_order_received`).
 - **직선 이동 / 도킹 / 주차** (v1.4):
   - `straight_`(StraightMotion: ACTION/DOCK_IN/UNDOCK)가 있으면 `tick` 은 `tick_straight` 만 돈다. 경로계획 없이 `kinematics.set_straight()` 로 heading 을 유지한 채 목표점까지 간다. PAUSE/e-stop 은 kinematics 쪽 목표를 지우므로 executor 가 목표를 들고 있다가 재개 때 다시 건다. `replan()` 은 `straight_` 가 있으면 아무것도 안 한다.
   - STRAIGHT: 노드 도착·정렬 후 노드 theta 방향 `distance` 만큼.
@@ -157,7 +166,7 @@ DOCK/PARK, 충돌, 일시정지/취소, 벽 안 시작, 저마찰 슬립, 110 m 
   - 메시지: Order / InstantAction / State.
   - 토픽: `fms/v1/{id}/{order,instant,state,connection}`.
   - `Action.params`(v1.4 추가, float|str|bool map): STRAIGHT/DOCK/PARK 필수 인자. 검증은 `schemas.cpp` `check_action_params()` 와 `viewer/common/schemas.py` `Action._check_params` 가 같은 규칙. 외부 FMS 원본 `common/schemas.py` 는 아직 안 고쳤다.
-  - InstantAction 종류: `CANCEL_ORDER, PAUSE, RESUME, RESET_ERROR, SET_MAP, INJECT_FAULT, INJECT_OBSTACLE, CLEAR_OBSTACLE, START_OBSTACLE_ZONE, STOP_OBSTACLE_ZONE`.
+  - InstantAction 종류: `CANCEL_ORDER, PAUSE, RESUME, RESET_ERROR, SET_MAP, INIT_POSITION, INJECT_FAULT, INJECT_OBSTACLE, CLEAR_OBSTACLE, START_OBSTACLE_ZONE, STOP_OBSTACLE_ZONE`.
   - `comm.cpp` 는 libmosquitto 래퍼다 (LWT, 재접속, `connection` retained 토픽).
   - **스키마 변경은 FMS 쪽과 맞춰야 한다.** 뷰어의 `viewer/common/schemas.py` 도 같이 고친다.
 - **맵 로드/동기화**: `map_model.cpp` 가 `fms_map.json` 과 그 `image` png(`stb_image`)를 읽는다. `SET_MAP` 을 받으면 `map_sync.cpp` 가 zip 을 받아 `map_cache/<map_uid>/` 에 풀고 `State.map_id/map_version` 으로 보고한다. FMS 는 이 값이 일치하는 로봇에만 job 을 배정한다.

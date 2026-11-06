@@ -58,6 +58,14 @@ std::string to_string(ConnectionState v) {
     }
     return "OFFLINE";
 }
+std::string to_string(LocalizationState v) {
+    switch (v) {
+        case LocalizationState::UNLOCALIZED: return "UNLOCALIZED";
+        case LocalizationState::LOCALIZING: return "LOCALIZING";
+        case LocalizationState::LOCALIZED: return "LOCALIZED";
+    }
+    return "UNLOCALIZED";
+}
 std::string to_string(InstantActionType v) {
     switch (v) {
         case InstantActionType::CANCEL_ORDER: return "CANCEL_ORDER";
@@ -70,6 +78,7 @@ std::string to_string(InstantActionType v) {
         case InstantActionType::CLEAR_OBSTACLE: return "CLEAR_OBSTACLE";
         case InstantActionType::START_OBSTACLE_ZONE: return "START_OBSTACLE_ZONE";
         case InstantActionType::STOP_OBSTACLE_ZONE: return "STOP_OBSTACLE_ZONE";
+        case InstantActionType::INIT_POSITION: return "INIT_POSITION";
     }
     return "PAUSE";
 }
@@ -126,6 +135,12 @@ ConnectionState connection_state_from(const std::string& s) {
     if (s == "CONNECTION_BROKEN") return ConnectionState::CONNECTION_BROKEN;
     throw ValidationError("unknown ConnectionState: " + s);
 }
+LocalizationState localization_state_from(const std::string& s) {
+    if (s == "UNLOCALIZED") return LocalizationState::UNLOCALIZED;
+    if (s == "LOCALIZING") return LocalizationState::LOCALIZING;
+    if (s == "LOCALIZED") return LocalizationState::LOCALIZED;
+    throw ValidationError("unknown LocalizationState: " + s);
+}
 InstantActionType instant_action_type_from(const std::string& s) {
     if (s == "CANCEL_ORDER") return InstantActionType::CANCEL_ORDER;
     if (s == "PAUSE") return InstantActionType::PAUSE;
@@ -137,6 +152,7 @@ InstantActionType instant_action_type_from(const std::string& s) {
     if (s == "CLEAR_OBSTACLE") return InstantActionType::CLEAR_OBSTACLE;
     if (s == "START_OBSTACLE_ZONE") return InstantActionType::START_OBSTACLE_ZONE;
     if (s == "STOP_OBSTACLE_ZONE") return InstantActionType::STOP_OBSTACLE_ZONE;
+    if (s == "INIT_POSITION") return InstantActionType::INIT_POSITION;
     throw ValidationError("unknown InstantActionType: " + s);
 }
 
@@ -415,7 +431,7 @@ cJSON* BatteryInfo::to_json() const {
 
 OrderNode OrderNode::from_json(cJSON* obj) {
     static const std::unordered_set<std::string> known = {
-        "node_id", "sequence_id", "released", "position", "action", "reserved_window"};
+        "node_id", "sequence_id", "released", "position", "action", "reserved_window", "allowed_zone_ids"};
     require_no_extra_fields(obj, known, "OrderNode");
     OrderNode n;
     n.node_id = get_str(obj, "node_id", "OrderNode");
@@ -427,6 +443,15 @@ OrderNode OrderNode::from_json(cJSON* obj) {
     if (act && !cJSON_IsNull(act)) n.action = Action::from_json(act);
     cJSON* win = cJSON_GetObjectItemCaseSensitive(obj, "reserved_window");
     if (win && !cJSON_IsNull(win)) n.reserved_window = TimeWindow::from_json(win);
+    cJSON* zones = cJSON_GetObjectItemCaseSensitive(obj, "allowed_zone_ids");
+    if (zones) {
+        if (!cJSON_IsArray(zones)) throw ValidationError("allowed_zone_ids must be an array");
+        cJSON* z;
+        cJSON_ArrayForEach(z, zones) {
+            if (!cJSON_IsString(z)) throw ValidationError("allowed_zone_ids entries must be strings");
+            n.allowed_zone_ids.emplace_back(z->valuestring);
+        }
+    }
     return n;
 }
 
@@ -556,6 +581,7 @@ std::string State::to_json_string() const {
     cJSON_AddNumberToObject(root, "header_id", (double)header_id);
     cJSON_AddNumberToObject(root, "timestamp", timestamp);
     cJSON_AddStringToObject(root, "robot_id", robot_id.c_str());
+    cJSON_AddBoolToObject(root, "traffic_control", traffic_control);
 
     cJSON_AddStringToObject(root, "state", to_string(state).c_str());
     if (sub_state) cJSON_AddStringToObject(root, "sub_state", to_string(*sub_state).c_str());
@@ -578,6 +604,8 @@ std::string State::to_json_string() const {
     else cJSON_AddNullToObject(root, "map_id");
     if (map_version) cJSON_AddStringToObject(root, "map_version", map_version->c_str());
     else cJSON_AddNullToObject(root, "map_version");
+    cJSON_AddStringToObject(root, "localization", to_string(localization).c_str());
+    cJSON_AddNumberToObject(root, "localization_score", localization_score);
 
     cJSON_AddStringToObject(root, "last_node_id", last_node_id.c_str());
     cJSON_AddNumberToObject(root, "last_node_sequence_id", last_node_sequence_id);
@@ -686,5 +714,6 @@ std::string topic_state(const std::string& id) { return std::string(TOPIC_PREFIX
 std::string topic_connection(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/connection"; }
 std::string topic_physics(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/physics"; }
 std::string topic_instant(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/instant"; }
+std::string topic_sim_teleport(const std::string& id) { return "sim/v1/" + id + "/teleport"; }
 
 }  // namespace fms
