@@ -87,6 +87,12 @@ void RobotComm::publish_state(const State& state) {
                        false);
 }
 
+void RobotComm::publish_physics(const PhysicsDebug& debug) {
+    std::string payload = debug.to_json_string();
+    mosquitto_publish(mosq_, nullptr, topic_physics(robot_id_).c_str(), (int)payload.size(), payload.c_str(), 0,
+                       false);
+}
+
 void RobotComm::publish_online() {
     std::string payload = connection_payload(ConnectionState::ONLINE);
     mosquitto_publish(mosq_, nullptr, topic_connection(robot_id_).c_str(), (int)payload.size(),

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-이 리포에서 일하는 AI 코딩 에이전트(Claude Code 등)용 안내. 코드와 대조해 2026-10-15 (`v1.4`) 기준으로 맞춰 두었다.
+이 리포에서 일하는 AI 코딩 에이전트(Claude Code 등)용 안내. 코드와 대조해 2026-10-20 (`v1.4` 이후, MuJoCo 물리 도입분 미태그) 기준으로 맞춰 두었다.
 
 ## 개요
 
@@ -8,7 +8,7 @@ AMR(자율주행 로봇) 시뮬레이터 모노레포. 세 부분이 MQTT+JSON �
 
 | 경로 | 내용 |
 |---|---|
-| 루트 (`src/ include/ tools/ maps/`) | C++20 로봇 클라이언트. 프로세스 1개 = 로봇 1대. Python 원본(`robot_client/*.py`, 이 리포에 없음) 포팅이라 주석에 원본 참조가 많다 |
+| 루트 (`src/ include/ tools/ maps/`) | C++20 로봇 클라이언트. 프로세스 1개 = 로봇 1대. Python 원본(`robot_client/*.py`, 이 리포에 없음) 포팅이라 주석에 원본 참조가 많다. 이동은 MuJoCo 물리로 계산한다 |
 | `tools/*.py` | Python 도구: 맵 생성/정리/편집기, 통합 런처 |
 | `viewer/` | 라이브 플릿 뷰어 (Python/PySide6). 순수 관측자, 아무것도 발행하지 않는다 |
 | `broker/` | 개발용 mosquitto 설정 (`mosquitto.conf`: `127.0.0.1:1883`, 익명 허용, persistence 끔) |
@@ -35,6 +35,7 @@ AMR(자율주행 로봇) 시뮬레이터 모노레포. 세 부분이 MQTT+JSON �
 
 ```bash
 # C++ 빌드 (macOS: brew install mosquitto cjson qt)
+tools/setup_mujoco.sh # 최초 1회. MuJoCo 를 third_party/mujoco/ 에 설치 (gitignore). 없으면 make 가 이 안내를 하고 멈춘다
 make                  # robot_client + tools/{send_order,place_obstacle,obstacle_zone}
 make clean
 
@@ -43,10 +44,11 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 실행
 mosquitto -c broker/mosquitto.conf -v             # 브로커
-./robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y 6.0
+./robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y -4.0
 ./robot_client --id AMR-002 --x 0 --y 0 --gui     # Qt 제어판
 ./robot_client --id AMR-003 --host <FMS IP>       # --map 없음: FMS 가 SET_MAP 으로 맵 전달
-./robot_client -h                                 # 전체 옵션 (속도/크기/배터리/센서/동적 장애물/--seed/--path-refine 등)
+./robot_client -h                                 # 전체 옵션 (속도/크기/배터리/센서/동적 장애물/--seed/--path-refine/--friction/--mass/--record 등)
+./robot_client --id AMR-001 --map maps/empty_hall1/fms_map.json --x 3 --y 3 --friction 0.2 --record records   # 저마찰 + 학습 데이터 기록 (라이다 위치보정은 기본 켜짐, 끄려면 --loc-rate 0)
 ./launch.sh           # 터미널 대화형으로 N대 실행 (PID 는 .run/pids, 로그는 logs/). jq 필요
 ./stop.sh             # launch.sh 가 띄운 로봇 종료
 .venv/bin/python tools/launcher.py   # 통합 런처 GUI: 브로커/로봇/뷰어/편집기/생성기/make 실행·정지
@@ -82,6 +84,10 @@ tools/send_order AMR-001 --instant PAUSE          # CANCEL_ORDER|PAUSE|RESUME|RE
 3. `tools/send_order` 로 오더를 보낸다.
 4. `mosquitto_sub -t 'fms/v1/#' -v` 또는 뷰어로 State 를 확인한다.
 
+자동 회귀 테스트: `.venv/bin/python tools/physics_test.py [시나리오...]`. 자체 mosquitto(포트 18851)와 `empty_hall1` 으로 이동, STRAIGHT,
+DOCK/PARK, 충돌, 일시정지/취소, 벽 안 시작, 저마찰 슬립, 110 m 주행, 동적 장애물, GUI(offscreen) 기동과 스냅샷, physics 토픽, 위치추정 보정(켬/끔)을 시험한다 (전부 약 9분, 60 항목).
+`make` 로 바이너리를 먼저 만들어야 한다. 이동/도착/충돌/도킹 코드를 건드렸으면 돌린다.
+
 맵 도구는 출력 png/json 을 직접 열어 확인한다. GUI 는 `QT_QPA_PLATFORM=offscreen` 으로 띄우고 `grab()` 스크린샷을 찍어 볼 수 있다. 실제 클릭과 다이얼로그 흐름은 사용자가 확인해야 한다.
 
 ## 맵과 좌표계
@@ -107,21 +113,39 @@ tools/send_order AMR-001 --instant PAUSE          # CANCEL_ORDER|PAUSE|RESUME|RE
 - **스레드 모델**: `--gui` 면 `robot_loop` 를 백그라운드 스레드로, Qt 이벤트루프를 메인 스레드로 돌린다. 공유 상태는 `exec_mutex` 로 보호한다. GUI→루프 명령은 `CommandQueue` (`include/command_queue.hpp`: Move/Relocalize/Start/Stop/Estop/Mode/Configure/ResyncMap/SetBattery) 로 보낸다. 맵 다운로드는 별도 워커 스레드(`MapSync`)라 tick 을 막지 않는다. `executor` 를 건드리는 코드는 항상 이 락 규칙을 따라야 한다.
 - **`OrderExecutor` (`executor.cpp`, 가장 큼)**:
   - 처리 범위: 오더 상태머신 (released/order_update_id/거절 규칙), e-stop/PAUSE/MANUAL, 세그먼트 단위 경로계획, 액션(PICK/DROP/CHARGE/WAIT/STRAIGHT/DOCK/PARK), 충돌 감지, 동적 장애물 재계획.
-  - 소유 객체: `TrapezoidalKinematics`(이동/회전 사다리꼴 프로파일), `BatterySim`, `DynamicObstacleField`.
+  - 소유 객체: `PhysicsWorld`(MuJoCo, `physics`), `TrapezoidalKinematics`(사다리꼴 궤적 = 명령 생성기, 위의 world 를 가리킨다), `BatterySim`, `DynamicObstacleField`, `Recorder`(`--record` 일 때만). 멤버 선언 순서가 중요하다: `physics` 가 `kinematics` 보다 먼저여야 한다.
+  - `tick(dt)` 는 `dt` 를 0.1 초로 자른 뒤 `tick_logic` 을 돌고 `Recorder` 에 한 줄 쓴다. 움직이지 않는 분기(idle/액션/대기)는 `kinematics.brake(dt)` 를 불러 굴러가던 로봇을 감속시킨다.
   - `map` 포인터는 소유하지 않는다. `main` 의 `map_model`/`synced_map` 이 소유한다. 맵 교체는 `set_map()` 으로만 한다.
 - **위치 오류 규칙** (v1.3):
   - 시작 위치가 비-FREE 여도 프로세스는 경고 로그만 남기고 뜬다 (`main.cpp` 시작 검사).
   - 그 상태에서 오더를 받으면 `replan()` 이 `PlanningError` 를 잡아 FATAL `NO_PATH` 를 올리고 ERROR 상태가 된다 (설명에 로봇 좌표 포함).
   - `force_relocalize` 로 FREE 칸에 옮기면(또는 맵이 없으면) `NO_PATH`/`COLLISION` 오류를 지운다. 비-FREE 칸이면 경고만 남긴다.
   - `force_relocalize` 는 현재 GUI 제어판(`CmdRelocalize`)에서만 부를 수 있다. MQTT instant action 에는 없다.
-  - `COLLISION` 은 이동 중에만 검사한다.
+  - `COLLISION` 은 이동 중에만 검사한다 (물리: 몸체-벽 접촉, 위 "물리").
+- **물리 (MuJoCo, v1.4 이후)**:
+  - 구조: `TrapezoidalKinematics` 는 이상 궤적을 내는 명령 생성기이고, 위치는 `PhysicsWorld` 가 정한다. `step()` 은 `sync_from_world()` 로 측정 자세를 읽고 → 이상 궤적을 한 걸음 내고 → 그 변위를 (v, w) 로 바꿔 `world.drive()` → `world.step(dt)` → 다시 측정한다. `kinematics.x/y/theta` 는 항상 마지막 **추정** 자세다 (오도메트리 + 위치추정 보정, 참 자세 아님). `executor` 는 이 값만 보면 된다.
+  - 모드 스위치는 없다. `world_ == nullptr` 이면 순수 운동학(이전 동작)으로 도는 분기가 `kinematics.cpp` 에 남아 있지만 executor 는 항상 world 를 붙인다.
+  - `physics_world.cpp` 만 `mujoco.h` 를 include 한다 (pimpl). 월드: 바닥 평면 + 차동구동 몸체(바퀴 구 2, 무마찰 캐스터 2, 충돌 원판) + 벽 상자. 맵 → 벽은 비-FREE 칸을 직사각형으로 병합하고(`merge_blocked_cells`), 로봇 주변 8 m 창만 MJCF 에 넣는다. 3 m 벗어나면 `rebuild()` 로 재컴파일하고 qpos/qvel/ctrl 을 옮긴다. 월드는 `set_map()` 때마다 맵 그리드에서 다시 만든다.
+  - **충돌 형상은 원판(반지름 `width/2 - 0.04`)이다.** planner 가 반지름 `width/2` 원으로 팽창시키기 때문에 맞춘 것이고, 직사각형으로 하면 좁은 통로 모퉁이에서 회전 중 COLLISION 이 난다 (`gen_loop` 에서 확인). `length` 는 표시와 관성에만 쓴다. 이 결정을 바꾸면 planner 팽창도 같이 봐야 한다.
+  - 충돌: 몸체-벽 접촉력 20 N 이상이 0.25 초 지속되면 `kinematics.collided()` 가 true 가 되고 `check_collision` 이 FATAL `COLLISION` 을 올린다. 기존 "중심점이 비-FREE" 검사도 남아 있다. 시작/강제 위치가 벽 안이면 `ghost` 로 몸체-벽 충돌을 끈다 (v1.3 의 "벽 위에서도 뜬다" 보존, 엔진이 튕겨내지 못하게).
+  - 도착: 경로는 실제로 멈추고(`at_rest`) 마지막 지점 3 cm 이내여야 `is_path_complete()`. 이상 궤적이 끝났는데 못 닿으면 `goal_` 을 다시 건다. 직선 이동은 이상 궤적 목표를 매 tick 지금 heading 진행선 위로 투영하고(옆 방향 오차는 직선으로 못 줄인다), 목표 방위로 조향하며, 진행 방향 남은 거리 1 cm 이내에서 서면 끝난다. 끝난 뒤 정착 대기(`settle_`)도 `straight_active()` 에 포함되어 executor 의 `finish_straight` 가 실제로 선 뒤에 불린다.
+  - 이상 궤적 속도는 실제 속도 ±0.3 m/s (각속도 ±0.5 rad/s)로 묶는다. 방위 허용치는 서 있다 출발할 때 0.05 rad, 달리는 중 0.3 rad 이고(이상 궤적은 0.02), 큰 꺾임(0.3 rad 초과) 경유점에서 서도록 `stop_distance_ahead()` 로 감속한다. 이걸 빼면 슬립/지연 때문에 서고-돌고를 반복하거나 모퉁이에서 순간 정지(수 m/s² 감속)한다.
+  - 바퀴 서보 게인 `kServoGain = 6`: 60 이면 접촉 compliance 와 얽혀 정지 후에도 떨린다. 일단 6 이어도 슬립이 쓸 만하게 나온다.
+  - `emergency_stop()`/`set_pose()` 는 world 를 즉시 정지/순간이동시킨다. `hold()` 와 `brake()` 는 `max_deceleration` 으로 감속시킨다. world 는 `kinematics.step/hold/brake` 안에서만 진행하므로 호출이 없으면 시간이 멈춘다.
+  - 뷰어 디버그 토픽: `fms/v1/{id}/physics` (`PhysicsDebug`, `schemas.hpp`). `State` 는 뷰어 스키마가 `extra=forbid` 라 필드를 못 더해서 프로토콜 밖 토픽으로 뺐다. `main` 루프가 tick 마다 `executor.build_physics()` 를 발행한다. 뷰어는 pydantic 없이 dict 로 읽고(`fleet_monitor.py`), `qt_viewer.py` 가 외삽/궤적/GT/패널(`p`,`l`,`o`,`k`)로 그린다. 뷰어 몸체 = 보고 위치(`est_*` = State.pose), 청록 GT = 참 위치(`x y theta`), 노란 점선 = 보정 전 오도메트리(`odom_*`). 필드를 바꾸면 `schemas.cpp` `PhysicsDebug::to_json_string` 과 `qt_viewer.py` `_physics_text`/`display_pose`/`truth_pose` 를 같이 고친다.
+  - GUI 제어판(`gui.cpp`)에는 같은 값을 보이는 Physics 절과 마찰/질량 설정칸이 있다 (`CmdConfigure.friction/mass` -> `apply_robot_geometry`). `AMR_GUI_SNAPSHOT=파일.png` 이면 1.5 초 뒤 창을 PNG 로 저장한다 (offscreen 레이아웃 확인용).
+  - **추정 자세 기반 제어 + 위치추정 보정 (기본 켜짐)**: `sync_from_world()` 가 `world.est_*` 를 읽는다. 추정 = `Localizer`(`localizer.hpp/cpp`)가 오도메트리(`odom_*`, 바퀴 엔코더 적분)에 얹는 보정 오프셋 `T` (`추정 = T ∘ 오도메트리`). `Localizer::update()` 는 `PhysicsWorld::step()` 끝에서 주기(`--loc-rate`, 기본 5 Hz)마다 `z = 참 자세 + 노이즈` 로 추정을 `gain` 만큼 당기고 `T` 를 다시 푼다 (한 번에 0.15 m/0.1 rad 상한, dropout 확률로 측정 누락). `--loc-rate 0` 이면 보정 없음(추정 = 순수 오도메트리). `Localizer` 는 엔진을 모른다 (참 자세는 호출자가 넘긴다) — 나중에 EKF 등으로 바꿀 때 이 클래스만 갈아낀다. 제어/경로계획/도착/`State.pose` 가 전부 추정으로 돈다. 참 자세(`world.x()` 등)는 충돌 판정(`check_collision`), 기록, `physics` 토픽(뷰어)에만 쓴다. `teleport`/`set_pose` 는 오도메트리를 그 자세로 맞추고 `T` 를 지운다. 경로선은 뷰어에서 추정 좌표로 그린다.
+  - 추정에 노이즈가 있어서 `kinematics.cpp` `step_ideal` 이 5 cm 안의 경유점(마지막 제외)을 건너뛰고 2 cm 안이면 방위를 유지한다 (아니면 구간 경계의 겹친 경유점 방위가 노이즈로 흔들려 제자리 헌팅한다). 도착 허용(3 cm)보다 `kAimMinDist` 를 작게 해야 마지막 보정 접근(옆 3 cm 를 돌아서 가기)이 된다.
+  - 기록: `--record DIR` → `recorder.cpp` CSV(+meta.json). 열 정의는 README "물리 시뮬레이션" 절. `State` 스키마는 바뀌지 않았다 (오도메트리 등은 State 가 아니라 기록 파일에만).
+  - 물리가 아닌 것: 동적 장애물(사각형 좌표), 로봇끼리 상호작용, 라이다/IMU. 위치 보정(맵 기반 위치추정)도 없다.
+  - 디버깅: `AMR_PHYSICS_DUMP=파일` 로 마지막 MJCF 를 덤프해 파이썬 `mujoco` 로 재현할 수 있다. 서보/접촉 파라미터는 그렇게 스윕해서 정했다.
 - **직선 이동 / 도킹 / 주차** (v1.4):
   - `straight_`(StraightMotion: ACTION/DOCK_IN/UNDOCK)가 있으면 `tick` 은 `tick_straight` 만 돈다. 경로계획 없이 `kinematics.set_straight()` 로 heading 을 유지한 채 목표점까지 간다. PAUSE/e-stop 은 kinematics 쪽 목표를 지우므로 executor 가 목표를 들고 있다가 재개 때 다시 건다. `replan()` 은 `straight_` 가 있으면 아무것도 안 한다.
   - STRAIGHT: 노드 도착·정렬 후 노드 theta 방향 `distance` 만큼.
   - DOCK/PARK: `plan_segment_path` 가 해당 노드 목표를 `approach_point()`(진입 완료 자세에서 `undock_distance` 만큼 앞/뒤)로 바꾼다. 도착하면 직선으로 진입하고, 진입을 시작하는 순간 `docked_`(exit 지점 = 진입 시작 자세)를 만든다.
   - 언도킹은 액션이 아니다. `replan()` 이 세그먼트를 만들 때 `docked_` 가 있으면 먼저 `start_undock()` 으로 exit 지점까지 직선 이동한다. `docked_` 는 언도킹 완료 때만 지운다 (취소돼도 남음). 강제 위치지정은 지운다.
   - DOCK 은 `min_charge` 미만이면 `idle_state()` 가 CHARGING 을 돌려줘서 `can_accept_job()` 이 거절한다. `clear_order()` 는 도킹 중이면 `battery.charging` 을 유지한다.
-  - 도착 오차와 마커 보정은 일부러 넣지 않았다 (사용자 결정).
+  - 마커 보정은 일부러 넣지 않았다 (사용자 결정). v1.4 에는 도착 오차도 없었지만 물리 도입 뒤에는 물리가 만든다 (보통 수 mm, 위 "물리").
 - **경로계획**: `planner.cpp` A* (로봇 크기 반영, 동적 장애물 사각형 입력). 장애물은 센서 범위(`--sensor-range`) 안에서만 인식한다. README 의 known issue 참고.
 - **PSO 경로 다듬기** (`path_refine.cpp`, `--path-refine`, 기본 꺼짐):
   - 위치: `plan_segment_path()` 에서 구간별 A* 결과의 중간 경유점을 PSO 로 미세 조정한다.
@@ -175,6 +199,9 @@ tools/send_order AMR-001 --instant PAUSE          # CANCEL_ORDER|PAUSE|RESUME|RE
 ## 주의 / 알려진 문제
 
 - Makefile 은 소스를 자동 수집하지 않는다. `.cpp` 를 추가하면 `CORE_SRC` 에 직접 넣는다 (`gui.cpp` 는 `GUI_OBJ` 로 따로 있다).
+- MuJoCo 는 `tools/setup_mujoco.sh` 가 PyPI 휠에서 꺼내 `third_party/mujoco/` 에 둔다 (macOS 에서만 실행해 봤고 Linux 는 미검증). macOS 는 휠의 install name 이 framework 경로라 스크립트가 `install_name_tool`/`codesign` 으로 고친다. 링크는 rpath 를 절대경로로 박으므로 리포를 옮기면 다시 `make` 한다.
+- 물리 극단값 한계: `--friction 0.12 --max-acceleration 3` 같은 조합은 제자리 회전이 접지력을 넘어 방위가 헌팅하며 거의 못 간다. 마찰 0.15~0.5 / 가속 0.6~2.0 은 완주한다. 개선하려면 `rotate_step` 대신 측정 각속도를 쓰는 PD 제어가 필요하다.
+- 제자리 회전 때 몸체가 오도메트리보다 3~4% 더 돈다 (구 바퀴 접촉 때문). 오도메트리 오차가 12 m 에 2~15 cm 쌓이는 이유 중 하나다.
 - 셸이 zsh 라 변수 단어 분리가 안 된다. `$VAR` 로 인자 목록을 전개할 수 없으니 `${=VAR}` 를 쓴다. macOS `sed -i` 는 백업 인자(`sed -i ''`)가 필요하다.
 - `send_order --path` 는 `X,Y[,THETA]` 토큰을 받고, `-` 로 시작하는 토큰에서 경로 수집을 멈춘다. 그래서 음수 좌표를 줄 수 없다. 생성 맵이 칸 중심을 양수 좌표로 두는 이유다.
 - 주석의 오래된 참조:

@@ -16,6 +16,8 @@
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
 
+#include <cmath>
+#include <cstdlib>
 #include <sstream>
 
 namespace fms {
@@ -206,6 +208,34 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
     QObject::connect(battery100Btn, &QPushButton::clicked, [&queue]() { queue.push(CmdSetBattery{100.0}); });
     QObject::connect(battery1Btn, &QPushButton::clicked, [&queue]() { queue.push(CmdSetBattery{1.0}); });
 
+    // -- 물리 관측값 (MuJoCo). 뷰어의 physics 패널과 같은 값이다 --
+    auto* physBox = make_section(root, "  Physics (MuJoCo)  ");
+    auto* physLayout = new QVBoxLayout(physBox);
+    auto make_phys_row = [&](const QString& label) {
+        auto* row = new QHBoxLayout();
+        auto* l = new QLabel(label);
+        l->setMinimumWidth(90);
+        l->setStyleSheet(QString("color:%1;").arg(FG_DIM));
+        auto* v = new QLabel("-");
+        v->setStyleSheet(QString("font-family: Menlo, monospace; color:%1;").arg(FG));
+        row->addWidget(l);
+        row->addWidget(v);
+        row->addStretch();
+        physLayout->addLayout(row);
+        return v;
+    };
+    QLabel* pVel = make_phys_row("v fwd/lat (m/s)");
+    QLabel* pYaw = make_phys_row("yaw rate (rad/s)");
+    QLabel* pCmd = make_phys_row("cmd v/w");
+    QLabel* pWheel = make_phys_row("wheel L/R (rad/s)");
+    QLabel* pSlip = make_phys_row("slip L/R");
+    QLabel* pOdom = make_phys_row("est err / raw odom");
+    QLabel* pLoc = make_phys_row("localization");
+    QLabel* pWall = make_phys_row("wall force (N)");
+    QLabel* pFlags = make_phys_row("flags");
+    QLabel* pParams = make_phys_row("floor \u03bc / mass");
+    QLabel* pPath = make_phys_row("path");
+
     // -- 맵 동기화 (SET_MAP -> 번들 다운로드) --
     auto* mapBox = make_section(root, "  Map Sync  ");
     auto* mapLayout = new QVBoxLayout(mapBox);
@@ -245,6 +275,10 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         labeled_entry(settingsLayout, "Max acceleration (m/s\u00b2)", QString::number(max_acceleration, 'f', 3));
     QLineEdit* sensorRangeEdit =
         labeled_entry(settingsLayout, "Sensor range (m)", QString::number(executor.sensor_range, 'f', 2));
+    QLineEdit* frictionEdit =
+        labeled_entry(settingsLayout, "Friction \u03bc (physics)", QString::number(executor.physics->spec().friction, 'f', 2));
+    QLineEdit* massEdit =
+        labeled_entry(settingsLayout, "Mass (kg, physics)", QString::number(executor.physics->spec().mass, 'f', 1));
     auto* settingsBtnRow = new QHBoxLayout();
     settingsBtnRow->addStretch();
     auto* applyBtn = new QPushButton("Apply");
@@ -262,16 +296,18 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         auto vel = parse_double(velEdit->text());
         auto accel = parse_double(accelEdit->text());
         auto sensorRange = parse_double(sensorRangeEdit->text());
+        auto friction = parse_double(frictionEdit->text());
+        auto mass = parse_double(massEdit->text());
         if (robot_id.empty()) {
             settingsStatus->setText("Robot ID cannot be empty");
             return;
         }
         if (!width || *width <= 0 || !length || *length <= 0 || !vel || *vel <= 0 || !accel || *accel <= 0 ||
-            !sensorRange || *sensorRange <= 0) {
-            settingsStatus->setText("Width/length/velocity/acceleration/sensor range must be positive numbers");
+            !sensorRange || *sensorRange <= 0 || !friction || *friction <= 0 || !mass || *mass <= 0) {
+            settingsStatus->setText("Width/length/velocity/acceleration/sensor range/friction/mass must be positive numbers");
             return;
         }
-        queue.push(CmdConfigure{robot_id, *width, *length, *vel, *accel, *sensorRange});
+        queue.push(CmdConfigure{robot_id, *width, *length, *vel, *accel, *sensorRange, *friction, *mass});
         settingsStatus->setText("Settings command sent");
     });
 
@@ -343,6 +379,7 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
     auto* timer = new QTimer(window);
     QObject::connect(timer, &QTimer::timeout, [=, &executor, &exec_mutex, &map_sync]() {
         State snap;
+        PhysicsDebug ph;
         bool estop_latched;
         OperatingMode mode;
         bool paused;
@@ -351,6 +388,7 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         {
             std::lock_guard<std::mutex> lock(exec_mutex);
             snap = executor.build_state(0, 0.0);
+            ph = executor.build_physics(0, 0.0);
             estop_latched = executor.estop_latched();
             mode = executor.mode();
             paused = executor.paused();
@@ -374,7 +412,7 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         xVal->setText(QString::number(snap.pose.x, 'f', 3));
         yVal->setText(QString::number(snap.pose.y, 'f', 3));
         thetaVal->setText(QString::number(snap.pose.theta, 'f', 3));
-        velVal->setText(QString::number(snap.velocity, 'f', 3));
+        velVal->setText(QString::number(ph.v_fwd, 'f', 3));  // 부호 있는 실제 속도 (후진은 -)
         batteryVal->setText(QString::number(snap.battery.charge, 'f', 1) + " %");
         batteryBar->setValue((int)snap.battery.charge);
         orderVal->setText(snap.order_id ? QString::fromStdString(*snap.order_id) : "(none)");
@@ -388,6 +426,32 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
             }
             errorsVal->setText(joined);
         }
+
+        // 물리 관측값
+        auto num = [](double v, int prec = 3) { return QString::number(v, 'f', prec); };
+        pVel->setText(num(ph.v_fwd) + " / " + num(ph.v_lat));
+        pYaw->setText(num(ph.yaw_rate));
+        pCmd->setText(num(ph.cmd_v) + " / " + num(ph.cmd_w));
+        pWheel->setText(num(ph.wheel_w[0], 2) + " / " + num(ph.wheel_w[1], 2) + "  (cmd " + num(ph.wheel_cmd[0], 2) +
+                        " / " + num(ph.wheel_cmd[1], 2) + ")");
+        pSlip->setText(num(ph.slip[0], 2) + " / " + num(ph.slip[1], 2));
+        double est_err = std::hypot(ph.est_x - ph.x, ph.est_y - ph.y);      // 보고 위치(State.pose) - GT
+        double raw_err = std::hypot(ph.odom_x - ph.x, ph.odom_y - ph.y);    // 보정 전 오도메트리 - GT
+        pOdom->setText(num(est_err * 100, 1) + " / " + num(raw_err * 100, 1) + " cm");
+        pLoc->setText(ph.loc_rate > 0 ? QString::number(ph.loc_rate, 'f', 0) + " Hz, fixes " +
+                                            QString::number(ph.loc_corrections) + " (drop " +
+                                            QString::number(ph.loc_dropouts) + ")"
+                                      : "off");
+        pWall->setText(num(ph.wall_force, 1));
+        QString flags;
+        flags += ph.at_rest ? "rest " : "moving ";
+        if (ph.ghost) flags += "GHOST ";
+        if (ph.collided) flags += "COLLIDED ";
+        if (ph.straight) flags += "straight ";
+        pFlags->setText(flags.trimmed());
+        pFlags->setStyleSheet(QString("font-family: Menlo, monospace; color:%1;").arg(ph.collided ? "#d92d43" : FG));
+        pParams->setText(num(ph.friction, 2) + " / " + num(ph.mass, 1) + " kg");
+        pPath->setText(QString::number(ph.path_points) + " wp, " + num(ph.path_remaining, 2) + " m left");
 
         // 맵 동기화 상태
         MapSync::Status ms = map_sync.status();
@@ -436,11 +500,19 @@ void launch_gui(int argc, char** argv, OrderExecutor& executor, std::mutex& exec
         velEdit->setEnabled(enabled);
         accelEdit->setEnabled(enabled);
         sensorRangeEdit->setEnabled(enabled);
+        frictionEdit->setEnabled(enabled);
+        massEdit->setEnabled(enabled);
         applyBtn->setEnabled(enabled);
         if (!enabled) settingsStatus->setText("Editable only when IDLE");
         else if (settingsStatus->text() == "Editable only when IDLE") settingsStatus->setText("");
     });
     timer->start(200);
+
+    // 테스트/문서용: AMR_GUI_SNAPSHOT=파일.png 이면 1.5 초 뒤 창을 PNG 로 저장한다 (offscreen 에서 레이아웃 확인)
+    if (const char* snap = std::getenv("AMR_GUI_SNAPSHOT")) {
+        std::string path = snap;
+        QTimer::singleShot(1500, window, [window, path]() { window->grab().save(QString::fromStdString(path)); });
+    }
 
     window->show();
     window->raise();

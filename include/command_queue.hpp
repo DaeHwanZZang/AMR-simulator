@@ -23,6 +23,7 @@ struct CmdMode { OperatingMode mode; };
 struct CmdConfigure {
     std::string robot_id;
     double robot_width, robot_length, max_velocity, max_acceleration, sensor_range;
+    double friction, mass;  // 물리: 바퀴-바닥 마찰계수, 질량 (kg)
 };
 struct CmdResyncMap {};  // 마지막 SET_MAP 을 다시 받는다 (다운로드 실패 복구용)
 struct CmdSetBattery { double charge; };  // GUI 디버그 버튼 (100% / 1%)

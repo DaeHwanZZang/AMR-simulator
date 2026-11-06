@@ -256,11 +256,50 @@ struct InstantAction {
 // 토픽 헬퍼
 // =============================================================================
 
+// =============================================================================
+// PhysicsDebug : Robot -> 뷰어 (프로토콜 밖)
+// =============================================================================
+// FMS 와 맞출 필요가 없는 디버그 전용 토픽이다 (fms/v1/{id}/physics). State 는 extra=forbid 라 필드를
+// 더할 수 없어서 따로 뺐다. tick 마다(20 Hz) 발행하고 읽는 쪽은 뷰어뿐이다. 물리 월드의 관측값 전부 + 제어 상태.
+struct PhysicsDebug {
+    long long header_id = 0;
+    double timestamp = 0.0;
+    std::string robot_id;
+    double sim_time = 0.0;
+    std::string state, sub_state, action;  // 비어 있으면 없음
+
+    double x = 0, y = 0, theta = 0;                // 실제(참) 자세 = GT
+    double odom_x = 0, odom_y = 0, odom_theta = 0;  // 바퀴 엔코더 적분 자세 (보정 전)
+    double est_x = 0, est_y = 0, est_theta = 0;     // 로봇이 아는 자세 (보정된 추정 = State.pose)
+    // 위치추정(라이다 시뮬레이션) 설정과 통계
+    double loc_rate = 0, loc_sigma_xy = 0, loc_sigma_theta = 0, loc_gain = 0, loc_dropout = 0;
+    long loc_corrections = 0, loc_dropouts = 0;
+    double loc_step_xy = 0, loc_step_theta = 0;
+    double v_fwd = 0, v_lat = 0, yaw_rate = 0;
+    double wheel_w[2] = {0, 0}, wheel_cmd[2] = {0, 0}, slip[2] = {0, 0};
+    double cmd_v = 0, cmd_w = 0;
+    double wall_force = 0;
+    bool ghost = false, collided = false, at_rest = true, straight = false;
+
+    // 설정
+    double friction = 0, mass = 0, wheel_radius = 0, track = 0, max_wheel_torque = 0;
+    double max_velocity = 0, max_acceleration = 0;
+
+    // 경로
+    int path_points = 0;
+    double path_remaining = 0;  // 지금 자세에서 local_path 를 따라 남은 길이 (m)
+    bool has_goal = false;
+    double goal_x = 0, goal_y = 0;
+
+    std::string to_json_string() const;
+};
+
 constexpr const char* TOPIC_PREFIX = "fms/v1";
 
 std::string topic_order(const std::string& robot_id);
 std::string topic_state(const std::string& robot_id);
 std::string topic_connection(const std::string& robot_id);
 std::string topic_instant(const std::string& robot_id);
+std::string topic_physics(const std::string& robot_id);
 
 }  // namespace fms

@@ -28,6 +28,7 @@ public:
     bool is_connected() const { return connected_; }
 
     void publish_state(const State& state);
+    void publish_physics(const PhysicsDebug& debug);  // 디버그 토픽 (뷰어 전용, 프로토콜 밖)
     void publish_online();
     long long next_header_id() { return ++header_id_; }
 

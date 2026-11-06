@@ -526,5 +526,12 @@ def topic_instant(robot_id: str) -> str:
     return f"{TOPIC_PREFIX}/{robot_id}/instant"
 
 
+def topic_physics(robot_id: str) -> str:
+    """로봇 물리 디버그 토픽. 프로토콜이 아니라 뷰어 전용이다 (State 는 extra=forbid 라 필드를 못 더한다).
+    FMS 는 읽을 필요가 없고 스키마를 맞출 필요도 없다. 페이로드는 pydantic 으로 검증하지 않고 dict 로 쓴다."""
+    return f"{TOPIC_PREFIX}/{robot_id}/physics"
+
+
 TOPIC_STATE_ALL = f"{TOPIC_PREFIX}/+/state"
 TOPIC_CONNECTION_ALL = f"{TOPIC_PREFIX}/+/connection"
+TOPIC_PHYSICS_ALL = f"{TOPIC_PREFIX}/+/physics"

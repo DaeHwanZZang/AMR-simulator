@@ -20,16 +20,22 @@
 
 ```bash
 brew install mosquitto cjson qt
+tools/setup_mujoco.sh                # 최초 1회: MuJoCo 를 third_party/mujoco/ 에 설치 (brew 패키지가 없다)
 make                                 # robot_client + tools/{send_order,place_obstacle,obstacle_zone}
 ```
 
 ### Ubuntu (배포 타깃)
 
 ```bash
-sudo apt install clang build-essential libmosquitto-dev libcjson-dev qt6-base-dev pkg-config jq curl unzip
+sudo apt install clang build-essential libmosquitto-dev libcjson-dev qt6-base-dev pkg-config jq curl unzip python3-pip
+tools/setup_mujoco.sh                # 최초 1회: MuJoCo 를 third_party/mujoco/ 에 설치
 make
 ```
 
+- MuJoCo(`tools/setup_mujoco.sh`): PyPI 휠에서 C 헤더와 공유 라이브러리만 꺼내 `third_party/mujoco/`
+  (gitignore) 에 둔다. `python3 -m pip` 가 필요하다. 다른 곳에 있으면 `make MUJOCO_DIR=/경로`.
+  없이 `make` 하면 `MuJoCo 가 없다 ... tools/setup_mujoco.sh 를 실행하라` 로 멈춘다. 휠은 macOS(arm64/x86_64)와
+  Linux(x86_64/aarch64) 용이 있고, 이 스크립트는 macOS 에서만 실행해 봤다 (Linux 는 미검증).
 - `clang`/`build-essential`: `Makefile` 이 `CXX := clang++` 로 고정돼 있어 필요
   (g++로 바꾸려면 `Makefile` 의 `CXX` 줄을 직접 수정 — 자동 분기 없음)
 - `libmosquitto-dev`/`libcjson-dev`: 브로커 패키지(`mosquitto`)나 런타임
@@ -51,7 +57,7 @@ cmake 없이 순수 Makefile (`Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux
 ## 실행
 
 ```bash
-./robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y 6.0
+./robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y -4.0
 ./robot_client --id AMR-002 --x 0 --y 0 --gui    # 제어판 창(Qt)
 ./robot_client --id AMR-003 --host <FMS IP>      # --map 없이: FMS 가 SET_MAP 으로 맵을 내려준다
 ./launch.sh                                       # 인터랙티브 실행기 — N대 한번에
@@ -74,8 +80,9 @@ localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다
 
 - DOCK/PARK 의 노드 position 은 **진입을 마친 자세**다. 로봇은 그 앞 `undock_distance` 지점까지
   A* 로 가서 theta 로 정렬하고 직선으로 들어간다. `FORWARD` 는 전진 진입, `BACKWARD` 는 후진 진입이다.
-  충전기가 벽에 붙어 있어 A* 로는 못 들어가는 칸이라도 된다 (진입 직선은 팽창 검사를 안 하고 중심점만 본다).
-  진입 시작 지점은 A* 가 닿는 곳이어야 하니 `undock_distance` 를 충분히 준다.
+  충전기가 벽에 붙어 있어 A* 로는 못 들어가는 칸이라도 된다 (진입 직선은 팽창 검사를 안 한다). 다만 물리 몸체
+  (반지름 `width/2 - 0.04`)가 실제로 들어갈 자리여야 한다. 벽에 `0.21 m` 보다 가깝게 찍으면 벽에 눌려
+  COLLISION 이다. 진입 시작 지점은 A* 가 닿는 곳이어야 하니 `undock_distance` 를 충분히 준다.
 - 빠져나오기(언도킹)는 별도 액션이 없다. 도킹/주차 상태에서 이동이 필요한 오더를 받으면 먼저 진입했던
   직선을 되짚어 나온다. 전진 진입했으면 후진으로, 후진 진입했으면 전진으로 나온다. 진입이나 언도킹 도중
   취소돼도 다음 오더에서 먼저 빠져나온다.
@@ -83,7 +90,8 @@ localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다
   바뀌어 job 을 받는다 (충전은 언도킹 전까지 계속, `battery.charging=true`).
 - 직선 이동 중에도 충돌 감지(COLLISION), 동적 장애물 대기(우회는 안 함), PAUSE/e-stop 정지·재개가 그대로 된다.
   강제 위치지정을 하면 도킹 상태가 풀린다.
-- 위치·자세 도착 오차와 마커 보정은 시뮬레이션하지 않는다 (지령 자세에 그대로 도착).
+- 마커 보정은 시뮬레이션하지 않는다. 도착 오차는 물리가 만든다: 직선 이동은 진행 방향 1 cm 이내, 옆 방향은
+  목표 방위로 조향해서 보통 수 mm 이내다 (아래 물리 절).
 
 ```bash
 # 리포 루트에서. theta 는 --path 의 세 번째 값 (라디안)
@@ -93,6 +101,94 @@ tools/send_order AMR-001 --path 14.75,5,0 --order-id d1 --action DOCK \
 tools/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK \
     --param entry=FORWARD --param undock_distance=0.6
 ```
+
+### 물리 시뮬레이션 (MuJoCo)
+
+로봇 이동은 MuJoCo 물리 엔진이 계산한다 (기본 동작이고 끌 수 없다). 바퀴 슬립, 관성, 벽과의 접촉이 그대로 나온다.
+
+```text
+오더 -> A* 경로 -> 사다리꼴 이상 궤적 -> (v, w) -> 바퀴 속도 서보 -> MuJoCo (2 ms x 25 / tick) -> 실제 자세
+                      ^---------- 매 tick 실제(측정) 자세에서 다시 출발 ----------------------'
+```
+
+- **이상 궤적은 명령 생성기다.** 기존 `TrapezoidalKinematics` 가 측정 자세에서 한 걸음 낸 변위를 몸체 목표 속도 (v, w) 로
+  바꿔 바퀴에 준다. 실제가 못 따라가면 다음 tick 에 그 자리에서 다시 계산한다 (폐루프).
+- **로봇은 자기 위치를 추정으로 안다 (참 자세를 모른다).** `State.pose`, 경로 추종, 도착 판정은 전부 추정 자세로 돈다.
+  추정 = 바퀴 엔코더 적분(오도메트리) + 위치추정 보정이다. 엔코더는 슬립을 못 봐서 오도메트리는 틀어지고(저마찰이면 12 m 에
+  1 m 이상), 보정이 그걸 고친다 (아래 "위치추정 보정"). 참 자세(GT)는 물리 엔진과 뷰어(`physics` 토픽)에만 있고, 벽 충돌 판정은
+  참 자세 기준이다. `State.velocity` 는 실제 속력(크기)이다. 강제 재위치(GUI)는 오도메트리와 추정을 그 자세로 맞춘다.
+- **몸체 모델**: 차동구동 + 캐스터 2개. 질량 60 kg (`--mass`), 바퀴 반지름 0.075 m, 바퀴 간격 `width - 0.15` m,
+  바퀴 토크 한계 12 N·m, 바퀴-바닥 마찰 `--friction` (기본 0.8). 질량 분포는 `length x width x 0.2 m` 직육면체 기준이다.
+- **충돌 형상은 원판이다 (반지름 `width/2 - 0.04`).** planner 가 로봇을 반지름 `width/2` 원으로 보고 팽창시키므로
+  같은 가정이어야 계획된 경로에서 제자리 회전하다 벽에 부딪히지 않는다. `length` 는 State/뷰어 표시와 관성에만 쓰인다.
+  직사각형으로 하면 폭 1 m 통로 모퉁이에서 회전 중 충돌이 났다 (실제로 확인).
+- **벽**: FREE 가 아닌 칸(OCCUPIED/UNKNOWN/맵 밖)을 직사각형으로 병합해 상자로 만든다 (실제 맵 2347x1687 px 이 22,897 개, 8 ms).
+  로봇 주변 8 m 창 안의 상자만 모델에 넣고, 창 중심에서 3 m 벗어나면 모델을 다시 컴파일한다 (상태는 이어받는다). 그래서 맵
+  크기와 tick 비용이 상관없다 (실제 맵 주행 중 CPU 약 4%). 맵 그리드가 원본이고 물리 월드는 로드/`SET_MAP` 때마다 거기서 만든다.
+- **충돌 판정**: 몸체-벽 접촉력이 20 N 이상으로 0.25 초 이어지면 FATAL `COLLISION` 이다 (로봇은 그 자리에서 선다).
+  시작/강제 위치가 벽 안이면 (v1.3 의 "벽 위에서도 일단 뜬다") 몸체-벽 충돌을 꺼서 엔진이 로봇을 튕겨내지 않게 한다. 기록의 `ghost` 열.
+- **정지와 도착**: 경로 끝은 실제로 멈추고 마지막 지점에서 3 cm 이내여야 도착이다 (못 닿으면 마지막 지점을 다시 건다).
+  직선 이동(STRAIGHT/DOCK/PARK/언도킹)은 목표 방위로 조향하며 가고, 진행 방향 남은 거리 1 cm 이내에서 서면 끝이다.
+  경로의 큰 꺾임(0.3 rad 초과)에서는 감속해 서서 돌고, 작은 꺾임은 서지 않고 조향하며 지나간다.
+- **PAUSE/e-stop/강제 정지는 즉시 선다.** 오더 취소나 대기 중에 굴러가고 있으면 `max_deceleration` 으로 감속해 선다.
+- **tick 의 dt 는 0.1 초로 자른다.** A* 가 루프를 수백 ms 막았다 돌아와도 로봇이 한 번에 튀지 않는다 (막혀 있던 시간은 건너뛴다).
+- **서보 게인은 6 으로 낮게 잡았다.** 60 이면 접촉 compliance 와 얽혀 정지 후에도 몇 cm/s 로 계속 떨렸다.
+
+슬립은 마찰이 낮거나 가속 요구가 마찰 한계를 넘을 때 생긴다. 예: `--friction 0.2 --max-acceleration 1.0`. 정상 마찰(0.8)에서는
+슬립률 중앙값이 0.001 이고 추정 오차(오도메트리 대 참)는 12 m 에 2~15 cm 정도다 (제자리 회전 때 바퀴 접촉 때문에 몸체가 오도메트리보다 3~4% 더 돈다).
+한계: `--friction 0.12 --max-acceleration 3` 처럼 극단이면 제자리 회전이 접지력을 넘어 방위가 ±0.5 rad 로 헌팅하며 거의 못 간다.
+마찰 0.15~0.5, 가속 0.6~2.0 은 완주한다.
+
+**위치추정 보정 (라이다 시뮬레이션, 기본 켜짐)**: 주기마다 "라이다 측정" `z = GT + 가우시안 노이즈` 를 받아 추정을 z 쪽으로
+`gain` 만큼 당긴다 (AMCL 이 map->odom 변환을 고치는 구조: `추정 = T ∘ 오도메트리`, `T` 를 갱신). 한 번에 고치는 양은
+0.15 m / 0.1 rad 로 묶어 추정이 튀지 않게 하고, 측정은 가끔 빠진다. 보정은 GT 를 노이즈 낀 측정값으로만 쓴다 (로봇이 GT 를 직접 알지 못한다).
+
+| 옵션 | 기본 | 뜻 |
+|---|---|---|
+| `--loc-rate HZ` | 5 | 보정 주기. **0 이면 보정 없는 순수 오도메트리** (오차 누적 시험용) |
+| `--loc-noise-xy M` | 0.02 | 측정 노이즈 위치 표준편차 |
+| `--loc-noise-theta RAD` | 0.01 | 측정 노이즈 방위 표준편차 |
+| `--loc-gain K` | 0.15 | 한 번에 측정 쪽으로 당기는 비율 (0~1) |
+| `--loc-dropout P` | 0.05 | 측정이 빠질 확률 |
+
+`--friction 0.3` 로 4 개 노드를 도는 시험에서 보정이 켜져 있으면 추정 오차가 최대 3 cm 였고 (보정 전 오도메트리는 1 m 이상 벌어짐),
+`--loc-rate 0` 이면 추정이 그대로 벌어진다. 낮은 마찰 + 보정 주기가 느리면 제자리 회전에서 보정 지연 때문에 추정이 흔들릴 수 있다 (5 Hz, gain 0.15 는 μ 0.3 까지 완주).
+기록 CSV 에는 `x y theta` (GT), `odom_*` (보정 전), `est_*` (보정된 추정) 가 모두 있다. 노이즈에도 경유점 방위가 흔들리지 않도록
+`kinematics.cpp` 가 5 cm 안의 경유점은 건너뛰고 2 cm 안이면 방위를 유지한다.
+
+**뷰어 물리 디버그**: 로봇이 `fms/v1/{id}/physics` 토픽으로 tick 마다(20 Hz) 물리 관측값을 발행한다. `State` 는 `extra=forbid` 라
+필드를 더할 수 없어서 따로 뺐고, 프로토콜이 아니라서 FMS 와 맞출 필요가 없다 (뷰어만 읽는다). 내용: 실제 자세/속도(`v_fwd`, `v_lat`, `yaw_rate`),
+바퀴 속도/목표/슬립, 오도메트리(보정 전)/추정(보정 후) 자세, 위치추정 설정과 통계, 몸체 목표 속도, 벽 접촉력, ghost/collided/at_rest, 마찰/질량/한계, 남은 경로 길이와 목표.
+Qt 뷰어는 이걸로 자세를 외삽해 부드럽게 그리고(30 fps), 왼쪽 패널(`p` 토글)에 값을 띄우며, 지나온 궤적(`l`), **GT(참 위치, 오차 없음)**
+(청록 윤곽 + 십자 + "GT" 라벨 + 청록 점선 궤적, `o`)와 보정 전 순수 오도메트리(노란 점선 윤곽, `i`)를 그린다.
+몸체는 로봇이 보고한 위치(`State.pose` = 보정된 추정)이고,
+GT 와 벌어진 만큼이 누적 오차다 (패널 `error`). 보정 알고리즘의 기준값은 `physics` 토픽의 `x y theta` 또는 기록 CSV 의 `x y theta` 열이다, 속도 벡터(초록)와, 벽에 눌릴 때 빨간 GT 윤곽을 그린다. 계획 경로는 현재 구간 굵게 + 남은 구간 눈금선 + 경유점 점 +
+목표 링과 남은 거리로 표시하고, 이미 지난 경유점은 뺀다. `k` 는 궤적과 피크값(최대 슬립/접촉력)을 지운다.
+로컬 제어판(`--gui`)에도 같은 값(Physics 절)과 마찰/질량 설정칸이 있다. 제어판 레이아웃은 `AMR_GUI_SNAPSHOT=파일.png` 로
+(`QT_QPA_PLATFORM=offscreen` 과 함께) 1.5 초 뒤 PNG 로 저장해 볼 수 있다.
+
+**데이터 기록 (`--record DIR`)**: tick(50 ms) 마다 한 줄씩 `DIR/<id>_<시작시각>.csv` 에 쓰고, 설정은 `.meta.json` 에 둔다
+(크기, 질량, 마찰, 최대 속도/가속도, 시작 자세, seed 등). 오더 하나가 에피소드이고 `order_id` 열로 나눈다 (비어 있으면 대기).
+
+| 열 | 내용 |
+|---|---|
+| `t`, `wall_time` | 로봇 시작 후 시뮬레이션 시간(s), epoch |
+| `state`, `sub_state`, `order_id`, `node_index`, `action` | 상태와 오더 진행 |
+| `x y theta` | 실제 자세 (엔진 값) |
+| `odom_x odom_y odom_theta` | 바퀴 엔코더만 적분한 자세 |
+| `v_fwd v_lat yaw_rate` | 몸체 좌표 실제 속도 (전진 +, 왼쪽 +) |
+| `cmd_v cmd_w` | 이상 궤적이 준 몸체 목표 속도 |
+| `wheel_w_l/r`, `wheel_cmd_l/r` | 바퀴 각속도와 목표 (rad/s) |
+| `slip_l slip_r` | 바퀴별 종방향 슬립률 (0 = 구름, ±1 이상 = 헛돎) |
+| `wall_force`, `ghost` | 몸체-벽 최대 접촉력(N), 벽 안 시작 여부 |
+| `battery`, `charging`, `detected_obstacles`, `error` | 배터리, 감지 장애물 수, 첫 오류 종류 |
+
+물리가 아닌 것: 동적 장애물은 사각형 좌표일 뿐 물리 객체가 아니다 (로봇이 밀지 못하고 센서 반경으로만 인식). 로봇끼리는
+프로세스가 따로라 서로 부딪히지 않는다. 라이다/IMU 센서는 없다.
+
+디버깅: `AMR_PHYSICS_DUMP=파일` 환경변수를 주면 마지막으로 컴파일한 MJCF 를 그 파일에 쓴다 (파이썬 `mujoco` 로 열어 볼 수 있다).
+통합 테스트: `.venv/bin/python tools/physics_test.py [시나리오...]` (empty_hall1 에서 이동/직선/도킹/충돌/일시정지/
+벽 안 시작/저마찰/장거리/동적 장애물, 약 8분).
 
 ### 통합 런처 (`tools/launcher.py`)
 
@@ -240,13 +336,14 @@ Qt 는 메인스레드 전용이라 `--gui` 주면 tick/MQTT 루프를 백그라
 |---|---|
 | 프로토콜/맵 계약 | `include+src/schemas.*`, `map_model.*` |
 | 경로계획/오더 실행/통신/시계 | `include+src/{planner,executor,comm,clock}.*` |
-| 물리 시뮬레이션 | `include+src/{kinematics,battery,dynamic_obstacles}.*` |
+| 물리 시뮬레이션 | `include+src/{physics_world,kinematics,battery,dynamic_obstacles}.*` (MuJoCo 는 `physics_world.cpp` 안에만) |
+| 데이터 기록 | `include+src/recorder.*` |
 | 로컬 제어판 | `gui.hpp/cpp` (Qt Widgets) |
 | CLI 도구 | `tools/*.cpp`, 테스트 맵 생성/정리 `tools/{gen_map,synth_map,clean_map}.py` |
 | SET_MAP 번들 다운로더 | `map_sync.hpp/cpp` |
 
 기능 범위: MQTT(LWT/재접속), 오더 상태머신(released/order_update_id/거절 규칙),
-4축 상태, e-stop/PAUSE, A* 경로계획, 사다리꼴 운동학, 배터리, 동적 장애물 회피,
+4축 상태, e-stop/PAUSE, A* 경로계획, MuJoCo 물리(사다리꼴 궤적 추종), 배터리, 동적 장애물 회피,
 충돌 감지, 강제 재위치, Qt 로컬 제어판.
 
 

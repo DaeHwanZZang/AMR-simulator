@@ -475,6 +475,79 @@ Order Order::from_json_string(const std::string& payload) {
     return o;
 }
 
+// -- PhysicsDebug -----------------------------------------------------
+
+std::string PhysicsDebug::to_json_string() const {
+    auto r5 = [](double v) { return std::round(v * 100000) / 100000; };
+    auto pair = [&](const double* a) {
+        cJSON* arr = cJSON_CreateArray();
+        cJSON_AddItemToArray(arr, cJSON_CreateNumber(r5(a[0])));
+        cJSON_AddItemToArray(arr, cJSON_CreateNumber(r5(a[1])));
+        return arr;
+    };
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "header_id", (double)header_id);
+    cJSON_AddNumberToObject(root, "timestamp", timestamp);
+    cJSON_AddStringToObject(root, "robot_id", robot_id.c_str());
+    cJSON_AddNumberToObject(root, "sim_time", r5(sim_time));
+    cJSON_AddStringToObject(root, "state", state.c_str());
+    cJSON_AddStringToObject(root, "sub_state", sub_state.c_str());
+    cJSON_AddStringToObject(root, "action", action.c_str());
+    cJSON_AddNumberToObject(root, "x", r5(x));
+    cJSON_AddNumberToObject(root, "y", r5(y));
+    cJSON_AddNumberToObject(root, "theta", r5(theta));
+    cJSON_AddNumberToObject(root, "odom_x", r5(odom_x));
+    cJSON_AddNumberToObject(root, "odom_y", r5(odom_y));
+    cJSON_AddNumberToObject(root, "odom_theta", r5(odom_theta));
+    cJSON_AddNumberToObject(root, "est_x", r5(est_x));
+    cJSON_AddNumberToObject(root, "est_y", r5(est_y));
+    cJSON_AddNumberToObject(root, "est_theta", r5(est_theta));
+    cJSON_AddNumberToObject(root, "loc_rate", r5(loc_rate));
+    cJSON_AddNumberToObject(root, "loc_sigma_xy", r5(loc_sigma_xy));
+    cJSON_AddNumberToObject(root, "loc_sigma_theta", r5(loc_sigma_theta));
+    cJSON_AddNumberToObject(root, "loc_gain", r5(loc_gain));
+    cJSON_AddNumberToObject(root, "loc_dropout", r5(loc_dropout));
+    cJSON_AddNumberToObject(root, "loc_corrections", (double)loc_corrections);
+    cJSON_AddNumberToObject(root, "loc_dropouts", (double)loc_dropouts);
+    cJSON_AddNumberToObject(root, "loc_step_xy", r5(loc_step_xy));
+    cJSON_AddNumberToObject(root, "loc_step_theta", r5(loc_step_theta));
+    cJSON_AddNumberToObject(root, "v_fwd", r5(v_fwd));
+    cJSON_AddNumberToObject(root, "v_lat", r5(v_lat));
+    cJSON_AddNumberToObject(root, "yaw_rate", r5(yaw_rate));
+    cJSON_AddItemToObject(root, "wheel_w", pair(wheel_w));
+    cJSON_AddItemToObject(root, "wheel_cmd", pair(wheel_cmd));
+    cJSON_AddItemToObject(root, "slip", pair(slip));
+    cJSON_AddNumberToObject(root, "cmd_v", r5(cmd_v));
+    cJSON_AddNumberToObject(root, "cmd_w", r5(cmd_w));
+    cJSON_AddNumberToObject(root, "wall_force", r5(wall_force));
+    cJSON_AddBoolToObject(root, "ghost", ghost);
+    cJSON_AddBoolToObject(root, "collided", collided);
+    cJSON_AddBoolToObject(root, "at_rest", at_rest);
+    cJSON_AddBoolToObject(root, "straight", straight);
+    cJSON_AddNumberToObject(root, "friction", r5(friction));
+    cJSON_AddNumberToObject(root, "mass", r5(mass));
+    cJSON_AddNumberToObject(root, "wheel_radius", r5(wheel_radius));
+    cJSON_AddNumberToObject(root, "track", r5(track));
+    cJSON_AddNumberToObject(root, "max_wheel_torque", r5(max_wheel_torque));
+    cJSON_AddNumberToObject(root, "max_velocity", r5(max_velocity));
+    cJSON_AddNumberToObject(root, "max_acceleration", r5(max_acceleration));
+    cJSON_AddNumberToObject(root, "path_points", path_points);
+    cJSON_AddNumberToObject(root, "path_remaining", r5(path_remaining));
+    if (has_goal) {
+        cJSON* g = cJSON_CreateArray();
+        cJSON_AddItemToArray(g, cJSON_CreateNumber(r5(goal_x)));
+        cJSON_AddItemToArray(g, cJSON_CreateNumber(r5(goal_y)));
+        cJSON_AddItemToObject(root, "goal", g);
+    } else {
+        cJSON_AddNullToObject(root, "goal");
+    }
+    char* txt = cJSON_PrintUnformatted(root);
+    std::string result(txt);
+    free(txt);
+    cJSON_Delete(root);
+    return result;
+}
+
 // -- State ------------------------------------------------------------
 
 std::string State::to_json_string() const {
@@ -611,6 +684,7 @@ bool InstantAction::has(const std::string& key) const { return param_has(params,
 std::string topic_order(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/order"; }
 std::string topic_state(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/state"; }
 std::string topic_connection(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/connection"; }
+std::string topic_physics(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/physics"; }
 std::string topic_instant(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/instant"; }
 
 }  // namespace fms

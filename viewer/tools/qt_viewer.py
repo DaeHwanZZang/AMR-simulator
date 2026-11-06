@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -35,7 +36,7 @@ from PySide6.QtGui import (
     QBrush, QColor, QFont, QIcon, QImage, QPainterPath, QPen, QPixmap, QPolygonF,
 )
 from PySide6.QtWidgets import (
-    QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
+    QGraphicsLineItem, QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
     QGraphicsRectItem, QGraphicsScene, QGraphicsView,
     QLabel, QMainWindow,
 )
@@ -56,6 +57,14 @@ ROBOT_PALETTE = [
 STALE_AFTER = 2.0          # 이 시간 동안 상태 보고가 없으면 흐리게
 EVENT_LOG_MAX_LINES = 14
 PATH_TICK_SPACING_PX = 14  # 경로선 눈금 간격 (화면 픽셀 아니라 scene 단위 — 아래 참고)
+PHYSICS_FRESH = 0.5        # 이 시간 안에 받은 physics 토픽만 믿고 자세를 외삽한다
+EXTRAPOLATE_MAX = 0.2      # 외삽은 최대 이만큼만 (그 이상은 멈춰 보이는 쪽이 낫다)
+TRAIL_MAX = 4000           # 지나간 궤적 점 개수 상한
+TRAIL_MIN_STEP = 0.03      # 이만큼(m) 움직여야 궤적에 점을 더한다
+WP_PASSED_DIST = 0.20      # 로봇이 경유점에 이만큼(m) 안으로 오면 이미 지난 걸로 보고 선에서 뺀다
+FORCE_ALERT = 5.0          # 벽 접촉력(N)이 이보다 크면 GT 윤곽을 빨갛게
+GT_COLOR = "#00e5ff"       # 참 위치(ground truth) 표시 색
+ODOM_COLOR = "#ffd60a"     # 보정 전 순수 오도메트리 표시 색
 
 # zone 타입별 색 — vendor zone_meta.json 을 그리는 용도 (표시 전용, 로봇 내비게이션엔
 # 관여 안 한다 — 그쪽은 fms_server 가 grid 에 구워서 각 로봇이 직접 받는다)
@@ -106,9 +115,57 @@ class RobotView:
     planned_path: list[tuple[float, float]] = field(default_factory=list)
     detected_obstacles: list[tuple[float, float, float, float]] = field(default_factory=list)
     has_pose: bool = False
+    # -- 물리 디버그 (fms/v1/{id}/physics, 로봇이 tick 마다(20 Hz) 발행). 없으면 State 값만 쓴다 --
+    physics: Optional[dict] = None
+    physics_at: float = 0.0
+    accel: float = 0.0                      # 측정 속도의 미분 (EMA)
+    peak_slip: float = 0.0                  # 오더 동안 최대 |slip|
+    peak_force: float = 0.0                 # 최대 벽 접촉력
+    trail: deque = field(default_factory=lambda: deque(maxlen=TRAIL_MAX))      # 로봇이 보고한(추정) 위치 궤적
+    gt_trail: deque = field(default_factory=lambda: deque(maxlen=TRAIL_MAX))   # 참 위치 궤적
+    trail_dirty: bool = False
+    # 이번 refresh 에서 그리는 자세 (물리 토픽으로 외삽한 값).
+    # 로봇이 보고하는 자세 (오도메트리 추정 = State.pose). 몸체와 계획 경로는 이 좌표계다
+    dx: float = 0.0
+    dy: float = 0.0
+    dth: float = 0.0
 
     def is_stale(self, now: float) -> bool:
         return self.has_pose and (now - self.last_seen) > STALE_AFTER
+
+    def physics_fresh(self, now: float) -> bool:
+        return self.physics is not None and (now - self.physics_at) < PHYSICS_FRESH
+
+    def _extrapolate(self, now: float, x: float, y: float, theta: float) -> tuple[float, float, float]:
+        p = self.physics
+        dt = max(0.0, min(now - self.physics_at, EXTRAPOLATE_MAX))
+        th = theta + p["yaw_rate"] * dt / 2   # 중점 방위로 적분
+        return (x + p["v_fwd"] * math.cos(th) * dt - p["v_lat"] * math.sin(th) * dt,
+                y + p["v_fwd"] * math.sin(th) * dt + p["v_lat"] * math.cos(th) * dt,
+                theta + p["yaw_rate"] * dt)
+
+    def display_pose(self, now: float) -> tuple[float, float, float]:
+        """로봇이 보고하는 자세(추정). State(5 Hz) 보다 physics(20 Hz)가 새로우면 그 odom 값에서 속도로 외삽한다."""
+        if not self.physics_fresh(now):
+            return self.x, self.y, self.theta
+        p = self.physics
+        if "est_x" in p:   # 위치추정 보정을 얹은 추정 (State.pose). 옛 로봇은 est 가 없어 순수 오도메트리를 쓴다
+            return self._extrapolate(now, p["est_x"], p["est_y"], p["est_theta"])
+        return self._extrapolate(now, p["odom_x"], p["odom_y"], p["odom_theta"])
+
+    def raw_odom_pose(self, now: float) -> Optional[tuple[float, float, float]]:
+        """보정 전 순수 오도메트리 (바퀴 엔코더 적분만)."""
+        if not self.physics_fresh(now):
+            return None
+        p = self.physics
+        return self._extrapolate(now, p["odom_x"], p["odom_y"], p["odom_theta"])
+
+    def truth_pose(self, now: float) -> Optional[tuple[float, float, float]]:
+        """참 자세 (물리 엔진, 오차 없음). 물리 토픽이 없는 로봇은 None."""
+        if not self.physics_fresh(now):
+            return None
+        p = self.physics
+        return self._extrapolate(now, p["x"], p["y"], p["theta"])
 
 
 class _OutlinedLabel(QGraphicsPathItem):
@@ -177,12 +234,106 @@ class _RobotItem:
         self.path_item.setZValue(3)
         scene.addItem(self.path_item)
 
+        # 현재 구간(로봇 -> 다음 경유점): 남은 경로보다 굵고 밝게
+        leg_pen = QPen(color.lighter(130))
+        leg_pen.setWidthF(2.6)
+        leg_pen.setCosmetic(True)
+        self.leg_item = QGraphicsPathItem()
+        self.leg_item.setPen(leg_pen)
+        self.leg_item.setZValue(3.5)
+        scene.addItem(self.leg_item)
+
+        # 경유점 점 + 최종 목표 링
+        wp_pen = QPen(QColor("white"))
+        wp_pen.setWidthF(1.0)
+        wp_pen.setCosmetic(True)
+        self.wp_item = QGraphicsPathItem()
+        self.wp_item.setPen(wp_pen)
+        self.wp_item.setBrush(QBrush(color))
+        self.wp_item.setZValue(3.6)
+        scene.addItem(self.wp_item)
+        goal_pen = QPen(color.lighter(150))
+        goal_pen.setWidthF(2.2)
+        goal_pen.setCosmetic(True)
+        self.goal_item = QGraphicsPathItem()
+        self.goal_item.setPen(goal_pen)
+        self.goal_item.setZValue(3.7)
+        scene.addItem(self.goal_item)
+        self.goal_label = _OutlinedLabel()
+        gf = self.goal_label.font()
+        gf.setPointSizeF(7.5)
+        gf.setBold(True)
+        self.goal_label.setFont(gf)
+        self.goal_label.setZValue(7)
+        scene.addItem(self.goal_label)
+
+        # 지나온 궤적 (실제 물리 자세)
+        trail_pen = QPen(color)
+        trail_pen.setWidthF(1.3)
+        trail_pen.setCosmetic(True)
+        self.trail_item = QGraphicsPathItem()
+        self.trail_item.setPen(trail_pen)
+        self.trail_item.setZValue(2.5)
+        scene.addItem(self.trail_item)
+
+        # 참 위치(ground truth, 물리 엔진 값, 오차 없음): 청록 윤곽 + 중심 십자 + "GT" 라벨 + 점선 궤적.
+        # 몸체(로봇이 보고한 추정 위치)와 벌어진 만큼이 누적 오차다. 보정 기준으로 쓴다
+        gt_pen = QPen(QColor(GT_COLOR))
+        gt_pen.setWidthF(1.8)
+        gt_pen.setCosmetic(True)
+        self.gt = QGraphicsRectItem()
+        self.gt.setPen(gt_pen)
+        self.gt.setZValue(6.2)
+        self.gt.setVisible(False)
+        scene.addItem(self.gt)
+        self.gt_cross = QGraphicsPathItem(self.gt)   # gt 의 자식: 위치/회전을 따라간다
+        self.gt_cross.setPen(gt_pen)
+        self.gt_label = _OutlinedLabel()
+        lf = self.gt_label.font()
+        lf.setPointSizeF(7.0)
+        lf.setBold(True)
+        self.gt_label.setFont(lf)
+        self.gt_label.setBrush(QBrush(QColor(GT_COLOR)))
+        self.gt_label.setText("GT")
+        self.gt_label.setZValue(7)
+        self.gt_label.setVisible(False)
+        scene.addItem(self.gt_label)
+        # 보정 전 순수 오도메트리 (노란 점선 윤곽): 위치추정 보정이 얼마나 일하고 있는지 보인다
+        odom_pen = QPen(QColor(ODOM_COLOR))
+        odom_pen.setWidthF(1.2)
+        odom_pen.setCosmetic(True)
+        odom_pen.setStyle(Qt.DashLine)
+        self.odom = QGraphicsRectItem()
+        self.odom.setPen(odom_pen)
+        self.odom.setZValue(4.5)
+        self.odom.setVisible(False)
+        scene.addItem(self.odom)
+        gt_trail_pen = QPen(QColor(GT_COLOR))
+        gt_trail_pen.setWidthF(1.3)
+        gt_trail_pen.setCosmetic(True)
+        gt_trail_pen.setStyle(Qt.DashLine)
+        self.gt_trail_item = QGraphicsPathItem()
+        self.gt_trail_item.setPen(gt_trail_pen)
+        self.gt_trail_item.setZValue(2.6)
+        scene.addItem(self.gt_trail_item)
+
+        # 속도 벡터 (진행방향, 길이 = 속도 m/s)
+        vel_pen = QPen(QColor("#32d74b"))
+        vel_pen.setWidthF(2.4)
+        vel_pen.setCosmetic(True)
+        self.vel_item = QGraphicsLineItem()
+        self.vel_item.setPen(vel_pen)
+        self.vel_item.setZValue(6.5)
+        self.vel_item.setVisible(False)
+        scene.addItem(self.vel_item)
+
         # 이 로봇이 감지한 동적 장애물 — 개수가 매번 바뀌므로 필요한 만큼 만들고
         # 남는 건 재사용한다 (update_obstacles 에서 관리)
         self.obstacle_items: list[QGraphicsRectItem] = []
 
     def remove(self, scene: QGraphicsScene) -> None:
-        for item in (self.body, self.label, self.path_item, *self.obstacle_items):
+        for item in (self.body, self.label, self.path_item, self.leg_item, self.wp_item, self.goal_item,
+                     self.goal_label, self.trail_item, self.odom, self.gt, self.gt_label, self.gt_trail_item, self.vel_item, *self.obstacle_items):
             scene.removeItem(item)
 
     def update_pose(self, meta, view: RobotView, label_text: str, alpha: float) -> None:
@@ -197,10 +348,10 @@ class _RobotItem:
             QPointF(tip, 0), QPointF(back, -half_w), QPointF(back, half_w),
         ]))
 
-        pos = world_to_scene(meta, view.x, view.y)
+        pos = world_to_scene(meta, view.dx, view.dy)
         self.body.setPos(pos)
         # world 도 y-down 이라 atan2(dy,dx) 가 Qt 의 "양수=시계방향" 규약과 그대로 맞는다
-        self.body.setRotation(math.degrees(view.theta))
+        self.body.setRotation(math.degrees(view.dth))
         self.body.setOpacity(alpha)
 
         self.label.setText(label_text)
@@ -209,13 +360,127 @@ class _RobotItem:
         self.label.setOpacity(alpha)
 
     def update_path(self, meta, view: RobotView, show: bool, alpha: float) -> None:
-        if not show or len(view.planned_path) < 1:
-            self.path_item.setPath(QPainterPath())
+        """계획 경로. 이미 지난 경유점은 빼고(State 는 5 Hz 라 한참 늦는다) 로봇이 보고하는 현재 위치(추정)에서 시작한다."""
+        empty = QPainterPath()
+        pts = list(view.planned_path)
+        # 지난 경유점 제거: 마지막 하나는 남긴다 (도착 직전까지 목표를 보여준다)
+        while len(pts) > 1 and math.hypot(pts[0][0] - view.dx, pts[0][1] - view.dy) < WP_PASSED_DIST:
+            pts.pop(0)
+        if not show or not pts:
+            for it in (self.path_item, self.leg_item, self.wp_item, self.goal_item):
+                it.setPath(empty)
+            self.goal_label.setText("")
             return
-        points = [world_to_scene(meta, view.x, view.y)]
-        points += [world_to_scene(meta, x, y) for x, y in view.planned_path]
-        self.path_item.setPath(_ticked_path(points))
+        start = world_to_scene(meta, view.dx, view.dy)
+        points = [start] + [world_to_scene(meta, x, y) for x, y in pts]
+
+        # 현재 구간(굵게) + 남은 구간(눈금선)
+        leg = QPainterPath(points[0])
+        leg.lineTo(points[1])
+        self.leg_item.setPath(leg)
+        self.leg_item.setOpacity(alpha)
+        rest = points[1:]
+        self.path_item.setPath(_ticked_path(rest) if len(rest) > 1 else empty)
         self.path_item.setOpacity(alpha)
+
+        # 경유점 점 (마지막은 목표 링으로 따로)
+        r = 0.10 / meta.resolution
+        dots = QPainterPath()
+        for p in points[1:-1]:
+            dots.addEllipse(p, r, r)
+        self.wp_item.setPath(dots)
+        self.wp_item.setOpacity(alpha)
+
+        g = points[-1]
+        gr = 0.18 / meta.resolution
+        ring = QPainterPath()
+        ring.addEllipse(g, gr, gr)
+        ring.addEllipse(g, gr * 0.35, gr * 0.35)
+        self.goal_item.setPath(ring)
+        self.goal_item.setOpacity(alpha)
+
+        remain = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                     for a, b in zip([(view.dx, view.dy)] + pts, pts))
+        self.goal_label.setText(f"{remain:.1f} m")
+        br = self.goal_label.boundingRect()
+        self.goal_label.setPos(g.x() - br.width() / 2, g.y() - gr - br.height() - 2)
+        self.goal_label.setOpacity(alpha)
+
+    def update_physics_items(self, meta, view: RobotView, show_trail: bool, show_gt: bool, show_odom: bool,
+                             alpha: float, now: float) -> None:
+        """궤적, 참 위치(GT) 윤곽, 속도 벡터. 물리 토픽이 없으면 GT/속도는 숨긴다."""
+        def polyline(points) -> QPainterPath:
+            path = QPainterPath()
+            pts = [world_to_scene(meta, x, y) for x, y in points]
+            if len(pts) >= 2:
+                path.moveTo(pts[0])
+                for q in pts[1:]:
+                    path.lineTo(q)
+            return path
+
+        if view.trail_dirty:
+            self.trail_item.setPath(polyline(view.trail))
+            self.gt_trail_item.setPath(polyline(view.gt_trail))
+            view.trail_dirty = False
+        self.trail_item.setVisible(show_trail)
+        self.trail_item.setOpacity(alpha * 0.8)
+        self.gt_trail_item.setVisible(show_trail and show_gt)
+        self.gt_trail_item.setOpacity(alpha * 0.8)
+
+        truth = view.truth_pose(now)
+        p = view.physics
+        raw = view.raw_odom_pose(now)
+        if raw is not None and "est_x" in (p or {}):
+            lp = max(view.length, 1e-3) / meta.resolution
+            wp = max(view.width, 1e-3) / meta.resolution
+            self.odom.setRect(-lp / 2, -wp / 2, lp, wp)
+            self.odom.setPos(world_to_scene(meta, raw[0], raw[1]))
+            self.odom.setRotation(math.degrees(raw[2]))
+            self.odom.setVisible(show_odom)
+            self.odom.setOpacity(alpha)
+        else:
+            self.odom.setVisible(False)
+        if truth is None or p is None:
+            self.gt.setVisible(False)
+            self.gt_label.setVisible(False)
+            self.vel_item.setVisible(False)
+            return
+        gx, gy, gth = truth
+        length_px = max(view.length, 1e-3) / meta.resolution
+        width_px = max(view.width, 1e-3) / meta.resolution
+        self.gt.setRect(-length_px / 2, -width_px / 2, length_px, width_px)
+        cross = QPainterPath()
+        c = min(length_px, width_px) * 0.3
+        cross.moveTo(-c, 0)
+        cross.lineTo(length_px / 2, 0)   # 앞쪽으로 긴 십자 = 참 방위
+        cross.moveTo(0, -c)
+        cross.lineTo(0, c)
+        self.gt_cross.setPath(cross)
+        pos = world_to_scene(meta, gx, gy)
+        self.gt.setPos(pos)
+        self.gt.setRotation(math.degrees(gth))
+        # 벽에 눌리면(접촉력 큼) 참 위치 윤곽을 빨갛게 -- 벽에 닿는 건 참 몸체다
+        pen = self.gt.pen()
+        hit = p["wall_force"] > FORCE_ALERT
+        pen.setColor(QColor("#ff453a") if hit else QColor(GT_COLOR))
+        pen.setWidthF(3.0 if hit else 1.8)
+        self.gt.setPen(pen)
+        self.gt_cross.setPen(pen)
+        self.gt.setVisible(show_gt)
+        self.gt.setOpacity(alpha)
+        br = self.gt_label.boundingRect()
+        self.gt_label.setPos(pos.x() - br.width() / 2, pos.y() + width_px * 0.75)
+        self.gt_label.setVisible(show_gt)
+        self.gt_label.setOpacity(alpha)
+
+        # 속도 벡터: 몸체(보고 위치) 중심에서 진행방향(후진이면 뒤)으로 v 미터
+        c, sn = math.cos(view.dth), math.sin(view.dth)
+        v = p["v_fwd"]
+        a = world_to_scene(meta, view.dx, view.dy)
+        b = world_to_scene(meta, view.dx + c * v * 1.0, view.dy + sn * v * 1.0)
+        self.vel_item.setLine(a.x(), a.y(), b.x(), b.y())
+        self.vel_item.setVisible(abs(v) > 0.01)
+        self.vel_item.setOpacity(alpha)
 
     def update_obstacles(self, scene: QGraphicsScene, meta, view: RobotView, alpha: float) -> None:
         """이 로봇이 지금 감지한 장애물만 그린다 — 다른 로봇 화면엔 안 보일 수 있다."""
@@ -276,6 +541,11 @@ class MapCanvas(QGraphicsView):
         self._robot_items: dict[str, _RobotItem] = {}
         self._show_grid = True
         self._show_planned_path = True
+        self._show_physics_hud = True
+        self._show_trail = True
+        self._show_gt = True
+        self._show_odom = True
+        self._follow: Optional[str] = None   # 시점을 따라다닐 로봇 id (f 로 순환, 드래그하면 해제)
         # robot_id -> 그 로봇의 가장 최근 이벤트 한 줄. 예전엔 deque 로 모든 로봇의
         # 이벤트를 시간순으로 쌓아서, 화면에 안 남은 지 오래된 로봇의 옛날 이벤트가
         # 계속 보이는 문제가 있었다 — 이제 로봇마다 최신 값 하나만 남긴다
@@ -442,6 +712,7 @@ class MapCanvas(QGraphicsView):
         legend = "■ OCCUPIED   ■ UNKNOWN   ■ FREE"
         if self._zone_items:
             legend += "     ▨ PROHIBIT   ▨ SLOW   ▨ ONEWAY  (z 토글)"
+        legend += "\n키: t 경로  p 물리패널  l 궤적  o GT(참 위치)  i 순수오도(노란)  f 시점고정  k 지우기  g 격자  r 보기초기화"
         self.legend_label.setText(legend)
 
         self.event_label = hud_label()
@@ -454,12 +725,16 @@ class MapCanvas(QGraphicsView):
         self.coord_label = hud_label()
         self.coord_label.setText("")
 
+        # 물리 디버그 패널 (왼쪽, 이벤트 로그 아래). p 로 토글
+        self.physics_label = hud_label()
+        self.physics_label.setText("")
+
         self._layout_hud()
 
     def _layout_hud(self) -> None:
         # setText() 는 크기를 자동으로 안 늘려준다 — 배치 전에 매번 다시 재야 한다
         for lbl in (self.title_label, self.legend_label, self.event_label,
-                    self.info_label, self.coord_label):
+                    self.info_label, self.coord_label, self.physics_label):
             lbl.adjustSize()
 
         vp = self.viewport().rect()
@@ -467,6 +742,8 @@ class MapCanvas(QGraphicsView):
         self.title_label.move(pad, pad)
         self.legend_label.move(pad, vp.height() - self.legend_label.height() - pad)
         self.event_label.move(pad, self.title_label.geometry().bottom() + 4)
+        self.physics_label.move(pad, self.event_label.geometry().bottom() + 6)
+        self.physics_label.setVisible(self._show_physics_hud and bool(self.physics_label.text()))
         self.info_label.move(vp.width() - self.info_label.width() - pad, pad)
         self.coord_label.move(
             vp.width() - self.coord_label.width() - pad,
@@ -508,6 +785,93 @@ class MapCanvas(QGraphicsView):
         view.detected_obstacles = list(detected_obstacles) if detected_obstacles else []
         view.last_seen = now
         view.has_pose = True
+        if not view.physics_fresh(now):  # 물리 토픽이 없는 로봇은 State 자세로 궤적을 쌓는다
+            self._add_trail(view, x, y)
+
+    @staticmethod
+    def _add_trail(view: RobotView, x: float, y: float, trail: Optional[deque] = None) -> None:
+        trail = view.trail if trail is None else trail
+        if trail:
+            lx, ly = trail[-1]
+            d = math.hypot(x - lx, y - ly)
+            if d > 1.0:      # 순간이동(강제 위치지정/재시작): 이어 그리면 가로지르는 선이 생긴다
+                trail.clear()
+            elif d < TRAIL_MIN_STEP:
+                return
+        trail.append((x, y))
+        view.trail_dirty = True
+
+    def update_physics(self, robot_id: str, data: dict, now: float = 0.0) -> None:
+        """로봇이 발행한 물리 디버그 값 (fms/v1/{id}/physics). 표시 전용."""
+        view = self.robots.get(robot_id)
+        if view is None:
+            view = RobotView(robot_id=robot_id)
+            self.robots[robot_id] = view
+        prev = view.physics
+        if prev is not None and data["sim_time"] > prev["sim_time"]:
+            dt = data["sim_time"] - prev["sim_time"]
+            a = (data["v_fwd"] - prev["v_fwd"]) / dt
+            view.accel = 0.5 * view.accel + 0.5 * a
+        if prev is None or data["sim_time"] < prev["sim_time"]:   # 첫 값, 또는 로봇 재시작
+            view.peak_slip = view.peak_force = 0.0
+        if data["state"] == "IDLE" and data["at_rest"] and prev is not None and prev["state"] != "IDLE":
+            view.peak_slip = view.peak_force = 0.0
+        view.peak_slip = max(view.peak_slip, abs(data["slip"][0]), abs(data["slip"][1]))
+        view.peak_force = max(view.peak_force, data["wall_force"])
+        view.physics = data
+        view.physics_at = now
+        self._add_trail(view, data["odom_x"], data["odom_y"])           # 로봇이 보고한 위치 (= State.pose)
+        self._add_trail(view, data["x"], data["y"], view.gt_trail)      # 참 위치
+
+    @staticmethod
+    def _physics_text(view: RobotView) -> str:
+        p = view.physics
+        if p is None:
+            return ""
+        sl, sr = p["slip"]
+        has_est = "est_x" in p
+        ex, ey, eth = (p["est_x"], p["est_y"], p["est_theta"]) if has_est else (p["odom_x"], p["odom_y"], p["odom_theta"])
+
+        def ang(a: float) -> float:
+            return math.degrees(math.atan2(math.sin(a), math.cos(a)))
+        drift = math.hypot(ex - p["x"], ey - p["y"])           # 보고 위치 - GT
+        dth = ang(eth - p["theta"])
+        raw = math.hypot(p["odom_x"] - p["x"], p["odom_y"] - p["y"])   # 보정 전 오도메트리 - GT
+        raw_th = ang(p["odom_theta"] - p["theta"])
+        flags = ["rest" if p["at_rest"] else "moving"]
+        if p["straight"]:
+            flags.append("straight")
+        if p["ghost"]:
+            flags.append("GHOST")
+        if p["collided"]:
+            flags.append("COLLIDED")
+        act = p["action"] or p["sub_state"] or "-"
+        goal = p["goal"]
+        lines = [
+            f"{view.robot_id} physics   t={p['sim_time']:.1f}s   {p['state']}/{act}",
+            f"  report  {ex:8.3f} {ey:8.3f}  th {eth:+.3f}   (State.pose, body)",
+            f"  GT      {p['x']:8.3f} {p['y']:8.3f}  th {p['theta']:+.3f}   (truth, cyan)",
+            f"  error   {drift * 100:.1f} cm  {dth:+.1f} deg   (report - GT)",
+            f"  odom    {p['odom_x']:8.3f} {p['odom_y']:8.3f}  th {p['odom_theta']:+.3f}   (raw encoders, yellow)",
+            f"  o-error {raw * 100:.1f} cm  {raw_th:+.1f} deg   (raw odom - GT)",
+            (f"  loc     {p['loc_rate']:.0f} Hz  noise {p['loc_sigma_xy'] * 100:.1f} cm/{p['loc_sigma_theta']:.3f} rad  gain {p['loc_gain']:.2f}"
+             f"  fixes {p['loc_corrections']} (drop {p['loc_dropouts']})  last {p['loc_step_xy'] * 100:.1f} cm"
+             if has_est and p['loc_rate'] > 0 else "  loc     off (no localization correction)"),
+            f"  v fwd   {p['v_fwd']:+7.3f} m/s   lat {p['v_lat']:+.3f}",
+            f"  yaw     {p['yaw_rate']:+7.3f} rad/s",
+            f"  accel   {view.accel:+7.3f} m/s2   (max {p['max_acceleration']:.2f})",
+            f"  cmd     v {p['cmd_v']:+.3f}  w {p['cmd_w']:+.3f}   err v {p['cmd_v'] - p['v_fwd']:+.3f}",
+            f"  wheel   L {p['wheel_w'][0]:+6.2f}  R {p['wheel_w'][1]:+6.2f} rad/s",
+            f"  w cmd   L {p['wheel_cmd'][0]:+6.2f}  R {p['wheel_cmd'][1]:+6.2f}",
+            f"  slip    L {sl:+.3f}  R {sr:+.3f}   peak {view.peak_slip:.3f}",
+            f"  wall    {p['wall_force']:6.1f} N   peak {view.peak_force:.1f} N",
+            f"  floor   mu {p['friction']:.2f}   mass {p['mass']:.0f} kg   wheel r {p['wheel_radius']:.3f} track {p['track']:.2f}",
+            f"  limit   v {p['max_velocity']:.2f} m/s   torque {p['max_wheel_torque']:.0f} Nm",
+            f"  path    {p['path_points']} wp   {p['path_remaining']:.2f} m left"
+            + (f"   goal {goal[0]:.2f},{goal[1]:.2f}" if goal else ""),
+            f"  flags   {' '.join(flags)}",
+        ]
+        return "\n".join(lines)
 
     def set_connection(self, robot_id: str, connection: str, now: float = 0.0) -> None:
         view = self.robots.get(robot_id)
@@ -562,8 +926,12 @@ class MapCanvas(QGraphicsView):
             if item is None:
                 item = _RobotItem(self._scene, color)
                 self._robot_items[robot_id] = item
+            view.dx, view.dy, view.dth = view.display_pose(now)
             item.update_pose(m, view, label_text, alpha)
+            if robot_id == self._follow:
+                self.centerOn(world_to_scene(m, view.dx, view.dy))   # 줌은 그대로, 중심만 로봇에 고정
             item.update_path(m, view, self._show_planned_path, 0.25 if stale else 0.75)
+            item.update_physics_items(m, view, self._show_trail, self._show_gt, self._show_odom, 0.25 if stale else 0.9, now)
             item.update_obstacles(self._scene, m, view, 0.25 if stale else 0.85)
 
             mark = "x" if stale else "*"
@@ -571,8 +939,13 @@ class MapCanvas(QGraphicsView):
             lines.append(f"{mark} {robot_id}  {view.state}")
             lines.append(f"    xy   {view.x:7.2f}, {view.y:6.2f}")
             lines.append(f"    th   {view.theta:7.3f} rad")
-            lines.append(f"    v    {view.velocity:7.2f} m/s")
+            v_shown = view.physics["v_fwd"] if view.physics_fresh(now) else view.velocity
+            lines.append(f"    v    {v_shown:+7.2f} m/s")
             lines.append(f"    bat  {battery}")
+            truth = view.truth_pose(now)
+            if truth is not None:
+                err = math.hypot(view.dx - truth[0], view.dy - truth[1])
+                lines.append(f"    GT   {truth[0]:7.2f}, {truth[1]:6.2f}  err {err * 100:.1f} cm")
             if view.order_id:
                 lines.append(f"    ord  {view.order_id} ({view.remaining_nodes} left)")
             if view.connection not in ("ONLINE", "?"):
@@ -587,6 +960,8 @@ class MapCanvas(QGraphicsView):
             self._robot_items.pop(robot_id).remove(self._scene)
 
         self.info_label.setText("\n".join(lines) if self.robots else "no robots")
+        blocks = [self._physics_text(v) for _, v in sorted(self.robots.items()) if v.physics_fresh(now)]
+        self.physics_label.setText("\n\n".join(b for b in blocks if b))
         self._layout_hud()
 
     # -- 조작: 확대/이동/토글 --------------------------------------------------
@@ -598,6 +973,25 @@ class MapCanvas(QGraphicsView):
     def reset_view(self) -> None:
         self.fitInView(QRectF(0, 0, self.map.metadata.width_px, self.map.metadata.height_px),
                         Qt.KeepAspectRatio)
+
+    def _cycle_follow(self) -> None:
+        """시점 고정: 꺼짐 -> 로봇1 -> 로봇2 ... -> 꺼짐. 줌은 스크롤로 그대로 조절한다."""
+        ids = sorted(r for r, v in self.robots.items() if v.has_pose)
+        order = [None] + ids
+        idx = order.index(self._follow) if self._follow in order else 0
+        self._follow = order[(idx + 1) % len(order)]
+        m = self.map.metadata
+        base = f"{m.name}  —  {m.width_m:g} x {m.height_m:g} m  @ {m.resolution:g} m/px"
+        self.title_label.setText(base + (f"   [follow {self._follow}]" if self._follow else ""))
+        self._layout_hud()
+
+    def mousePressEvent(self, event) -> None:
+        if self._follow is not None:   # 드래그로 이동하려는 순간 고정을 푼다
+            self._follow = None
+            m = self.map.metadata
+            self.title_label.setText(f"{m.name}  —  {m.width_m:g} x {m.height_m:g} m  @ {m.resolution:g} m/px")
+            self._layout_hud()
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         super().mouseMoveEvent(event)
@@ -622,10 +1016,27 @@ class MapCanvas(QGraphicsView):
             self._refresh_map_pixmap()
         elif key == "t":
             self._show_planned_path = not self._show_planned_path
+        elif key == "p":
+            self._show_physics_hud = not self._show_physics_hud
+            self._layout_hud()
+        elif key == "l":
+            self._show_trail = not self._show_trail
+        elif key == "o":
+            self._show_gt = not self._show_gt
+        elif key == "i":
+            self._show_odom = not self._show_odom
+        elif key == "k":
+            for v in self.robots.values():
+                v.trail.clear()
+                v.gt_trail.clear()
+                v.trail_dirty = True
+                v.peak_slip = v.peak_force = 0.0
         elif key == "z":
             self._show_zones = not self._show_zones
             for item in self._zone_items:
                 item.setVisible(self._show_zones)
+        elif key == "f":
+            self._cycle_follow()
         elif key == "r":
             self.reset_view()
         else:
@@ -656,6 +1067,9 @@ class FleetViewWindow(QMainWindow):
 
     def append_event(self, robot_id: str, text: str) -> None:
         self.canvas.append_event(robot_id, text)
+
+    def update_physics(self, *a, **kw) -> None:
+        self.canvas.update_physics(*a, **kw)
 
     def refresh(self, now: float = 0.0) -> None:
         self.canvas.refresh(now)

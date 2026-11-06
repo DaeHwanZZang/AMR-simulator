@@ -1,6 +1,7 @@
 #include "executor.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -43,6 +44,8 @@ bool segment_intersects_rect(double ax, double ay, double bx, double by, double 
     return t0 <= t1;
 }
 
+constexpr double kMaxTickDt = 0.1;  // s
+
 }  // namespace
 
 OrderExecutor::OrderExecutor(std::string robot_id_, double start_x, double start_y, double start_theta,
@@ -51,8 +54,21 @@ OrderExecutor::OrderExecutor(std::string robot_id_, double start_x, double start
                               DynamicObstacleField obstacle_field_, double sensor_range_)
     : robot_id(std::move(robot_id_)), robot_width(robot_width_), robot_length(robot_length_),
       obstacle_field(std::move(obstacle_field_)), sensor_range(sensor_range_),
+      physics(std::make_unique<PhysicsWorld>(RobotSpec{robot_width_, robot_length_}, start_x, start_y, start_theta)),
       kinematics(start_x, start_y, start_theta, max_velocity, max_acceleration, max_acceleration),
-      battery(std::move(battery_)), map(map_model) {}
+      battery(std::move(battery_)), map(map_model) {
+    kinematics.attach_physics(physics.get());
+    physics->set_map(map);
+}
+
+void OrderExecutor::apply_robot_geometry(double friction, double mass) {
+    RobotSpec spec = physics->spec();
+    spec.width = robot_width;
+    spec.length = robot_length;
+    if (friction > 0) spec.friction = friction;
+    if (mass > 0) spec.mass = mass;
+    physics->set_spec(spec);
+}
 
 bool OrderExecutor::motion_inhibited() const {
     return estop_latched_ || paused_ || mode_ == OperatingMode::MANUAL || base_state_ == RobotState::ERROR;
@@ -160,6 +176,7 @@ void OrderExecutor::resume_motion() {
 
 void OrderExecutor::set_map(const MapModel* new_map, std::string map_uid, std::string map_version) {
     map = new_map;
+    physics->set_map(new_map);
     clearance_.reset();
     current_map_uid_ = std::move(map_uid);
     current_map_version_ = std::move(map_version);
@@ -330,6 +347,33 @@ void OrderExecutor::handle_instant(const InstantAction& action) {
 }
 
 void OrderExecutor::tick(double dt) {
+    // 경로계획 등으로 루프가 길게 막혔다 돌아오면 dt 가 크다 (A* 가 수백 ms 걸린다). 물리/궤적이 한 번에
+    // 크게 움직이지 않도록 자른다. 막혀 있던 시간은 시뮬레이션에서 건너뛴다.
+    dt = std::min(dt, kMaxTickDt);
+    tick_logic(dt);
+    sim_time_ += dt;
+    if (recorder) record_sample(dt);
+}
+
+void OrderExecutor::record_sample(double dt) {
+    RecordRow row;
+    row.t = sim_time_;
+    row.wall_time = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+    row.state = to_string(state());
+    if (sub_state_ && state() == RobotState::BUSY) row.sub_state = to_string(*sub_state_);
+    row.order_id = order_id_;
+    row.node_index = current_index_;
+    if (straight_) row.action = "STRAIGHT_MOTION";
+    if (acting_) row.action = to_string(acting_->action_type);
+    row.w = physics->telemetry();
+    row.battery = battery.charge;
+    row.charging = battery.charging;
+    row.detected_obstacles = (int)last_detected_.size();
+    if (!errors_.empty()) row.error = errors_.front().error_type;
+    recorder->write(row);
+}
+
+void OrderExecutor::tick_logic(double dt) {
     obstacle_field.tick(dt);
     auto detected = update_detections();
     last_detected_ = detected;
@@ -344,11 +388,13 @@ void OrderExecutor::tick(double dt) {
     }
     if (acting_) {
         tick_action(dt);
+        kinematics.brake(dt);
         battery.step(dt, 0.0);
         return;
     }
     if (order_id_.empty()) {
         set_base(idle_state());
+        kinematics.brake(dt);
         battery.step(dt, 0.0);
         return;
     }
@@ -356,11 +402,13 @@ void OrderExecutor::tick(double dt) {
         log::info("[%s] order complete: %s", robot_id.c_str(), order_id_.c_str());
         last_completed_ = std::make_pair(order_id_, order_update_id_);
         clear_order();
+        kinematics.brake(dt);
         battery.step(dt, 0.0);
         return;
     }
     if (!nodes_[current_index_].released) {
         set_busy(BusySubState::WAITING);
+        kinematics.brake(dt);
         battery.step(dt, 0.0);
         return;
     }
@@ -368,6 +416,7 @@ void OrderExecutor::tick(double dt) {
         replan();
         if (segment_.empty()) {
             if (base_state_ != RobotState::ERROR) set_busy(BusySubState::WAITING);
+            kinematics.brake(dt);
             battery.step(dt, 0.0);
             return;
         }
@@ -385,7 +434,7 @@ void OrderExecutor::tick(double dt) {
     }
     since_dynamic_replan_ = 0.0;
 
-    double prev_x = kinematics.x, prev_y = kinematics.y;
+    double prev_x = physics->x(), prev_y = physics->y();  // 충돌 롤백은 참 자세 기준
     auto kin_state = kinematics.step(dt);
     consume_reached_nodes();
     battery.step(dt, kin_state.velocity);
@@ -396,7 +445,20 @@ void OrderExecutor::tick(double dt) {
     else set_busy(BusySubState::MOVING);
 }
 
-bool OrderExecutor::check_collision(double x, double y, double prev_x, double prev_y) {
+bool OrderExecutor::check_collision(double, double, double prev_x, double prev_y) {
+    // 벽과 닿았는지는 참 자세로 본다 (오도메트리 추정이 벽 안으로 가도 충돌이 아니다). 인자 x, y 는 쓰지 않는다
+    const double x = physics->x(), y = physics->y();
+    if (kinematics.collided()) {  // 물리: 몸체가 벽에 눌린 채 멈춰 있다
+        double force = physics->wall_force();
+        log::error("[%s] collision: chassis pressed against a wall at (%.2f, %.2f) (%.0f N), order %s aborted",
+                   robot_id.c_str(), x, y, force, order_id_.c_str());
+        ErrorInfo e; e.error_type = "COLLISION"; e.level = ErrorLevel::FATAL;
+        char desc[96];
+        std::snprintf(desc, sizeof desc, "chassis pressed against a wall at (%.2f, %.2f), contact force %.0f N", x, y, force);
+        e.description = desc;
+        raise_fatal(e);
+        return true;
+    }
     if (map == nullptr || map->is_free(x, y)) return false;
     CellType cell = map->cell_at(x, y);
     log::error("[%s] collision: (%.2f, %.2f), stopping at (%.2f, %.2f), order %s aborted", robot_id.c_str(), x, y, prev_x,
@@ -495,7 +557,7 @@ void OrderExecutor::tick_straight(double dt, const std::vector<DynamicObstacle>&
         return;
     }
     set_busy(m.purpose == StraightPurpose::UNDOCK ? BusySubState::MOVING : BusySubState::ACTING);
-    double prev_x = kinematics.x, prev_y = kinematics.y;
+    double prev_x = physics->x(), prev_y = physics->y();  // 충돌 롤백은 참 자세 기준
     auto kin_state = kinematics.step(dt);
     battery.step(dt, kin_state.velocity);
     if (check_collision(kin_state.x, kin_state.y, prev_x, prev_y)) return;
@@ -743,6 +805,64 @@ bool OrderExecutor::force_relocalize(double x, double y, double theta) {
         log::warning("[%s] relocalized position is not drivable: orders will fail with NO_PATH", robot_id.c_str());
     }
     return true;
+}
+
+PhysicsDebug OrderExecutor::build_physics(long long header_id, double timestamp) const {
+    PhysicsDebug d;
+    d.header_id = header_id;
+    d.timestamp = timestamp;
+    d.robot_id = robot_id;
+    d.sim_time = sim_time_;
+    d.state = to_string(state());
+    if (sub_state_ && state() == RobotState::BUSY) d.sub_state = to_string(*sub_state_);
+    if (straight_) d.action = "STRAIGHT_MOTION";
+    if (acting_) d.action = to_string(acting_->action_type);
+
+    WorldTelemetry w = physics->telemetry();
+    d.x = w.x; d.y = w.y; d.theta = w.theta;
+    d.odom_x = w.odom_x; d.odom_y = w.odom_y; d.odom_theta = w.odom_theta;
+    d.est_x = w.est_x; d.est_y = w.est_y; d.est_theta = w.est_theta;
+    const LocalizerParams& lp = physics->localization();
+    d.loc_rate = lp.rate_hz; d.loc_sigma_xy = lp.sigma_xy; d.loc_sigma_theta = lp.sigma_theta;
+    d.loc_gain = lp.gain; d.loc_dropout = lp.dropout;
+    d.loc_corrections = w.loc_corrections; d.loc_dropouts = w.loc_dropouts;
+    d.loc_step_xy = w.loc_step_xy; d.loc_step_theta = w.loc_step_theta;
+    d.v_fwd = w.v_fwd; d.v_lat = w.v_lat; d.yaw_rate = w.yaw_rate;
+    for (int i = 0; i < 2; ++i) {
+        d.wheel_w[i] = w.wheel_w[i];
+        d.wheel_cmd[i] = w.wheel_cmd[i];
+        d.slip[i] = w.slip[i];
+    }
+    d.cmd_v = w.cmd_v; d.cmd_w = w.cmd_w;
+    d.wall_force = w.wall_force;
+    d.ghost = w.ghost;
+    d.collided = kinematics.collided();
+    d.at_rest = physics->at_rest();
+    d.straight = kinematics.straight_active();
+
+    const RobotSpec& spec = physics->spec();
+    d.friction = spec.friction;
+    d.mass = spec.mass;
+    d.wheel_radius = spec.wheel_radius;
+    d.track = physics->track();
+    d.max_wheel_torque = spec.max_wheel_torque;
+    d.max_velocity = kinematics.max_velocity;
+    d.max_acceleration = kinematics.max_acceleration;
+
+    auto k = kinematics.get_state();
+    d.path_points = (int)k.local_path.size();
+    double px = w.x, py = w.y;
+    for (auto& [x, y] : k.local_path) {
+        d.path_remaining += std::hypot(x - px, y - py);
+        px = x;
+        py = y;
+    }
+    if (!k.local_path.empty()) {
+        d.has_goal = true;
+        d.goal_x = k.local_path.back().first;
+        d.goal_y = k.local_path.back().second;
+    }
+    return d;
 }
 
 State OrderExecutor::build_state(long long header_id, double timestamp) const {

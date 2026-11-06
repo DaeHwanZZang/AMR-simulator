@@ -13,6 +13,8 @@
 #include "kinematics.hpp"
 #include "map_model.hpp"
 #include "path_refine.hpp"
+#include "physics_world.hpp"
+#include "recorder.hpp"
 #include "schemas.hpp"
 
 namespace fms {
@@ -25,11 +27,13 @@ public:
     double robot_width, robot_length;
     DynamicObstacleField obstacle_field;
     double sensor_range;
+    std::unique_ptr<PhysicsWorld> physics;  // 몸체/벽 물리 (kinematics 가 가리킨다). kinematics 보다 먼저 선언해야 한다
     TrapezoidalKinematics kinematics;
     BatterySim battery;
     const MapModel* map = nullptr;  // 없으면 경로계획/충돌감지 꺼짐 (소유하지 않음)
     MapSync* map_sync = nullptr;    // 없으면 SET_MAP 은 로깅만 (소유하지 않음)
     PathRefineParams path_refine;   // enabled=false 가 기본 (A* 결과 그대로 사용)
+    std::unique_ptr<Recorder> recorder;  // 있으면 tick 마다 한 줄 기록 (--record)
 
     OrderExecutor(std::string robot_id_, double start_x, double start_y, double start_theta,
                   double max_velocity, double max_acceleration, BatterySim battery_,
@@ -61,10 +65,15 @@ public:
     // uid/version 은 State 로 FMS 에 보고된다 (FMS 의 job 게이팅 기준).
     void set_map(const MapModel* new_map, std::string map_uid, std::string map_version);
 
+    // GUI 에서 로봇 크기를 바꿨을 때 물리 상자도 맞춘다. friction/mass 가 0 보다 크면 그 값으로도 바꾼다
+    void apply_robot_geometry(double friction = -1.0, double mass = -1.0);
+
     // -- 매 tick --
     void tick(double dt);
 
     State build_state(long long header_id, double timestamp) const;
+    // 뷰어/GUI 디버그용 물리 관측값 (fms/v1/{id}/physics). 프로토콜이 아니다
+    PhysicsDebug build_physics(long long header_id, double timestamp) const;
 
     // GUI/콘솔 설정 변경 (IDLE 일 때만 허용, main 이 호출)
     OperatingMode mode() const { return mode_; }
@@ -124,6 +133,7 @@ private:
     std::optional<Docked> docked_;
     std::vector<std::pair<std::string, ActionStatus>> action_states_;  // 삽입 순서 유지
 
+    double sim_time_ = 0.0;  // 시작 후 누적 tick 시간 (기록용)
     double since_dynamic_replan_ = 0.0;
     std::set<std::string> detected_obstacle_ids_;
     std::vector<DynamicObstacle> last_detected_;
@@ -136,6 +146,8 @@ private:
     bool path_blocked_by(const std::vector<DynamicObstacle>& detected) const;
     void try_dynamic_replan(const std::vector<DynamicObstacle>& detected);
     bool check_collision(double x, double y, double prev_x, double prev_y);
+    void tick_logic(double dt);
+    void record_sample(double dt);
     void tick_action(double dt);
     void tick_straight(double dt, const std::vector<DynamicObstacle>& detected);
     void finish_straight();

@@ -14,6 +14,12 @@
     g             격자 토글
     c             색상 모드 토글 (분류색 <-> 원본 그레이스케일)
     t             계획 경로 토글
+    p             물리 디버그 패널 토글 (속도/바퀴/슬립/오도메트리/접촉력 ...)
+    l             지나온 궤적 토글
+    o             GT(참 위치, 청록 윤곽/점선 궤적) 토글 -- 몸체(로봇이 보고한 추정 위치)와 벌어진 만큼이 오차
+    i             보정 전 순수 오도메트리(노란 점선 윤곽) 토글
+    k             궤적/피크값 지우기
+    f             시점 고정 (로봇1 -> 로봇2 ... -> 해제 순환). 드래그하면 해제, 스크롤 줌은 유지
     r             보기 초기화 (맵 전체)
 """
 
@@ -37,7 +43,7 @@ from tools.qt_viewer import ICON_PATH, FleetViewWindow  # noqa: E402
 
 log = logging.getLogger("monitor-qt")
 
-REFRESH_PERIOD_MS = 100
+REFRESH_PERIOD_MS = 33   # 30 fps. 로봇 자세는 물리 토픽(20 Hz)을 속도로 외삽해서 그린다
 APP_NAME = "Fleet Viewer"
 
 

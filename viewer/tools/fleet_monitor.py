@@ -24,6 +24,7 @@ MQTT 콜백은 paho 네트워크 스레드에서 오고 matplotlib 은 메인 �
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import queue
 import sys
@@ -39,6 +40,7 @@ from pydantic import ValidationError  # noqa: E402
 from common.map_model import MapModel  # noqa: E402
 from common.schemas import (  # noqa: E402
     TOPIC_CONNECTION_ALL,
+    TOPIC_PHYSICS_ALL,
     TOPIC_PREFIX,
     TOPIC_STATE_ALL,
     Connection,
@@ -93,7 +95,7 @@ class FleetMonitor:
         if reason_code != 0:
             log.error("브로커 접속 실패: %s", reason_code)
             return
-        topics = [(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1)]
+        topics = [(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1), (TOPIC_PHYSICS_ALL, 0)]
         if self.watch_orders:
             topics.append((TOPIC_ORDER_ALL, 1))
         client.subscribe(topics)
@@ -103,6 +105,13 @@ class FleetMonitor:
         try:
             payload = msg.payload.decode("utf-8")
         except UnicodeDecodeError:
+            return
+        if msg.topic.endswith("/physics"):  # 디버그 토픽: 스키마 없이 dict 로 넘긴다
+            try:
+                data = json.loads(payload)
+                self._inbox.put(("physics", data))
+            except ValueError:
+                pass
             return
         try:
             if msg.topic.endswith("/state"):
@@ -126,6 +135,11 @@ class FleetMonitor:
             except queue.Empty:
                 break
             changed = True
+            if isinstance(message, tuple):  # ("physics", dict)
+                update_physics = getattr(self.viewer, "update_physics", None)  # matplotlib 뷰어엔 없다
+                if update_physics is not None:
+                    update_physics(message[1]["robot_id"], message[1], now=now)
+                continue
             if isinstance(message, State):
                 self.viewer.update_robot(
                     message.robot_id,

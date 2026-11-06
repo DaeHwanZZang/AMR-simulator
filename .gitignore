@@ -2,6 +2,8 @@
 *.d
 robot_client
 map_cache/
+third_party/mujoco/
+records/
 tools/send_order
 tools/place_obstacle
 tools/obstacle_zone

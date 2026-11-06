@@ -46,6 +46,11 @@ struct Args {
     std::string log_level = "INFO";
     bool gui = false;
     bool path_refine = false;
+    double friction = 0.8;                // 바퀴-바닥 마찰계수 (물리)
+    double mass = 60.0;                   // 로봇 질량 kg (물리)
+    std::optional<std::string> record;    // 학습/분석용 기록 폴더
+    // 위치추정 보정 (라이다 시뮬레이션). 기본 켜짐. --loc-rate 0 이면 순수 오도메트리
+    LocalizerParams loc;
 
     double sensor_range = 3.0;
     std::optional<Zone> obstacle_zone;
@@ -97,6 +102,14 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--log-level") a.log_level = next(i);
         else if (k == "--gui") a.gui = true;
         else if (k == "--path-refine") a.path_refine = true;
+        else if (k == "--friction") a.friction = std::stod(next(i));
+        else if (k == "--mass") a.mass = std::stod(next(i));
+        else if (k == "--record") a.record = next(i);
+        else if (k == "--loc-rate") a.loc.rate_hz = std::stod(next(i));
+        else if (k == "--loc-noise-xy") a.loc.sigma_xy = std::stod(next(i));
+        else if (k == "--loc-noise-theta") a.loc.sigma_theta = std::stod(next(i));
+        else if (k == "--loc-gain") a.loc.gain = std::stod(next(i));
+        else if (k == "--loc-dropout") a.loc.dropout = std::stod(next(i));
         else if (k == "--sensor-range") a.sensor_range = std::stod(next(i));
         else if (k == "--obstacle-zone") a.obstacle_zone = parse_zone(next(i));
         else if (k == "--obstacle-sides") a.obstacle_sides = parse_sides(next(i));
@@ -114,6 +127,10 @@ bool parse_args(int argc, char** argv, Args& a) {
                 "  --robot-width --robot-length --max-velocity --max-acceleration --battery\n"
                 "  --seed N --speed-noise R --log-level LV --gui\n"
                 "  --path-refine (A* 경로를 PSO 로 다듬기, 기본 꺼짐)\n"
+                "  --friction MU (바퀴-바닥 마찰계수, 기본 0.8. 낮으면 슬립이 생긴다) --mass KG (기본 60)\n"
+                "  --loc-rate HZ (라이다 위치보정 주기, 기본 5. 0 이면 보정 없는 순수 오도메트리)\n"
+                "  --loc-noise-xy M (기본 0.02) --loc-noise-theta RAD (기본 0.01) --loc-gain K (기본 0.15) --loc-dropout P (기본 0.05)\n"
+                "  --record DIR (tick 마다 실제/오도메트리/바퀴/슬립 등을 CSV 로 기록)\n"
                 "  --sensor-range --obstacle-zone XMIN,YMIN,XMAX,YMAX --obstacle-sides E-X\n"
                 "  --obstacle-spawn-interval --obstacle-max-count --obstacle-width --obstacle-height\n"
                 "  --obstacle-speed --obstacle-seed\n";
@@ -177,14 +194,15 @@ void dispatch_gui_command(OrderExecutor& exec, RobotComm& comm, MapSync& map_syn
                 exec.kinematics.max_deceleration = c.max_acceleration;
                 exec.battery.max_velocity = c.max_velocity;
                 exec.sensor_range = c.sensor_range;
+                exec.apply_robot_geometry(c.friction, c.mass);
                 if (c.robot_id != exec.robot_id) {
                     comm.rebind_id(c.robot_id);
                     exec.robot_id = c.robot_id;
                 }
                 log::info("[%s] GUI settings applied: size=%.2fx%.2f max_velocity=%.3f max_acceleration=%.3f "
-                          "sensor_range=%.2f",
+                          "sensor_range=%.2f friction=%.2f mass=%.1f",
                           exec.robot_id.c_str(), exec.robot_width, exec.robot_length, c.max_velocity,
-                          c.max_acceleration, c.sensor_range);
+                          c.max_acceleration, c.sensor_range, c.friction, c.mass);
             } else if constexpr (std::is_same_v<T, CmdSetBattery>) {
                 exec.battery.charge = std::max(0.0, std::min(100.0, c.charge));
                 log::info("[%s] GUI debug: battery set to %.0f%%", exec.robot_id.c_str(), exec.battery.charge);
@@ -245,6 +263,32 @@ int main(int argc, char** argv) {
                             battery, map_model ? &*map_model : nullptr, args.robot_width, args.robot_length,
                             std::move(obstacle_field), args.sensor_range);
 
+    {
+        RobotSpec spec = executor.physics->spec();
+        spec.friction = args.friction;
+        spec.mass = args.mass;
+        executor.physics->set_spec(spec);
+        LocalizerParams lp = args.loc;
+        lp.seed = seed_from_string(args.seed ? (std::to_string(*args.seed) + "-" + args.id + "-loc") : (args.id + "-loc"));
+        executor.physics->set_localization(lp);
+    }
+    if (args.record) {
+        char meta[1024];
+        std::snprintf(meta, sizeof meta,
+                      "{\"robot_id\": \"%s\", \"map\": \"%s\", \"width\": %.3f, \"length\": %.3f, "
+                      "\"mass\": %.1f, \"wheel_radius\": %.3f, \"track\": %.3f, \"friction\": %.3f, "
+                      "\"max_wheel_torque\": %.1f, \"max_velocity\": %.3f, \"max_acceleration\": %.3f, "
+                      "\"physics_timestep\": 0.002, \"tick_period\": 0.05, \"seed\": %lld, "
+                      "\"start\": [%.3f, %.3f, %.3f]}",
+                      args.id.c_str(), args.map ? args.map->c_str() : "", args.robot_width, args.robot_length,
+                      executor.physics->spec().mass, executor.physics->spec().wheel_radius, executor.physics->track(),
+                      args.friction, executor.physics->spec().max_wheel_torque, max_velocity, args.max_acceleration,
+                      args.seed ? *args.seed : -1LL, args.x, args.y, args.theta);
+        executor.recorder = std::make_unique<Recorder>(*args.record, args.id, meta);
+        if (executor.recorder->ok()) log::info("[%s] recording to %s", args.id.c_str(), executor.recorder->path().c_str());
+        else executor.recorder.reset();
+    }
+
     executor.path_refine.enabled = args.path_refine;
     executor.path_refine.seed = seed_from_string(args.seed ? (std::to_string(*args.seed) + "-" + args.id + "-refine")
                                                            : (args.id + "-refine"));
@@ -302,6 +346,7 @@ int main(int argc, char** argv) {
             while (auto cmd = command_queue.pop()) dispatch_gui_command(executor, comm, map_sync, *cmd);
             executor.tick(dt);
             since_state += dt;
+            comm.publish_physics(executor.build_physics(0, clock.now()));  // 뷰어 디버그 토픽: tick 마다 (20 Hz)
             if (since_state >= STATE_PERIOD) {
                 since_state = 0.0;
                 comm.publish_state(executor.build_state(comm.next_header_id(), clock.now()));
