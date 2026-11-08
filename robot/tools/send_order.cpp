@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <sstream>
 
@@ -51,6 +52,7 @@ void add_param(Params& params, const std::string& kv) {
 // =============================================================================
 // 한 줄에 명령 하나. "//" 와 "#" 뒤는 주석. 줄 앞 번호("0 START") 는 있어도 무시한다.
 //   START / END                         선택. END 뒤에 명령이 오면 오류
+//   GOTO 줄번호 횟수                    그 번호의 줄로 횟수만큼 점프 (노드로 펼쳐서 한 Order 로 보낸다)
 //   MOVE x y [theta]                    노드 하나. theta 는 rad, "90deg" 도 가능
 //   PICK|DROP|CHARGE|WAIT [초] [key=value ...]
 //   STRAIGHT|DOCK|PARK key=value ...    직전 노드에 붙는 액션. 이미 액션이 있으면 같은 좌표 노드를 복제한다
@@ -84,14 +86,24 @@ bool all_digits(const std::string& s) {
     return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c); });
 }
 
+struct Stmt {
+    int line_no;
+    int label = -1;                 // 줄 앞 번호 (GOTO 대상). 없으면 -1
+    std::vector<std::string> tok;   // tok[0] = 명령
+};
+
+constexpr size_t MAX_NODES = 5000;       // GOTO 로 펼친 노드 수 상한
+constexpr size_t MAX_STEPS = 200000;     // 실행한 문장 수 상한 (안전장치)
+
 std::vector<OrderNode> parse_script(const std::string& file, const std::string& order_id) {
     std::ifstream in(file);
     if (!in) throw std::runtime_error("script 파일을 열 수 없다: " + file);
 
-    std::vector<OrderNode> nodes;
-    bool started = false, ended = false, any_cmd = false;
+    // --- 1) 줄 -> 문장. 문법 검사 가능한 것(START/END 위치, 라벨 중복)은 여기서 한다
+    std::vector<Stmt> prog;
     std::string text;
     int line_no = 0;
+    bool ended = false;
     while (std::getline(in, text)) {
         ++line_no;
         for (const char* c : {"//", "#"}) {
@@ -99,30 +111,65 @@ std::vector<OrderNode> parse_script(const std::string& file, const std::string& 
             if (pos != std::string::npos) text.erase(pos);
         }
         std::stringstream ss(text);
-        std::vector<std::string> tok;
-        for (std::string w; ss >> w;) tok.push_back(w);
-        if (!tok.empty() && all_digits(tok[0])) tok.erase(tok.begin());  // 줄 번호 접두사
-        if (tok.empty()) continue;
+        Stmt st;
+        st.line_no = line_no;
+        for (std::string w; ss >> w;) st.tok.push_back(w);
+        if (!st.tok.empty() && all_digits(st.tok[0])) {  // 줄 번호 = GOTO 라벨
+            st.label = std::stoi(st.tok[0]);
+            st.tok.erase(st.tok.begin());
+            for (auto& o : prog)
+                if (o.label == st.label) script_error(line_no, "줄 번호 " + std::to_string(st.label) + " 가 " + std::to_string(o.line_no) + " 번째 줄과 중복된다");
+        }
+        if (st.tok.empty()) continue;
+        std::string cmd = upper(st.tok[0]);
+        if (ended) script_error(line_no, "END 뒤에 명령이 있다: " + st.tok[0]);
+        if (cmd == "END") ended = true;
+        if (cmd == "START" && !prog.empty()) script_error(line_no, "START 는 첫 명령이어야 한다");
+        prog.push_back(st);
+    }
 
+    // --- 2) 실행 (GOTO 는 여기서 펼친다). GOTO n N = n 번 줄로 N 번 점프 (총 N+1 번 실행)
+    std::vector<OrderNode> nodes;
+    std::map<size_t, int> remaining;  // GOTO 문장 인덱스 -> 남은 점프 수 (소진되면 지워서 바깥 루프가 다시 돌 때 새로 시작)
+    size_t steps = 0;
+    for (size_t pc = 0; pc < prog.size();) {
+        if (++steps > MAX_STEPS) script_error(prog[pc].line_no, "실행이 너무 길다 (GOTO 반복 확인)");
+        const Stmt& st = prog[pc];
+        const auto& tok = st.tok;
         std::string cmd = upper(tok[0]);
-        if (ended) script_error(line_no, "END 뒤에 명령이 있다: " + tok[0]);
+        int ln = st.line_no;
+        ++pc;
 
         if (cmd == "START") {
-            if (any_cmd) script_error(line_no, "START 는 첫 명령이어야 한다");
-            started = true;
         } else if (cmd == "END") {
-            ended = true;
+            break;
+        } else if (cmd == "GOTO") {
+            if (tok.size() != 3) script_error(ln, "GOTO 줄번호 횟수  (예: GOTO 1 50 = 1번 줄로 50번 점프. 횟수 없는 무한 반복은 지원하지 않는다)");
+            if (!all_digits(tok[1])) script_error(ln, "GOTO 대상이 줄 번호가 아니다: '" + tok[1] + "'");
+            if (!all_digits(tok[2])) script_error(ln, "GOTO 횟수는 0 이상의 정수여야 한다: '" + tok[2] + "'");
+            int target = std::stoi(tok[1]);
+            auto dest = std::find_if(prog.begin(), prog.end(), [&](const Stmt& s) { return s.label == target; });
+            if (dest == prog.end()) script_error(ln, "줄 번호 " + tok[1] + " 이(가) 없다");
+            size_t me = pc - 1;
+            auto it = remaining.find(me);
+            if (it == remaining.end()) it = remaining.emplace(me, std::stoi(tok[2])).first;
+            if (it->second > 0) {
+                --it->second;
+                pc = (size_t)(dest - prog.begin());
+            } else {
+                remaining.erase(it);  // 소진: 다음으로 진행
+            }
         } else if (cmd == "MOVE") {
-            if (tok.size() != 3 && tok.size() != 4) script_error(line_no, "MOVE x y [theta]");
-            double th = tok.size() == 4 ? parse_angle(tok[3], line_no) : 0.0;
+            if (tok.size() != 3 && tok.size() != 4) script_error(ln, "MOVE x y [theta]");
+            double th = tok.size() == 4 ? parse_angle(tok[3], ln) : 0.0;
             OrderNode n;
-            n.position = Pose{parse_number(tok[1], line_no, "x"), parse_number(tok[2], line_no, "y"), std::atan2(std::sin(th), std::cos(th))};
+            n.position = Pose{parse_number(tok[1], ln, "x"), parse_number(tok[2], ln, "y"), std::atan2(std::sin(th), std::cos(th))};
             nodes.push_back(n);
         } else {
             ActionType type;
             try { type = action_type_from(cmd); }
-            catch (...) { script_error(line_no, "알 수 없는 명령: " + tok[0] + " (MOVE|PICK|DROP|CHARGE|WAIT|STRAIGHT|DOCK|PARK|START|END)"); }
-            if (nodes.empty()) script_error(line_no, cmd + " 앞에 MOVE 가 있어야 한다 (액션은 직전 MOVE 위치에서 실행된다)");
+            catch (...) { script_error(ln, "알 수 없는 명령: " + tok[0] + " (MOVE|PICK|DROP|CHARGE|WAIT|STRAIGHT|DOCK|PARK|GOTO|START|END)"); }
+            if (nodes.empty()) script_error(ln, cmd + " 앞에 MOVE 가 있어야 한다 (액션은 직전 MOVE 위치에서 실행된다)");
             if (nodes.back().action) {  // 노드당 액션 1개: 같은 좌표 노드를 복제한다
                 OrderNode dup;
                 dup.position = nodes.back().position;
@@ -134,14 +181,14 @@ std::vector<OrderNode> parse_script(const std::string& file, const std::string& 
             bool positional_ok = type == ActionType::PICK || type == ActionType::DROP || type == ActionType::CHARGE || type == ActionType::WAIT;
             for (size_t i = 1; i < tok.size(); ++i) {
                 if (tok[i].find('=') == std::string::npos) {
-                    if (!positional_ok || i != 1) script_error(line_no, "'" + tok[i] + "': key=value 형식이어야 한다");
-                    a.duration = parse_number(tok[i], line_no, "duration");
+                    if (!positional_ok || i != 1) script_error(ln, "'" + tok[i] + "': key=value 형식이어야 한다");
+                    a.duration = parse_number(tok[i], ln, "duration");
                     continue;
                 }
                 Params one;
-                try { add_param(one, tok[i]); } catch (const std::exception& e) { script_error(line_no, e.what()); }
+                try { add_param(one, tok[i]); } catch (const std::exception& e) { script_error(ln, e.what()); }
                 for (auto& [k, v] : one) {
-                    if (k == "duration") a.duration = parse_number(tok[i].substr(tok[i].find('=') + 1), line_no, "duration");
+                    if (k == "duration") a.duration = parse_number(tok[i].substr(tok[i].find('=') + 1), ln, "duration");
                     else if (k == "payload_id") a.payload_id = tok[i].substr(tok[i].find('=') + 1);
                     else a.params[k] = v;
                 }
@@ -150,14 +197,13 @@ std::vector<OrderNode> parse_script(const std::string& file, const std::string& 
             cJSON* aj = a.to_json();
             try { Action::from_json(aj); } catch (const ValidationError& e) {
                 cJSON_Delete(aj);
-                script_error(line_no, std::string("잘못된 액션: ") + e.what());
+                script_error(ln, std::string("잘못된 액션: ") + e.what());
             }
             cJSON_Delete(aj);
             nodes.back().action = a;
         }
-        if (cmd != "START") any_cmd = true;
+        if (nodes.size() > MAX_NODES) script_error(ln, "노드가 " + std::to_string(MAX_NODES) + "개를 넘는다 (GOTO 횟수 확인)");
     }
-    (void)started;
     if (nodes.empty()) throw std::runtime_error("script 에 MOVE 가 하나도 없다: " + file);
     return nodes;
 }
@@ -170,7 +216,7 @@ void usage() {
         "        (--action 은 마지막 노드에 붙는다. 예: --action DOCK --param entry=BACKWARD\n"
         "         --param undock_distance=0.6 --param min_charge=80 / --action STRAIGHT --param distance=-1.0)\n"
         "        send_order ROBOT_ID --script FILE [--order-id ID] [--dry-run]   (텍스트 스크립트를 Order 하나로 묶어 발행.\n"
-        "         MOVE x y [theta] / PICK|DROP|CHARGE|WAIT [초] / STRAIGHT|DOCK|PARK key=value / START / END, 주석 // #)\n"
+        "         MOVE x y [theta] / PICK|DROP|CHARGE|WAIT [초] / STRAIGHT|DOCK|PARK key=value / GOTO 줄번호 횟수 / START / END, 주석 // #)\n"
         "        send_order ROBOT_ID --instant CANCEL_ORDER|PAUSE|RESUME|RESET_ERROR|INJECT_FAULT [--fault NAME]\n"
         "        send_order ROBOT_ID --instant INIT_POSITION --param x=X --param y=Y [--param theta=RAD]  (위치 힌트)\n";
 }

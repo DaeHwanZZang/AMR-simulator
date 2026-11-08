@@ -175,7 +175,8 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
   - **스키마 변경은 FMS 쪽과 맞춰야 한다.** 원본은 `AMR-fms/common/{schemas,map_model,map_annotations}.py` 이고 `viewer/common/` 은 바이트 동일 사본이다. 원본을 먼저 고치고 `cp` 로 사본을 갱신한 뒤 C++ 를 포팅한다 (AMR-fms `fms_server/tests/test_common_sync.py` 가 사본 일치를 검사). 커밋은 리포마다 따로 한다.
 - **맵 로드/동기화**: `map_model.cpp` 가 `fms_map.json` 과 그 `image` png(`stb_image`)를 읽는다. `SET_MAP` 을 받으면 `map_sync.cpp` 가 zip 을 받아 `map_cache/<map_uid>/` 에 풀고 `State.map_id/map_version` 으로 보고한다. FMS 는 이 값이 일치하는 로봇에만 job 을 배정한다.
 - **`send_order --script`** (`robot/tools/send_order.cpp` `parse_script`): 텍스트 파일 한 줄 = 명령 하나를 Order 하나로 컴파일해 발행한다 (프로토콜/로봇 코드는 그대로, FMS 가 같은 Order 를 보내도 동일).
-  - 문법: `MOVE x y [theta]`(노드 하나, rad 또는 `90deg`), `PICK|DROP|CHARGE|WAIT [초] [key=value..]`, `STRAIGHT|DOCK|PARK key=value..`(직전 MOVE 노드에 붙는 액션), `START`/`END`(선택, END 뒤 명령은 오류), 주석 `//` `#`, 줄 앞 번호 접두사는 무시.
+  - 문법: `MOVE x y [theta]`(노드 하나, rad 또는 `90deg`), `PICK|DROP|CHARGE|WAIT [초] [key=value..]`, `STRAIGHT|DOCK|PARK key=value..`(직전 MOVE 노드에 붙는 액션), `START`/`END`(선택, END 뒤 명령은 오류), 주석 `//` `#`. 줄 앞 번호는 GOTO 라벨(중복 불가)이고 없어도 된다.
+  - 반복: `GOTO 줄번호 횟수` (줄 앞 번호가 라벨). 횟수만큼 점프하고 파일을 읽는 단계에서 노드로 펼쳐 한 Order 로 보낸다. 횟수 없는 GOTO(무한 반복)는 Order 가 정적 노드 목록이라 지원하지 않고 오류를 낸다. 노드 5000개 / 실행 20만 문장 상한. 안쪽 GOTO 는 바깥 루프가 다시 돌 때 횟수가 새로 시작한다. 예시 `scripts/examples/loop_job.txt`.
   - 한 노드에는 액션이 하나뿐이라 액션이 연달아 오면 같은 좌표 노드를 자동 복제한다 (길이 0 구간은 로봇이 문제없이 지나간다, `physics_test.py script`). 첫 액션 앞에는 MOVE 가 있어야 한다.
   - 액션 인자는 로봇과 같은 검증(`Action::from_json`)을 미리 돌려 줄 번호와 함께 오류를 낸다. `--order-id` 기본값은 파일명. 예시는 `scripts/examples/demo_job.txt`, 런처에는 "스크립트 실행" 항목이 있다.
 - **C++ `tools/`**: `send_order`, `place_obstacle`, `obstacle_zone` 은 별도 실행 파일이고 `schemas.o` 만 링크한다. `mqtt_once.hpp` 는 1회 발행 헬퍼다.

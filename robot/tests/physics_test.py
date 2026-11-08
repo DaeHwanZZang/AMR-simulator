@@ -588,6 +588,13 @@ def test_script():
                 for st in r.states for a in st.get("action_states", [])}
     ids = {i for i, _ in seen}
     check("script: WAIT and PICK ran", {"job-A0", "job-A1"} <= ids and ("job-A1", "FINISHED") in seen, f"seen={sorted(seen)}")
+    open(f"{SCR}/loop.txt", "w").write("1 MOVE 5 3\n2 MOVE 5 4\n3 GOTO 1 2\n")
+    dry = subprocess.run([f"{REPO}/build/bin/send_order", "S1", "--script", f"{SCR}/loop.txt", "--dry-run"], capture_output=True, text=True)
+    check("script: GOTO 1 2 expands to 6 nodes", dry.stdout.count("  N") == 6, dry.stdout.strip().replace("\n", " | ") or dry.stderr)
+    run = subprocess.run([f"{REPO}/build/bin/send_order", "S1", "--port", str(PORT), "--script", f"{SCR}/loop.txt", "--order-id", "loop"], capture_output=True, text=True)
+    s = r.idle_done("loop", 60)
+    p = r.pose()
+    check("script: GOTO loop runs to the end", s is not None and dist((p["x"], p["y"]), (5, 4)) < 0.05, f"pose={p}")
     bad = open(f"{SCR}/bad.txt", "w"); bad.write("WAIT 1\n"); bad.close()
     run = subprocess.run([f"{REPO}/build/bin/send_order", "S1", "--port", str(PORT), "--script", f"{SCR}/bad.txt"], capture_output=True, text=True)
     check("script: invalid script is rejected with line number", run.returncode != 0 and "line 1" in run.stderr, run.stderr.strip())
