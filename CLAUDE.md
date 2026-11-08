@@ -13,7 +13,7 @@ AMR(자율주행 로봇) 시뮬레이터 모노레포. 세 부분이 MQTT+JSON �
 | `viewer/` | 라이브 플릿 뷰어 (Python/PySide6). 순수 관측자, 아무것도 발행하지 않는다 |
 | `broker/` | 개발용 mosquitto 설정 (`mosquitto.conf`: `127.0.0.1:1883`, 익명 허용, persistence 끔) |
 
-외부 `fms_server`(이 리포에 없음)도 같은 프로토콜로 붙는다. FMS 가 없으면 `tools/send_order` 가 그 역할을 대신한다. `maps/` 는 클라이언트와 뷰어가 같이 쓰며, `viewer/maps` 사본은 없다.
+FMS(`fms_server`)는 형제 폴더 `../AMR-fms` 별도 리포(private)에 있고 같은 프로토콜로 붙는다. FMS 가 없으면 `tools/send_order` 가 그 역할을 대신한다. `maps/` 는 클라이언트와 뷰어가 같이 쓰며, `viewer/maps` 사본은 없다.
 
 ## 작업 규칙
 
@@ -142,7 +142,7 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
 - **로컬라이징 / 충전기 / 교통 구역** (makerton 에서 역이식):
   - 기본은 시작 자세를 이미 아는 상태(LOCALIZED, 위치추정 보정 켜짐)로 뜬다. `--require-localization` 이면 UNLOCALIZED 로 떠서 `INIT_POSITION` 힌트(또는 GUI Pose Hint/Force Localize) 전에는 오더를 거절하고 움직이지 않는다 (`motion_inhibited`/`can_accept_job`). 플래그가 꺼져 있으면 `SET_MAP` 으로 다른 맵 uid 가 와도, 순간이동(`sim/v1/{id}/teleport`)을 받아도 LOCALIZED 를 유지한다 (`OrderExecutor::require_localization`).
   - 힌트를 받으면 LOCALIZING -> `localize_time`(1 s) 뒤 가상 라이다 스캔 매칭(`scan_matcher.cpp`, 360빔/20 m/노이즈 0.02 m)으로 LOCALIZED 또는 WARNING `LOCALIZATION_FAILED`(UNLOCALIZED 로 남음). 힌트는 ±1.5 m, ±30° 안이어야 한다. 점수는 `State.localization_score`. `Localizer` 의 추적 보정(`set_tracking`)은 LOCALIZED 일 때만 켜진다. 시작 직후 기본 경로는 `force_relocalize` 한 번으로 이 상태를 만든다.
-  - `State.localization` 필드와 `INIT_POSITION` 액션(params x, y, theta, 선택 map_id)이 프로토콜에 추가됐다. `viewer/common/schemas.py` 도 같이 고쳤다. 외부 FMS 원본은 따로 맞춰야 한다.
+  - `State.localization` 필드와 `INIT_POSITION` 액션(params x, y, theta, 선택 map_id)이 프로토콜에 추가됐다. `viewer/common/schemas.py` 도 같이 고쳤다 (FMS 원본 `AMR-fms/common` 과 동일).
   - 충전기: 맵 폴더의 `chargers.json`(`chargers.cpp`). `chargers.json` 이 **있는 맵에서만** DOCK 이 충전기 근처(0.3 m/0.35 rad)·진입 방향·자세(0.06 m/0.1 rad)를 검사해 `DOCK_FAILED` 를 낸다. 없는 맵은 예전처럼 충전기 없이 DOCK 을 받는다. `CHARGE` 가 충전기 밖이면 `CHARGE_FAILED`.
   - 배터리: `--battery-low`(기본 20, WARNING `LOW_BATTERY`), `--battery-critical`(기본 5, FATAL `BATTERY_CRITICAL` 이면 DOCK 오더만 받음), 0% 는 `BATTERY_EMPTY`.
   - 교통 구역: 맵 폴더 `annotations.json` 의 `occupancy` 구역과 노드 `allowed_zone_ids`, `Order.traffic_control`. 허가 없는 구역은 재계획에서 막고 직선 이동은 `TRAFFIC_BLOCKED`(FATAL). 구역 정의는 FMS 가 만든 번들에서 온다 (이 리포에는 편집기가 없다).
@@ -165,10 +165,10 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
 - **프로토콜**: `schemas.hpp/cpp` 가 메시지와 JSON 직렬화(cJSON)를 정의한다.
   - 메시지: Order / InstantAction / State.
   - 토픽: `fms/v1/{id}/{order,instant,state,connection}`.
-  - `Action.params`(v1.4 추가, float|str|bool map): STRAIGHT/DOCK/PARK 필수 인자. 검증은 `schemas.cpp` `check_action_params()` 와 `viewer/common/schemas.py` `Action._check_params` 가 같은 규칙. 외부 FMS 원본 `common/schemas.py` 는 아직 안 고쳤다.
+  - `Action.params`(v1.4 추가, float|str|bool map): STRAIGHT/DOCK/PARK 필수 인자. 검증은 `schemas.cpp` `check_action_params()` 와 `viewer/common/schemas.py` `Action._check_params` 가 같은 규칙 (FMS 원본 `AMR-fms/common/schemas.py` 도 동일).
   - InstantAction 종류: `CANCEL_ORDER, PAUSE, RESUME, RESET_ERROR, SET_MAP, INIT_POSITION, INJECT_FAULT, INJECT_OBSTACLE, CLEAR_OBSTACLE, START_OBSTACLE_ZONE, STOP_OBSTACLE_ZONE`.
   - `comm.cpp` 는 libmosquitto 래퍼다 (LWT, 재접속, `connection` retained 토픽).
-  - **스키마 변경은 FMS 쪽과 맞춰야 한다.** 뷰어의 `viewer/common/schemas.py` 도 같이 고친다.
+  - **스키마 변경은 FMS 쪽과 맞춰야 한다.** 원본은 `AMR-fms/common/{schemas,map_model,map_annotations}.py` 이고 `viewer/common/` 은 바이트 동일 사본이다. 원본을 먼저 고치고 `cp` 로 사본을 갱신한 뒤 C++ 를 포팅한다 (AMR-fms `fms_server/tests/test_common_sync.py` 가 사본 일치를 검사). 커밋은 리포마다 따로 한다.
 - **맵 로드/동기화**: `map_model.cpp` 가 `fms_map.json` 과 그 `image` png(`stb_image`)를 읽는다. `SET_MAP` 을 받으면 `map_sync.cpp` 가 zip 을 받아 `map_cache/<map_uid>/` 에 풀고 `State.map_id/map_version` 으로 보고한다. FMS 는 이 값이 일치하는 로봇에만 job 을 배정한다.
 - **C++ `tools/`**: `send_order`, `place_obstacle`, `obstacle_zone` 은 별도 실행 파일이고 `schemas.o` 만 링크한다. `mqtt_once.hpp` 는 1회 발행 헬퍼다.
 

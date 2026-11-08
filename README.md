@@ -1,6 +1,6 @@
 # AMR_client — 로봇 클라이언트 (C++)
 
-프로토콜(MQTT+JSON)이 언어 무관이라 `fms_server` 와 그대로 섞어 쓴다.
+프로토콜(MQTT+JSON)이 언어 무관이라 `fms_server`(별도 리포 AMR-fms)와 그대로 섞어 쓴다.
 
 ## 리포 구성
 
