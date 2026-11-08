@@ -325,6 +325,27 @@ def test_pause_cancel():
     r.stop()
 
 
+def test_lazy_plan():
+    """경로계획은 현재 목적지까지만: C 가 맵 밖이어도 A->B 는 가고, B 에 도착한 뒤에야 C 에서 NO_PATH 가 난다."""
+    r = Robot("L1", 3, 3)
+    r.order("lz1", ["5,3", "7,3", "500,500"])
+    s = r.wait(lambda s: s["state"] == "ERROR", 60)
+    p = r.pose()
+    errs = [e["error_type"] for e in (s or {}).get("errors", [])]
+    check("lazy: reaches B before failing on unreachable C", s is not None and dist((p["x"], p["y"]), (7, 3)) < 0.1 and "NO_PATH" in errs,
+          f"pose={p} errors={errs}")
+    r.stop()
+    r = Robot("L2", 3, 3)
+    r.order("lz2", ["5,3,0", "5,5,1.57", "7,5,3.14"])
+    s = r.idle_done("lz2", 60)
+    p = r.pose()
+    check("lazy: 3-node order completes, last theta aligned", s is not None and dist((p["x"], p["y"]), (7, 5)) < 0.05 and abs(adiff(p["theta"], 3.14)) < 0.1, f"pose={p}")
+    with open(f"{SCR}/L2.log") as f:
+        plans = sum(1 for line in f if "planning path from" in line)
+    check("lazy: one planning per node", plans == 3, f"plans={plans}")
+    r.stop()
+
+
 def test_ghost_start():
     r = Robot("G1", 0.0, 0.0, localize=False)  # 맵 여백(UNKNOWN) 위
     time.sleep(2.0)
@@ -603,7 +624,7 @@ def test_script():
 
 ALL = {
     "move": test_move, "straight": test_straight, "dock": test_dock_park, "collision": test_collision,
-    "default": test_default_localized, "script": test_script,
+    "default": test_default_localized, "script": test_script, "lazy": test_lazy_plan,
     "pause": test_pause_cancel, "ghost": test_ghost_start, "lowfric": test_low_friction, "slip": test_normal_slip_small,
     "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
 }

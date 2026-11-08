@@ -141,7 +141,7 @@ private:
     int last_node_sequence_id_ = 0;
     std::optional<std::pair<std::string, int>> last_completed_;
 
-    std::vector<int> segment_;
+    std::vector<int> segment_;  // 지금 계획/주행 중인 목적지 노드 (항상 최대 1개: 도착한 뒤에 다음 노드를 계획한다)
     // 이번 세그먼트 경로계획 결과. segment_wp_bounds_[k] = segment_[k] 노드에
     // 도달하는 시점의 누적 경유점 개수. 세그먼트 중간에서 멈췄다가(EMERGENCY/PAUSE/
     // MANUAL) 재개할 때 이미 지나온 노드로 되돌아가지 않도록 진행도를 추적한다.

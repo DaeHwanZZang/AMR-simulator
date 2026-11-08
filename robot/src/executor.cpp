@@ -738,12 +738,8 @@ void OrderExecutor::replan() {
         kinematics.set_path({});
         return;
     }
-    for (int i = current_index_; i < (int)nodes_.size(); ++i) {
-        auto& node = nodes_[i];
-        if (!node.released) break;
-        segment_.push_back(i);
-        if (node.action) break;
-    }
+    // 현재 목적지(다음 노드 하나)까지만 계획한다. 그 뒤 노드는 도착한 다음에 (그때의 위치/장애물로) 계획한다.
+    if (current_index_ < (int)nodes_.size() && nodes_[current_index_].released) segment_.push_back(current_index_);
     if (segment_.empty()) {
         log::debug("[%s] skipping replan: no released nodes in this segment", robot_id.c_str());
         kinematics.set_path({});
