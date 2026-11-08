@@ -6,12 +6,17 @@
 
 | 경로 | 내용 |
 |---|---|
-| (루트) `src/ include/ tools/ maps/` | C++ 로봇 클라이언트 (아래 문서) |
+| `robot/` | C++ 로봇 클라이언트 (`src/ include/ tools/ tests/ Makefile`, 아래 문서). 빌드 산출물은 `build/` |
+| `tools/` | Python 도구: 통합 런처, 맵 생성/정리/편집기 |
+| `maps/` | 맵 (클라이언트와 뷰어가 공유) |
+| `scripts/` | `launch.sh`/`stop.sh` (터미널 대화형 N대 실행/종료) |
 | `viewer/` | 라이브 플릿 뷰어 (Python/Qt) -- `viewer/README.md` |
 | `broker/` | 개발용 mosquitto 설정 -- `broker/README.md` |
 
 세 폴더는 MQTT 로만 통신한다. `maps/` 는 클라이언트와 뷰어가 공유한다.
-빠른 실행: `mosquitto -c broker/mosquitto.conf -v` -> `./robot_client ...` ->
+**가장 쉬운 시작: 리포 루트에서 `./launcher`** (브로커/로봇/뷰어/맵 도구/빌드/테스트를 한 창에서 실행. `.venv` 는 없으면 자동으로 만든다).
+
+수동 실행: `mosquitto -c broker/mosquitto.conf -v` -> `build/bin/robot_client ...` ->
 `cd viewer && .venv/bin/python tools/fleet_monitor_qt.py ../maps/warehouse/warehouse.json`
 
 ## 빌드
@@ -20,24 +25,24 @@
 
 ```bash
 brew install mosquitto cjson qt
-tools/setup_mujoco.sh                # 최초 1회: MuJoCo 를 third_party/mujoco/ 에 설치 (brew 패키지가 없다)
-make                                 # robot_client + tools/{send_order,place_obstacle,obstacle_zone}
+robot/tools/setup_mujoco.sh                # 최초 1회: MuJoCo 를 robot/third_party/mujoco/ 에 설치 (brew 패키지가 없다)
+make -C robot                       # build/bin/{robot_client,send_order,place_obstacle,obstacle_zone}
 ```
 
 ### Ubuntu (배포 타깃)
 
 ```bash
 sudo apt install clang build-essential libmosquitto-dev libcjson-dev qt6-base-dev pkg-config jq curl unzip python3-pip
-tools/setup_mujoco.sh                # 최초 1회: MuJoCo 를 third_party/mujoco/ 에 설치
-make
+robot/tools/setup_mujoco.sh                # 최초 1회: MuJoCo 를 robot/third_party/mujoco/ 에 설치
+make -C robot
 ```
 
-- MuJoCo(`tools/setup_mujoco.sh`): PyPI 휠에서 C 헤더와 공유 라이브러리만 꺼내 `third_party/mujoco/`
+- MuJoCo(`robot/tools/setup_mujoco.sh`): PyPI 휠에서 C 헤더와 공유 라이브러리만 꺼내 `robot/third_party/mujoco/`
   (gitignore) 에 둔다. `python3 -m pip` 가 필요하다. 다른 곳에 있으면 `make MUJOCO_DIR=/경로`.
-  없이 `make` 하면 `MuJoCo 가 없다 ... tools/setup_mujoco.sh 를 실행하라` 로 멈춘다. 휠은 macOS(arm64/x86_64)와
+  없이 `make -C robot` 하면 `MuJoCo 가 없다 ... robot/tools/setup_mujoco.sh 를 실행하라` 로 멈춘다. 휠은 macOS(arm64/x86_64)와
   Linux(x86_64/aarch64) 용이 있고, 이 스크립트는 macOS 에서만 실행해 봤다 (Linux 는 미검증).
-- `clang`/`build-essential`: `Makefile` 이 `CXX := clang++` 로 고정돼 있어 필요
-  (g++로 바꾸려면 `Makefile` 의 `CXX` 줄을 직접 수정 — 자동 분기 없음)
+- `clang`/`build-essential`: `robot/Makefile` 이 `CXX := clang++` 로 고정돼 있어 필요
+  (g++로 바꾸려면 `robot/Makefile` 의 `CXX` 줄을 직접 수정 — 자동 분기 없음)
 - `libmosquitto-dev`/`libcjson-dev`: 브로커 패키지(`mosquitto`)나 런타임
   라이브러리(`libmosquitto1`/`libcjson1`)만 깔려 있으면 헤더가 없어 `mosquitto.h`/
   `cjson/cJSON.h` not found 로 빌드 실패한다
@@ -45,34 +50,33 @@ make
   `QtWidgets/QApplication` not found
 - `pkg-config`: Linux 분기가 `pkg-config --cflags/--libs Qt6Widgets` 로 Qt
   경로를 잡는 데 씀 (macOS 는 프레임워크라 불필요)
-- `jq`: 빌드엔 안 쓰지만 `launch.sh` 가 맵 폴더 안 메타데이터 json 자동탐지에
+- `jq`: 빌드엔 안 쓰지만 `scripts/launch.sh` 가 맵 폴더 안 메타데이터 json 자동탐지에
   쓴다. 없으면 원인 설명 없이 "메타데이터 json 을 못 찾음" 만 뜬다
 - `curl`/`unzip`: 빌드엔 안 쓰지만 `map_sync.cpp` 가 SET_MAP 번들 다운로드에
   fork+exec 로 호출. `unzip` 없으면 다운로드는 되는데 압축해제 단계서 조용히
   실패 → Map Sync 상태 FAILED, `State.map_version` 계속 `None` 으로 보고돼
   FMS 가 job dispatch 를 422(맵 버전 불일치)로 계속 거절한다
 
-cmake 없이 순수 Makefile (`Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux 분기).
+cmake 없이 순수 Makefile (`robot/Makefile` 상단 `BREW`/`UNAME_S` 로 macOS/Linux 분기).
 
 ## 실행
 
 ```bash
-./robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y -4.0
-./robot_client --id AMR-002 --x 0 --y 0 --gui    # 제어판 창(Qt)
-./robot_client --id AMR-003 --host <FMS IP>      # --map 없이: FMS 가 SET_MAP 으로 맵을 내려준다
-./launch.sh                                       # 인터랙티브 실행기 — N대 한번에
+build/bin/robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y -4.0
+build/bin/robot_client --id AMR-002 --x 0 --y 0 --gui    # 제어판 창(Qt)
+build/bin/robot_client --id AMR-003 --host <FMS IP>      # --map 없이: FMS 가 SET_MAP 으로 맵을 내려준다
+scripts/launch.sh                                       # 인터랙티브 실행기 — N대 한번에
 ```
 
-옵션은 `./robot_client --help`. 브로커 주소는 `--host`/`--port` (기본
-localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다 —
-`AMR_master/maps/` 갱신되면 여기도 수동 재복사 필요.
+옵션은 `build/bin/robot_client --help`. 브로커 주소는 `--host`/`--port` (기본
+localhost:1883). `scripts/launch.sh`는 리포 루트 `maps/`에서 맵을 찾는다.
 
 ### 로컬라이징 / 충전기 / 배터리
 
 - 기본: 시작 자세에서 바로 LOCALIZED. `--require-localization` 이면 UNLOCALIZED 로 떠서 위치 힌트 전에는 오더를 거절한다.
   ```bash
-  ./robot_client --id AMR-001 --map maps/empty_hall1/fms_map.json --x 3 --y 3 --require-localization
-  tools/send_order AMR-001 --instant INIT_POSITION --param x=3 --param y=3 --param theta=0   # ±1.5 m, ±30° 안
+  build/bin/robot_client --id AMR-001 --map maps/empty_hall1/fms_map.json --x 3 --y 3 --require-localization
+  build/bin/send_order AMR-001 --instant INIT_POSITION --param x=3 --param y=3 --param theta=0   # ±1.5 m, ±30° 안
   ```
   제어판(`--gui`)에는 **Pose Hint**(같은 동작)와 **Force Localize**(디버그: 그 자리로 옮기고 바로 LOCALIZED)가 있다.
   `State.localization` = `UNLOCALIZED | LOCALIZING | LOCALIZED`, `localization_score` 는 가상 라이다 스캔 매칭 점수 (0.8 미만이면 `LOCALIZATION_FAILED` 경고). 뷰어는 위치를 모르는 로봇을 흐린 빨간 점선으로 그린다.
@@ -109,10 +113,10 @@ localhost:1883). `launch.sh`는 이 폴더 안 `maps/`에서만 맵을 찾는다
 
 ```bash
 # 리포 루트에서. theta 는 --path 의 세 번째 값 (라디안)
-tools/send_order AMR-001 --path 3,1.5,0 --order-id s1 --action STRAIGHT --param distance=-1.0
-tools/send_order AMR-001 --path 14.75,5,0 --order-id d1 --action DOCK \
+build/bin/send_order AMR-001 --path 3,1.5,0 --order-id s1 --action STRAIGHT --param distance=-1.0
+build/bin/send_order AMR-001 --path 14.75,5,0 --order-id d1 --action DOCK \
     --param entry=BACKWARD --param undock_distance=0.6 --param min_charge=80
-tools/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK \
+build/bin/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK \
     --param entry=FORWARD --param undock_distance=0.6
 ```
 
@@ -201,7 +205,7 @@ GT 와 벌어진 만큼이 누적 오차다 (패널 `error`). 보정 알고리�
 프로세스가 따로라 서로 부딪히지 않는다. 라이다/IMU 센서는 없다.
 
 디버깅: `AMR_PHYSICS_DUMP=파일` 환경변수를 주면 마지막으로 컴파일한 MJCF 를 그 파일에 쓴다 (파이썬 `mujoco` 로 열어 볼 수 있다).
-통합 테스트: `.venv/bin/python tools/physics_test.py [시나리오...]` (empty_hall1 에서 이동/직선/도킹/충돌/일시정지/
+통합 테스트: `.venv/bin/python robot/tests/physics_test.py [시나리오...]` (empty_hall1 에서 이동/직선/도킹/충돌/일시정지/
 벽 안 시작/저마찰/장거리/동적 장애물, 약 8분).
 
 ### 통합 런처 (`tools/launcher.py`)
@@ -219,7 +223,7 @@ GT 와 벌어진 만큼이 누적 오차다 (패널 `error`). 보정 알고리�
 - 정지는 SIGTERM 이다. 맵 편집기는 저장 안 한 수정이 있으면 확인 창이 뜨고, 제한 시간(편집기 30 초)이 지나면 강제 종료할지 묻는다.
 - 런처를 닫을 때 "전부 정지 / 그대로 두고 종료 / 취소" 를 고른다. 그대로 두고 종료하거나 비정상 종료하면 다음 실행 때 `.run/launcher.json` 으로 프로세스를 다시 찾아 붙는다.
 - 로봇 시작 위치가 벽/미탐색이어도 실행은 된다 (`start position ... is not drivable` 경고). 대신 오더를 받으면 `NO_PATH` 오류가 나고, 제어판(GUI)의 강제 위치지정으로 주행 가능한 칸에 옮기면 `NO_PATH`/`COLLISION` 오류가 풀린다. 레이아웃 맵은 칸 (r,c) 중심이 world ((c+1) m, (r+1) m).
-- 새 툴은 `tools/launcher_tools.json` 에 항목만 추가하면 붙는다 (파일 안 `_설명` 참고). `launch.sh`/`stop.sh` 는 따로 그대로 쓸 수 있다 (`.run/pids` 는 런처가 쓰지 않는다).
+- 새 툴은 `tools/launcher_tools.json` 에 항목만 추가하면 붙는다 (파일 안 `_설명` 참고). `scripts/launch.sh`/`scripts/stop.sh` 는 따로 그대로 쓸 수 있다 (`.run/pids` 는 런처가 쓰지 않는다).
 
 ## 테스트 맵 생성 (`tools/gen_map.py`)
 
@@ -230,7 +234,7 @@ GT 와 벌어진 만큼이 누적 오차다 (패널 `error`). 보정 알고리�
 ```bash
 python3.11 -m venv .venv && .venv/bin/pip install numpy pillow   # 리포 루트. viewer/.venv 를 써도 된다
 .venv/bin/python tools/gen_map.py tools/map_layouts/loop.txt --out maps/gen_loop --seed 1
-./robot_client --id AMR-001 --map maps/gen_loop/fms_map.json --x 1.0 --y 1.0
+build/bin/robot_client --id AMR-001 --map maps/gen_loop/fms_map.json --x 1.0 --y 1.0
 ```
 
 - 레이아웃은 텍스트 한 글자 = 1 m: `.` 통로, `#` 막힘, `;` 주석. 바깥 1칸은 자동으로 막힌다
@@ -348,10 +352,10 @@ Qt 는 메인스레드 전용이라 `--gui` 주면 tick/MQTT 루프를 백그라
 
 | 영역 | 파일 |
 |---|---|
-| 프로토콜/맵 계약 | `include+src/schemas.*`, `map_model.*` |
-| 경로계획/오더 실행/통신/시계 | `include+src/{planner,executor,comm,clock}.*` |
-| 물리 시뮬레이션 | `include+src/{physics_world,kinematics,battery,dynamic_obstacles}.*` (MuJoCo 는 `physics_world.cpp` 안에만) |
-| 데이터 기록 | `include+src/recorder.*` |
+| 프로토콜/맵 계약 | `robot/{include,src}/schemas.*`, `map_model.*` |
+| 경로계획/오더 실행/통신/시계 | `robot/{include,src}/{planner,executor,comm,clock}.*` |
+| 물리 시뮬레이션 | `robot/{include,src}/{physics_world,kinematics,battery,dynamic_obstacles}.*` (MuJoCo 는 `physics_world.cpp` 안에만) |
+| 데이터 기록 | `robot/{include,src}/recorder.*` |
 | 로컬 제어판 | `gui.hpp/cpp` (Qt Widgets) |
 | CLI 도구 | `tools/*.cpp`, 테스트 맵 생성/정리 `tools/{gen_map,synth_map,clean_map}.py` |
 | SET_MAP 번들 다운로더 | `map_sync.hpp/cpp` |

@@ -25,7 +25,7 @@
       "name": "로봇 클라이언트",
       "mode": "multi",
       "cmd": [
-        "./robot_client", "--id", "{id}", "--host", "{host}", "--port", "{port}",
+        "build/bin/robot_client", "--id", "{id}", "--host", "{host}", "--port", "{port}",
         "--x", "{x}", "--y", "{y}", "--theta", "{theta}",
         {"if": "map", "args": ["--map", "{map}"]},
         "--robot-width", "{robot_width}", "--robot-length", "{robot_length}",
@@ -50,7 +50,7 @@
         {"if": "obstacle_seed", "args": ["--obstacle-seed", "{obstacle_seed}"]}
       ],
       "requires": ["broker"],
-      "needs_build": "robot_client",
+      "needs_build": "build/bin/robot_client",
       "stop_timeout_s": 5,
       "multi": {"id_param": "id", "id_fmt": "AMR-{n:03d}", "step": {"y": 1.0}},
       "params": [
@@ -126,10 +126,39 @@
       "stop_timeout_s": 10
     },
     {
-      "id": "make",
-      "name": "빌드 (make)",
+      "id": "setup_mujoco",
+      "name": "MuJoCo 설치 (최초 1회)",
       "mode": "oneshot",
-      "cmd": ["make"],
+      "cmd": ["robot/tools/setup_mujoco.sh"],
+      "stop_timeout_s": 10
+    },
+    {
+      "id": "physics_test",
+      "name": "물리 회귀 테스트",
+      "mode": "oneshot",
+      "cmd": ["{python}", "robot/tests/physics_test.py", {"if": "scenarios", "args": ["{scenarios}"]}],
+      "stop_timeout_s": 15,
+      "params": [
+        {"key": "scenarios", "label": "시나리오 이름 1개 (비우면 전체)", "type": "str", "default": ""}
+      ]
+    },
+    {
+      "id": "instant",
+      "name": "즉시명령 (send_order)",
+      "mode": "oneshot",
+      "cmd": ["build/bin/send_order", "{id}", "--host", "{host}", "--port", "{port}", "--instant", "{kind}"],
+      "needs_build": "build/bin/send_order",
+      "stop_timeout_s": 5,
+      "params": [
+        {"key": "id", "label": "로봇 ID", "type": "str", "default": "AMR-001"},
+        {"key": "kind", "label": "종류", "type": "choice", "choices": ["PAUSE", "RESUME", "CANCEL_ORDER", "RESET_ERROR"], "default": "PAUSE"}
+      ]
+    },
+    {
+      "id": "make",
+      "name": "빌드 (make -C robot)",
+      "mode": "oneshot",
+      "cmd": ["make", "-C", "robot"],
       "stop_timeout_s": 10
     }
   ]

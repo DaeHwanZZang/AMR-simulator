@@ -392,7 +392,7 @@ def save_map(out: Path, name: str | None, img: np.ndarray, layout: np.ndarray, l
           f"seed {info.get('seed')}, edited_navi_gridmap.png {'새로 생성' if info['edited_created'] else '기존 유지'})")
     print("통로 칸 중심 예시 (world x, y):", ", ".join(f"({x:.1f}, {y:.1f})" for x, y in spots[:: max(1, len(spots) // 5)][:5]))
     x, y = spots[0]
-    print(f"실행 예: ./robot_client --id AMR-001 --map {out}/fms_map.json --x {x:.1f} --y {y:.1f}")
+    print(f"실행 예: build/bin/robot_client --id AMR-001 --map {out}/fms_map.json --x {x:.1f} --y {y:.1f}")
 
 
 # -- main --------------------------------------------------------------------

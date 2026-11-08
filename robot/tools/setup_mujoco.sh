@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# MuJoCo(헤더 + 공유 라이브러리)를 third_party/mujoco/ 에 설치한다. 리포 루트 어디서 실행해도 된다.
-#   tools/setup_mujoco.sh                 # 기본 버전
-#   MUJOCO_VERSION=3.16.0 tools/setup_mujoco.sh
+# MuJoCo(헤더 + 공유 라이브러리)를 robot/third_party/mujoco/ 에 설치한다. 어디서 실행해도 된다.
+#   robot/tools/setup_mujoco.sh                 # 기본 버전
+#   MUJOCO_VERSION=3.16.0 robot/tools/setup_mujoco.sh
 # brew 패키지가 없어서 PyPI 휠(mujoco)에서 C 라이브러리만 꺼내 쓴다. 파이썬 바인딩은 쓰지 않는다.
 # 휠은 플랫폼에 맞는 것을 pip 가 고른다 (macOS arm64/x86_64, Linux x86_64/aarch64).
 set -euo pipefail

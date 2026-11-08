@@ -8,12 +8,14 @@ AMR(자율주행 로봇) 시뮬레이터 모노레포. 세 부분이 MQTT+JSON �
 
 | 경로 | 내용 |
 |---|---|
-| 루트 (`src/ include/ tools/ maps/`) | C++20 로봇 클라이언트. 프로세스 1개 = 로봇 1대. Python 원본(`robot_client/*.py`, 이 리포에 없음) 포팅이라 주석에 원본 참조가 많다. 이동은 MuJoCo 물리로 계산한다 |
-| `tools/*.py` | Python 도구: 맵 생성/정리/편집기, 통합 런처 |
+| `robot/` (`src/ include/ tools/ tests/ Makefile`) | C++20 로봇 클라이언트. 프로세스 1개 = 로봇 1대. Python 원본(`robot_client/*.py`, 이 리포에 없음) 포팅이라 주석에 원본 참조가 많다. 이동은 MuJoCo 물리로 계산한다 |
+| `tools/*.py` | Python 도구: 맵 생성/정리/편집기, 통합 런처. 루트 `./launcher` 가 진입점 |
+| `scripts/` | `launch.sh`/`stop.sh` (터미널 대화형 N대 실행/종료) |
+| `build/` | 빌드 산출물 (gitignore): `bin/` 실행파일, `obj/` 오브젝트 |
 | `viewer/` | 라이브 플릿 뷰어 (Python/PySide6). 순수 관측자, 아무것도 발행하지 않는다 |
 | `broker/` | 개발용 mosquitto 설정 (`mosquitto.conf`: `127.0.0.1:1883`, 익명 허용, persistence 끔) |
 
-FMS(`fms_server`)는 형제 폴더 `../AMR-fms` 별도 리포(private)에 있고 같은 프로토콜로 붙는다. FMS 가 없으면 `tools/send_order` 가 그 역할을 대신한다. `maps/` 는 클라이언트와 뷰어가 같이 쓰며, `viewer/maps` 사본은 없다.
+FMS(`fms_server`)는 형제 폴더 `../AMR-fms` 별도 리포(private)에 있고 같은 프로토콜로 붙는다. FMS 가 없으면 `build/bin/send_order` 가 그 역할을 대신한다. `maps/` 는 클라이언트와 뷰어가 같이 쓰며, `viewer/maps` 사본은 없다.
 
 ## 작업 규칙
 
@@ -28,35 +30,36 @@ FMS(`fms_server`)는 형제 폴더 `../AMR-fms` 별도 리포(private)에 있고
 - `origin` = `DaeHwanZZang/AMR-simulator` (public, 메인).
 - 기존 org 리포 `GC-WAYPOINT/AMR_client` 는 원래 `upstream`(fetch 전용, push URL `DISABLED`)으로 썼다. 현재 로컬 클론에는 이 remote 가 없다. 필요하면 다시 추가한다:
   `git remote add upstream <URL> && git remote set-url --push upstream DISABLED`
-- org 에 반영할 버전은 수동으로 가져간다 (cherry-pick/patch). 그래서 C++ 클라이언트 파일은 루트 경로에서 옮기지 않는다. 옮기면 org 쪽과 충돌한다.
+- org 에 반영할 버전은 수동으로 가져간다 (cherry-pick/patch). C++ 클라이언트는 `robot/` 아래에 있어 org 루트 레이아웃과 경로가 다르다. 뽑을 때 `git format-patch --relative=robot <범위>` 로 접두를 떼고 org 에서 `git am` 한다.
 - `viewer/`, `broker/` 는 `git subtree` 로 원본 이력을 보존해 합쳤다. 기준 태그 `v1.1` = PSO 작업 직전.
 
 ## 명령 (리포 루트에서 실행)
 
 ```bash
 # C++ 빌드 (macOS: brew install mosquitto cjson qt)
-tools/setup_mujoco.sh # 최초 1회. MuJoCo 를 third_party/mujoco/ 에 설치 (gitignore). 없으면 make 가 이 안내를 하고 멈춘다
-make                  # robot_client + tools/{send_order,place_obstacle,obstacle_zone}
-make clean
+robot/tools/setup_mujoco.sh # 최초 1회. MuJoCo 를 robot/third_party/mujoco/ 에 설치 (gitignore). 없으면 make 가 이 안내를 하고 멈춘다
+make -C robot          # build/bin/{robot_client,send_order,place_obstacle,obstacle_zone}
+make -C robot clean   # build/ 삭제
+./launcher            # 통합 런처 GUI (.venv 없으면 자동 생성)
 
 # Python 도구 + 뷰어 공용 venv (최초 1회, Python 3.11+)
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 실행
 mosquitto -c broker/mosquitto.conf -v             # 브로커
-./robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y -4.0
-./robot_client --id AMR-002 --x 0 --y 0 --gui     # Qt 제어판
-./robot_client --id AMR-003 --host <FMS IP>       # --map 없음: FMS 가 SET_MAP 으로 맵 전달
-./robot_client -h                                 # 전체 옵션 (속도/크기/배터리/센서/동적 장애물/--seed/--path-refine/--friction/--mass/--record 등)
-./robot_client --id AMR-001 --map maps/empty_hall1/fms_map.json --x 3 --y 3 --friction 0.2 --record records   # 저마찰 + 학습 데이터 기록 (라이다 위치보정은 기본 켜짐, 끄려면 --loc-rate 0)
-./launch.sh           # 터미널 대화형으로 N대 실행 (PID 는 .run/pids, 로그는 logs/). jq 필요
-./stop.sh             # launch.sh 가 띄운 로봇 종료
-.venv/bin/python tools/launcher.py   # 통합 런처 GUI: 브로커/로봇/뷰어/편집기/생성기/make 실행·정지
+build/bin/robot_client --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y -4.0
+build/bin/robot_client --id AMR-002 --x 0 --y 0 --gui     # Qt 제어판
+build/bin/robot_client --id AMR-003 --host <FMS IP>       # --map 없음: FMS 가 SET_MAP 으로 맵 전달
+build/bin/robot_client -h                                 # 전체 옵션 (속도/크기/배터리/센서/동적 장애물/--seed/--path-refine/--friction/--mass/--record 등)
+build/bin/robot_client --id AMR-001 --map maps/empty_hall1/fms_map.json --x 3 --y 3 --friction 0.2 --record records   # 저마찰 + 학습 데이터 기록 (라이다 위치보정은 기본 켜짐, 끄려면 --loc-rate 0)
+scripts/launch.sh           # 터미널 대화형으로 N대 실행 (PID 는 .run/pids, 로그는 logs/). jq 필요
+scripts/stop.sh             # scripts/launch.sh 가 띄운 로봇 종료
+.venv/bin/python tools/launcher.py   # (= ./launcher) 브로커/로봇/뷰어/편집기/생성기/make/테스트 실행·정지
 
 # FMS 대역 (오더/즉시명령 1회 발행)
-tools/send_order AMR-001 --path 2,1 5,1 --order-id o1
-tools/send_order AMR-001 --path 14.75,5,0 --order-id d1 --action DOCK --param entry=BACKWARD --param undock_distance=0.6 --param min_charge=80   # 마지막 노드에 액션 (X,Y[,THETA])
-tools/send_order AMR-001 --instant PAUSE          # CANCEL_ORDER|PAUSE|RESUME|RESET_ERROR|INJECT_FAULT
+build/bin/send_order AMR-001 --path 2,1 5,1 --order-id o1
+build/bin/send_order AMR-001 --path 14.75,5,0 --order-id d1 --action DOCK --param entry=BACKWARD --param undock_distance=0.6 --param min_charge=80   # 마지막 노드에 액션 (X,Y[,THETA])
+build/bin/send_order AMR-001 --instant PAUSE          # CANCEL_ORDER|PAUSE|RESUME|RESET_ERROR|INJECT_FAULT
 
 # 맵 도구
 .venv/bin/python tools/gen_map.py tools/map_layouts/loop.txt --out maps/gen_loop     # 실제 맵 조각을 이어 붙여 생성
@@ -72,27 +75,27 @@ tools/send_order AMR-001 --instant PAUSE          # CANCEL_ORDER|PAUSE|RESUME|RE
 ../.venv/bin/python tools/fleet_monitor_qt.py ../maps/warehouse/warehouse.json --host <브로커 IP>
 ```
 
-- 빌드: `Makefile` 은 `CXX := clang++` 고정이고 cmake 는 없다. `-MMD -MP` 로 헤더 의존성을 추적한다. 이게 없으면 `schemas.hpp` 를 바꿨을 때 stale `.o` 가 링크되어 런타임 세그폴트가 난다.
+- 빌드: `robot/Makefile` 은 `CXX := clang++` 고정이고 cmake 는 없다. `-MMD -MP` 로 헤더 의존성을 추적한다. 이게 없으면 `schemas.hpp` 를 바꿨을 때 stale `.o` 가 링크되어 런타임 세그폴트가 난다.
 - Ubuntu 의존성(clang, libmosquitto-dev, libcjson-dev, qt6-base-dev, pkg-config, jq, curl, unzip)은 README 참고.
-- 런타임에 `curl`/`unzip`/`jq` 가 필요하다 (`map_sync.cpp` 는 fork+exec, `launch.sh` 는 jq). 없으면 조용히 실패한다.
+- 런타임에 `curl`/`unzip`/`jq` 가 필요하다 (`map_sync.cpp` 는 fork+exec, `scripts/launch.sh` 는 jq). 없으면 조용히 실패한다.
 - 런처로 띄운 프로세스는 별도 세션이라 그냥 `ps` 로는 안 보인다 (현재 tty 만 나옴). `ps -ax | grep robot_client` 또는 `pgrep -fl robot_client` 를 쓴다.
 
 ## 검증
 
 1. 브로커를 띄운다.
 2. 로봇을 띄운다. 시작 좌표는 FREE 칸이어야 한다 (아래 "좌표계" 참고).
-3. `tools/send_order` 로 오더를 보낸다.
+3. `build/bin/send_order` 로 오더를 보낸다.
 4. `mosquitto_sub -t 'fms/v1/#' -v` 또는 뷰어로 State 를 확인한다.
 
-자동 회귀 테스트: `.venv/bin/python tools/physics_test.py [시나리오...]`. 자체 mosquitto(포트 18851)와 `empty_hall1` 으로 이동, STRAIGHT,
+자동 회귀 테스트: `.venv/bin/python robot/tests/physics_test.py [시나리오...]`. 자체 mosquitto(포트 18851)와 `empty_hall1` 으로 이동, STRAIGHT,
 DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, 저마찰 슬립, 110 m 주행, 동적 장애물, GUI(offscreen) 기동과 스냅샷, physics 토픽, 위치추정 보정(켬/끔), 로컬라이징(UNLOCALIZED/힌트/기본 LOCALIZED)을 시험한다. 시나리오 헬퍼 `Robot` 은 기본으로 `--require-localization` 을 붙이고 힌트로 위치를 잡는다 (플래그 없는 기본 동작은 `default` 시나리오). 교통 구역 시나리오는 FMS 가 필요해 이 리포에서 뺐다.
-`make` 로 바이너리를 먼저 만들어야 한다. 이동/도착/충돌/도킹 코드를 건드렸으면 돌린다.
+`make -C robot` 으로 바이너리를 먼저 만들어야 한다. 이동/도착/충돌/도킹 코드를 건드렸으면 돌린다.
 
 맵 도구는 출력 png/json 을 직접 열어 확인한다. GUI 는 `QT_QPA_PLATFORM=offscreen` 으로 띄우고 `grab()` 스크린샷을 찍어 볼 수 있다. 실제 클릭과 다이얼로그 흐름은 사용자가 확인해야 한다.
 
 ## 맵과 좌표계
 
-- 메타 `fms_map.json` 의 키는 `image`, `resolution`, `origin_x`/`origin_y`, `width_px`/`height_px`, 임계값 `free_thresh`/`occupied_thresh` 이다. 런처와 `launch.sh` 는 `image`, `resolution`, `width_px` 를 모두 가진 json 을 메타로 본다.
+- 메타 `fms_map.json` 의 키는 `image`, `resolution`, `origin_x`/`origin_y`, `width_px`/`height_px`, 임계값 `free_thresh`/`occupied_thresh` 이다. 런처와 `scripts/launch.sh` 는 `image`, `resolution`, `width_px` 를 모두 가진 json 을 메타로 본다.
 - `origin` 은 **왼쪽 위 픽셀의 world 좌표**이고 y 는 아래로 증가한다. 변환식은 `px = floor((x - origin_x) / res)` (`map_model.cpp`).
 - 칸 분류: 회색값 `>= free_thresh` 이면 FREE, `<= occupied_thresh` 이면 OCCUPIED, 그 사이는 UNKNOWN, 맵 밖은 OCCUPIED. **주행 가능 = FREE 만** (`drivable()`).
 - planner 는 비-FREE 칸 전부를 로봇 반폭(`ceil(width/2/res)` px)만큼 팽창시킨 뒤 A* 를 돌린다. 시작점이나 목표점이 비-FREE 면 `PlanningError` 를 던진다.
@@ -106,11 +109,11 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
 
 ## 아키텍처 (C++ 클라이언트)
 
-- **진입점 `src/main.cpp`**:
+- **진입점 `robot/src/main.cpp`**:
   - 순서: 인자 파싱 → `MapModel` 로드(옵션) → 시작 위치 검사 → `OrderExecutor` + `RobotComm` + `MapSync` 조립 → `robot_loop`.
   - 루프: `Ticker` 로 50 ms tick (`TICK_PERIOD`), 200 ms 마다 `State` 발행 (`STATE_PERIOD`).
   - 한 tick 안의 순서: MQTT 수신(`comm.drain()`) → `map_sync.take_ready()` 로 새 맵 교체 → GUI 명령 처리 → `executor.tick(dt)` → 상태 발행.
-- **스레드 모델**: `--gui` 면 `robot_loop` 를 백그라운드 스레드로, Qt 이벤트루프를 메인 스레드로 돌린다. 공유 상태는 `exec_mutex` 로 보호한다. GUI→루프 명령은 `CommandQueue` (`include/command_queue.hpp`: Move/Relocalize/Start/Stop/Estop/Mode/Configure/ResyncMap/SetBattery) 로 보낸다. 맵 다운로드는 별도 워커 스레드(`MapSync`)라 tick 을 막지 않는다. `executor` 를 건드리는 코드는 항상 이 락 규칙을 따라야 한다.
+- **스레드 모델**: `--gui` 면 `robot_loop` 를 백그라운드 스레드로, Qt 이벤트루프를 메인 스레드로 돌린다. 공유 상태는 `exec_mutex` 로 보호한다. GUI→루프 명령은 `CommandQueue` (`robot/include/command_queue.hpp`: Move/Relocalize/Start/Stop/Estop/Mode/Configure/ResyncMap/SetBattery) 로 보낸다. 맵 다운로드는 별도 워커 스레드(`MapSync`)라 tick 을 막지 않는다. `executor` 를 건드리는 코드는 항상 이 락 규칙을 따라야 한다.
 - **`OrderExecutor` (`executor.cpp`, 가장 큼)**:
   - 처리 범위: 오더 상태머신 (released/order_update_id/거절 규칙), e-stop/PAUSE/MANUAL, 세그먼트 단위 경로계획, 액션(PICK/DROP/CHARGE/WAIT/STRAIGHT/DOCK/PARK), 충돌 감지, 동적 장애물 재계획.
   - 소유 객체: `PhysicsWorld`(MuJoCo, `physics`), `TrapezoidalKinematics`(사다리꼴 궤적 = 명령 생성기, 위의 world 를 가리킨다), `BatterySim`, `DynamicObstacleField`, `Recorder`(`--record` 일 때만). 멤버 선언 순서가 중요하다: `physics` 가 `kinematics` 보다 먼저여야 한다.
@@ -207,15 +210,15 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
 
 ## 주의 / 알려진 문제
 
-- Makefile 은 소스를 자동 수집하지 않는다. `.cpp` 를 추가하면 `CORE_SRC` 에 직접 넣는다 (`gui.cpp` 는 `GUI_OBJ` 로 따로 있다).
-- MuJoCo 는 `tools/setup_mujoco.sh` 가 PyPI 휠에서 꺼내 `third_party/mujoco/` 에 둔다 (macOS 에서만 실행해 봤고 Linux 는 미검증). macOS 는 휠의 install name 이 framework 경로라 스크립트가 `install_name_tool`/`codesign` 으로 고친다. 링크는 rpath 를 절대경로로 박으므로 리포를 옮기면 다시 `make` 한다.
+- robot/Makefile 은 소스를 자동 수집하지 않는다. `.cpp` 를 추가하면 `CORE_SRC` 에 직접 넣는다 (`gui.cpp` 는 `GUI_OBJ` 로 따로 있다).
+- MuJoCo 는 `robot/tools/setup_mujoco.sh` 가 PyPI 휠에서 꺼내 `robot/third_party/mujoco/` 에 둔다 (macOS 에서만 실행해 봤고 Linux 는 미검증). macOS 는 휠의 install name 이 framework 경로라 스크립트가 `install_name_tool`/`codesign` 으로 고친다. 링크는 rpath 를 절대경로로 박으므로 리포를 옮기면 다시 `make` 한다.
 - 물리 극단값 한계: `--friction 0.12 --max-acceleration 3` 같은 조합은 제자리 회전이 접지력을 넘어 방위가 헌팅하며 거의 못 간다. 마찰 0.15~0.5 / 가속 0.6~2.0 은 완주한다. 개선하려면 `rotate_step` 대신 측정 각속도를 쓰는 PD 제어가 필요하다.
 - 제자리 회전 때 몸체가 오도메트리보다 3~4% 더 돈다 (구 바퀴 접촉 때문). 오도메트리 오차가 12 m 에 2~15 cm 쌓이는 이유 중 하나다.
 - 셸이 zsh 라 변수 단어 분리가 안 된다. `$VAR` 로 인자 목록을 전개할 수 없으니 `${=VAR}` 를 쓴다. macOS `sed -i` 는 백업 인자(`sed -i ''`)가 필요하다.
 - `send_order --path` 는 `X,Y[,THETA]` 토큰을 받고, `-` 로 시작하는 토큰에서 경로 수집을 멈춘다. 그래서 음수 좌표를 줄 수 없다. 생성 맵이 칸 중심을 양수 좌표로 두는 이유다.
 - 주석의 오래된 참조:
-  - `launch.sh`/`Makefile` 주석의 "AGENTS.md 결정 4", "최종 타깃" 은 org 상위 프로젝트 문서를 가리킨다. 이 리포에는 해당 내용이 없다.
-  - `launch.sh` 주석의 `robot_new` 는 이 리포 루트의 예전 이름이다.
+  - `scripts/launch.sh`/`Makefile` 주석의 "CLAUDE.md 결정 4", "최종 타깃" 은 org 상위 프로젝트 문서를 가리킨다. 이 리포에는 해당 내용이 없다.
+  - `scripts/launch.sh` 주석의 `robot_new` 는 이 리포 루트의 예전 이름이다.
 - 맵 이미지 불일치: `maps/641931.../fms_map.json` 의 `image` 는 `edited_navi_gridmap.png` 인데, 예전 뷰어 사본은 `grid.png` 를 썼다. 뷰어는 메타의 `image` 를 따르므로 표시가 예전과 다를 수 있다 (미결정).
 - README known issue:
   - 양 갈림길이 다 막히면 왕복한다.
@@ -225,4 +228,4 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
   - 목표 방향 부호가 바뀌면 각속도가 순간 반전된다.
   - 목표 도달 시 남은 각도로 잘라서 급정지한다.
   - `hold()` 는 각속도 값만 줄이고 `theta` 는 움직이지 않는다. 그래서 보고되는 각속도와 실제 회전이 어긋난다.
-- `.gitignore`: `*.o`, `*.d`, `robot_client`, `tools/` 바이너리, `map_cache/`, `logs/`, `.run/`, `.venv/`, `__pycache__/`, `.DS_Store`.
+- `.gitignore`: `*.o`, `*.d`, `build/`, `robot/third_party/mujoco/`, `map_cache/`, `logs/`, `.run/`, `.venv/`, `__pycache__/`, `.DS_Store`.

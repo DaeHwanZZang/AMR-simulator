@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# 통합 런처 진입점. 브로커/로봇/뷰어/맵 도구/빌드/테스트를 한 창에서 실행한다.
+#   ./launcher
+# .venv 가 없거나 PySide6 가 없으면 requirements.txt 로 만든다 (Python 3.11+ 필요).
+set -e
+cd "$(dirname "${BASH_SOURCE[0]}")"
+if [ ! -x .venv/bin/python ] || ! .venv/bin/python -c "import PySide6" 2>/dev/null; then
+    echo "[launcher] Python 환경 준비 중 (.venv)..."
+    python3 -m venv .venv
+    .venv/bin/pip install -q -r requirements.txt
+fi
+exec .venv/bin/python tools/launcher.py "$@"

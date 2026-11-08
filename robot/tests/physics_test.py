@@ -8,7 +8,7 @@ import csv, glob, json, math, os, shutil, signal, subprocess, sys, tempfile, thr
 
 import paho.mqtt.client as mqtt
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCR = tempfile.mkdtemp(prefix="physics_test_")
 os.environ["PATH"] = os.environ.get("PATH", "") + ":/opt/homebrew/sbin:/usr/local/sbin"  # mosquitto 위치 (macOS brew)
 PORT = 18851
@@ -30,7 +30,7 @@ class Robot:
         self.state = None
         self.states = []
         self.lock = threading.Lock()
-        cmd = [f"{REPO}/robot_client", "--id", rid, "--port", str(PORT), "--x", str(x), "--y", str(y),
+        cmd = [f"{REPO}/build/bin/robot_client", "--id", rid, "--port", str(PORT), "--x", str(x), "--y", str(y),
                "--theta", str(theta), "--seed", "1", "--speed-noise", "0"]
         if mapfile:
             cmd += ["--map", mapfile]
@@ -71,7 +71,7 @@ class Robot:
         return None
 
     def order(self, oid, path, action=None, params=(), upd=0):
-        a = [f"{REPO}/tools/send_order", self.rid, "--port", str(PORT), "--order-id", oid, "--update", str(upd), "--path"] + path
+        a = [f"{REPO}/build/bin/send_order", self.rid, "--port", str(PORT), "--order-id", oid, "--update", str(upd), "--path"] + path
         if action:
             a += ["--action", action]
             for p in params:
@@ -82,10 +82,10 @@ class Robot:
         return r.returncode == 0
 
     def instant(self, kind):
-        subprocess.run([f"{REPO}/tools/send_order", self.rid, "--port", str(PORT), "--instant", kind], capture_output=True)
+        subprocess.run([f"{REPO}/build/bin/send_order", self.rid, "--port", str(PORT), "--instant", kind], capture_output=True)
 
     def hint(self, x, y, theta=0.0):
-        subprocess.run([f"{REPO}/tools/send_order", self.rid, "--port", str(PORT), "--instant", "INIT_POSITION",
+        subprocess.run([f"{REPO}/build/bin/send_order", self.rid, "--port", str(PORT), "--instant", "INIT_POSITION",
                         "--param", f"x={x}", "--param", f"y={y}", "--param", f"theta={theta}"], capture_output=True)
 
     def pose(self):
@@ -432,7 +432,7 @@ def test_obstacle():
     r = Robot("O1", 3, 6)
     r.order("b1", ["30,6,0"])
     r.wait(lambda s: s["pose"]["x"] > 8 and s["velocity"] > 0.8, 30)
-    subprocess.run([f"{REPO}/tools/place_obstacle", "O1", "--port", str(PORT), "--x", "20", "--y", "6", "--width", "1.0", "--height", "3.0"], capture_output=True)
+    subprocess.run([f"{REPO}/build/bin/place_obstacle", "O1", "--port", str(PORT), "--x", "20", "--y", "6", "--width", "1.0", "--height", "3.0"], capture_output=True)
     s = r.wait(lambda s: s["sub_state"] == "WAITING" if s.get("sub_state") else False, 20)
     check("obstacle: robot waits when path blocked", s is not None)
     time.sleep(4)
@@ -442,7 +442,7 @@ def test_obstacle():
         if abs(float(a["v_fwd"])) > 0.6:
             amax = max(amax, abs(float(b["v_fwd"]) - float(a["v_fwd"])) / max(1e-3, float(b["t"]) - float(a["t"])))
     check("obstacle: no abrupt stops from cruise speed (|a| < 2 m/s^2 above 0.6 m/s)", amax < 2.0, f"max |a|={amax:.2f}")
-    subprocess.run([f"{REPO}/tools/place_obstacle", "O1", "--port", str(PORT), "--clear"], capture_output=True)
+    subprocess.run([f"{REPO}/build/bin/place_obstacle", "O1", "--port", str(PORT), "--clear"], capture_output=True)
     s = r.idle_done("b1", 60)
     p = r.pose()
     check("obstacle: resumes and arrives after clearing", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.04, f"pose={p}")
@@ -548,7 +548,7 @@ def test_localization():
 
 def test_gui_offscreen():
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
-    p = subprocess.Popen([f"{REPO}/robot_client", "--id", "U1", "--port", str(PORT), "--x", "3", "--y", "3", "--map", MAP, "--gui"],
+    p = subprocess.Popen([f"{REPO}/build/bin/robot_client", "--id", "U1", "--port", str(PORT), "--x", "3", "--y", "3", "--map", MAP, "--gui"],
                          env=dict(env, AMR_GUI_SNAPSHOT=f"{SCR}/gui_U1.png"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=REPO)
     time.sleep(3.0)
     alive = p.poll() is None
@@ -581,7 +581,7 @@ ALL = {
 }
 
 if __name__ == "__main__":
-    for need in (f"{REPO}/robot_client", f"{REPO}/tools/send_order", f"{REPO}/tools/place_obstacle"):
+    for need in (f"{REPO}/build/bin/robot_client", f"{REPO}/build/bin/send_order", f"{REPO}/build/bin/place_obstacle"):
         if not os.path.exists(need):
             sys.exit(f"{need} 없음: 먼저 make 를 실행하라")
     print(f"로그/기록 폴더: {SCR}")

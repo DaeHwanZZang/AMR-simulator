@@ -4,7 +4,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PIDS_FILE="$SCRIPT_DIR/.run/pids"
+PIDS_FILE="$SCRIPT_DIR/../.run/pids"
 
 if [[ ! -s "$PIDS_FILE" ]]; then
     echo "종료할 로봇이 없다 (${PIDS_FILE} 비어있음)"

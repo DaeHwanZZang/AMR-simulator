@@ -1,12 +1,9 @@
 *.o
 *.d
-robot_client
 map_cache/
-third_party/mujoco/
+robot/third_party/mujoco/
+build/
 records/
-tools/send_order
-tools/place_obstacle
-tools/obstacle_zone
 logs/
 .run/
 .venv/

@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # 로봇 클라이언트(C++) 인터랙티브 실행기.
 # CLI 옵션을 하나씩 물어보고, 로봇 대수만큼 robot_client 프로세스를 띄운다.
-# 맵은 robot_new/maps/ 안에서만 찾는다 (robot_new 는 독립 리포지토리로 뗄 수 있어야 하므로
-# 프로젝트 루트 maps/ 를 참조하지 않는다 -- CLAUDE.md 루트 maps/ 와는 별개의 사본).
+# 맵은 리포 루트 maps/ 에서 찾는다. 리포 루트 어디서 실행해도 된다 (scripts/launch.sh).
 # bash 3.2(macOS 기본) 호환을 위해 nounset(-u) 은 안 쓴다 -- 빈 배열 확장이
 # 버전별로 다르게 동작해서 오탐이 잦다. Ubuntu(CLAUDE.md 최종 타깃)의 bash4+ 에서도 동일하게 동작한다.
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR/.."
 
-BIN="./robot_client"
+BIN="./build/bin/robot_client"
 MAPS_DIR="./maps"
 LOG_DIR="./logs"
 RUN_DIR="./.run"
@@ -74,9 +73,9 @@ ask_num() {  # ask_num "질문" "기본값"  (실수 허용)
 if [[ ! -x "$BIN" ]]; then
     echo "robot_client 바이너리가 없다."
     if [[ "$(ask_yn "지금 make 할까요?" "y")" == "y" ]]; then
-        make || { echo "빌드 실패. 직접 make 해보고 다시 실행하세요."; exit 1; }
+        make -C robot || { echo "빌드 실패. 직접 make -C robot 해보고 다시 실행하세요."; exit 1; }
     else
-        echo "빌드 후 다시 실행하세요 (cd robot_new && make)."; exit 1
+        echo "빌드 후 다시 실행하세요 (make -C robot)."; exit 1
     fi
 fi
 
