@@ -155,6 +155,18 @@
       ]
     },
     {
+      "id": "run_script",
+      "name": "스크립트 실행 (send_order --script)",
+      "mode": "oneshot",
+      "cmd": ["build/bin/send_order", "{id}", "--host", "{host}", "--port", "{port}", "--script", "{script}"],
+      "needs_build": "build/bin/send_order",
+      "stop_timeout_s": 5,
+      "params": [
+        {"key": "id", "label": "로봇 ID", "type": "str", "default": "AMR-001"},
+        {"key": "script", "label": "스크립트 파일 (리포 루트 기준)", "type": "str", "default": "scripts/examples/demo_job.txt"}
+      ]
+    },
+    {
       "id": "make",
       "name": "빌드 (make -C robot)",
       "mode": "oneshot",

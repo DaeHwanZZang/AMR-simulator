@@ -120,6 +120,30 @@ build/bin/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK 
     --param entry=FORWARD --param undock_distance=0.6
 ```
 
+### 텍스트 스크립트로 job 만들기 (`send_order --script`)
+
+FMS 없이 동작을 텍스트 파일에 순서대로 적으면 Order 하나(= job 하나)로 묶어 발행한다. 로봇 쪽은 달라지지 않는다.
+
+```
+// scripts/examples/demo_job.txt
+0 START
+1 MOVE 6 3 0          // x y theta(rad). "90deg" 도 가능, 생략하면 0
+2 WAIT 2              // 직전 MOVE 위치에서 2초
+3 PICK 3              // 같은 자리에서 액션을 연달아 쓰면 같은 좌표 노드가 자동으로 복제된다
+4 MOVE 6 8 1.57
+5 DROP 3
+6 END
+```
+
+- 명령: `MOVE x y [theta]`, `PICK|DROP|CHARGE|WAIT [초] [key=value ...]`, `STRAIGHT|DOCK|PARK key=value ...`, `START`, `END`.
+  액션은 직전 `MOVE` 노드에 붙는다 (첫 액션 앞에는 MOVE 필요). `//` `#` 뒤는 주석, 줄 앞 번호는 무시한다. END 뒤 명령은 오류.
+- 잘못된 줄은 줄 번호와 함께 오류를 내고 발행하지 않는다 (액션 인자는 로봇과 같은 검증).
+
+```bash
+build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt --dry-run   # 발행 없이 컴파일 결과만 출력
+build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt             # order_id 기본값 = 파일명
+```
+
 ### 물리 시뮬레이션 (MuJoCo)
 
 로봇 이동은 MuJoCo 물리 엔진이 계산한다 (기본 동작이고 끌 수 없다). 바퀴 슬립, 관성, 벽과의 접촉이 그대로 나온다.

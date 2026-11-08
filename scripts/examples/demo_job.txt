@@ -1,0 +1,9 @@
+// 예시 job. 사용: build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt
+// empty_hall1 맵 기준 (robot_client --map maps/empty_hall1/fms_map.json --x 3 --y 3)
+0 START
+1 MOVE 6 3 0          // x y theta(rad)
+2 WAIT 2              // 직전 MOVE 위치에서 2초
+3 PICK 3              // 같은 자리에서 연달아 쓰면 노드가 자동 복제된다
+4 MOVE 6 8 1.57
+5 DROP 3
+6 END

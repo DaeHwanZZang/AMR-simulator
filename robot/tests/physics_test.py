@@ -573,9 +573,30 @@ def test_default_localized():
     r.stop()
 
 
+def test_script():
+    """send_order --script: MOVE 2개 + WAIT + PICK(복제 노드) 이 Order 하나로 묶여 끝까지 돈다."""
+    r = Robot("S1", 3, 3)
+    path = f"{SCR}/job.txt"
+    open(path, "w").write("0 START\n1 MOVE 5 3 0   // x y th\n2 WAIT 1\n3 PICK 1\n4 MOVE 5 6 1.57\n5 END\n")
+    run = subprocess.run([f"{REPO}/build/bin/send_order", "S1", "--port", str(PORT), "--script", path], capture_output=True, text=True)
+    check("script: published", run.returncode == 0, run.stderr.strip())
+    s = r.idle_done("job", 60)
+    p = r.pose()
+    check("script: reaches last MOVE", s is not None and dist((p["x"], p["y"]), (5, 6)) < 0.05, f"pose={p}")
+    with r.lock:
+        seen = {(a["action_id"], a["status"])
+                for st in r.states for a in st.get("action_states", [])}
+    ids = {i for i, _ in seen}
+    check("script: WAIT and PICK ran", {"job-A0", "job-A1"} <= ids and ("job-A1", "FINISHED") in seen, f"seen={sorted(seen)}")
+    bad = open(f"{SCR}/bad.txt", "w"); bad.write("WAIT 1\n"); bad.close()
+    run = subprocess.run([f"{REPO}/build/bin/send_order", "S1", "--port", str(PORT), "--script", f"{SCR}/bad.txt"], capture_output=True, text=True)
+    check("script: invalid script is rejected with line number", run.returncode != 0 and "line 1" in run.stderr, run.stderr.strip())
+    r.stop()
+
+
 ALL = {
     "move": test_move, "straight": test_straight, "dock": test_dock_park, "collision": test_collision,
-    "default": test_default_localized,
+    "default": test_default_localized, "script": test_script,
     "pause": test_pause_cancel, "ghost": test_ghost_start, "lowfric": test_low_friction, "slip": test_normal_slip_small,
     "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
 }
