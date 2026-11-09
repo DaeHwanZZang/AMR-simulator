@@ -194,6 +194,25 @@ std::optional<std::vector<Px>> astar(Px start, Px goal, const std::vector<uint8_
     return std::nullopt;
 }
 
+// 정적 팽창 + 동적 장애물 + 허가 없는 교통 구역을 반영한 계획용 grid (2 = 주행 가능)
+std::vector<uint8_t> planning_grid(const MapModel& map_model, double robot_width,
+                                   const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles,
+                                   const std::vector<std::string>& allowed, double traffic_margin) {
+    int radius_px = (int)std::ceil((robot_width / 2) / map_model.metadata.resolution);
+    std::vector<uint8_t> inflated = get_inflated_grid(map_model, radius_px);
+    int w = map_model.metadata.width_px, h = map_model.metadata.height_px;
+    if (dynamic_obstacles && !dynamic_obstacles->empty())
+        inflated = apply_dynamic_obstacles(map_model, inflated, w, h, *dynamic_obstacles, robot_width);
+    if (!map_model.occupancy_zones.empty()) {
+        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+            const auto p = map_model.pixel_to_world(x, y);
+            if (map_model.traffic_blocked(p.first, p.second, traffic_margin, allowed))
+                inflated[(size_t)y*w+x] = 0;
+        }
+    }
+    return inflated;
+}
+
 }  // namespace
 
 std::vector<std::pair<double, double>> plan_path(
@@ -218,19 +237,8 @@ std::vector<std::pair<double, double>> plan_path(
     auto goal_px = map_model.world_to_pixel(goal.first, goal.second);
     if (start_px == goal_px) return {goal};
 
-    int radius_px = (int)std::ceil((robot_width / 2) / map_model.metadata.resolution);
-    std::vector<uint8_t> inflated = get_inflated_grid(map_model, radius_px);
-    int w = map_model.metadata.width_px, h = map_model.metadata.height_px;
-    if (dynamic_obstacles && !dynamic_obstacles->empty())
-        inflated = apply_dynamic_obstacles(map_model, inflated, w, h, *dynamic_obstacles, robot_width);
-    if (!map_model.occupancy_zones.empty()) {
-        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
-            const auto p = map_model.pixel_to_world(x, y);
-            if (map_model.traffic_blocked(p.first, p.second, traffic_margin, allowed))
-                inflated[(size_t)y*w+x] = 0;
-        }
-    }
-
+    std::vector<uint8_t> inflated = planning_grid(map_model, robot_width, dynamic_obstacles, allowed, traffic_margin);
+    const int w = map_model.metadata.width_px, h = map_model.metadata.height_px;
     auto drivable = [&](int px, int py) {
         return px >= 0 && px < w && py >= 0 && py < h && inflated[(size_t)py * w + px] == 2;
     };
@@ -260,6 +268,62 @@ std::vector<std::pair<double, double>> plan_path(
     if (!waypoints.empty()) waypoints.back() = goal;
     else waypoints = {goal};
     return waypoints;
+}
+
+std::vector<std::pair<double, double>> smooth_path(
+    const MapModel& map_model, const std::vector<std::pair<double, double>>& path, double robot_width, double robot_length,
+    const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles,
+    const std::vector<std::string>* allowed_zone_ids, const SmoothParams& prm) {
+    if (path.size() < 3) return path;
+    const std::vector<std::string> empty;
+    const auto& allowed = allowed_zone_ids ? *allowed_zone_ids : empty;
+    const double traffic_margin = std::hypot(robot_width, robot_length) / 2 + 0.1;
+    const std::vector<uint8_t> grid = planning_grid(map_model, robot_width, dynamic_obstacles, allowed, traffic_margin);
+    const int w = map_model.metadata.width_px, h = map_model.metadata.height_px;
+    auto free_at = [&](double x, double y) {
+        auto [px, py] = map_model.world_to_pixel(x, y);
+        return px >= 0 && px < w && py >= 0 && py < h && grid[(size_t)py * w + px] == 2;
+    };
+    using P = std::pair<double, double>;
+    std::vector<P> out = {path.front()};
+    for (size_t i = 1; i + 1 < path.size(); ++i) {
+        const P prev = path[i - 1], cur = path[i], next = path[i + 1];
+        double ix = cur.first - prev.first, iy = cur.second - prev.second;
+        double ox = next.first - cur.first, oy = next.second - cur.second;
+        double len_in = std::hypot(ix, iy), len_out = std::hypot(ox, oy);
+        if (len_in < 1e-6 || len_out < 1e-6) { out.push_back(cur); continue; }
+        ix /= len_in; iy /= len_in; ox /= len_out; oy /= len_out;
+        double phi = std::acos(std::clamp(ix * ox + iy * oy, -1.0, 1.0));  // 꺾임각
+        if (phi < prm.min_turn || phi > prm.max_turn) { out.push_back(cur); continue; }
+        // 접선 길이 d = R tan(phi/2). 이웃 코너의 곡선과 겹치지 않게 각 구간의 45% 까지만 쓴다
+        double d = std::min({prm.radius * std::tan(phi / 2), 0.45 * len_in, 0.45 * len_out});
+        bool done = false;
+        for (int attempt = 0; attempt < 4 && d >= 0.05 && !done; ++attempt, d *= 0.5) {
+            const P a{cur.first - ix * d, cur.second - iy * d}, b{cur.first + ox * d, cur.second + oy * d};
+            const double r_eff = d / std::tan(phi / 2);
+            const double hdl = 4.0 / 3.0 * std::tan(phi / 4) * r_eff;  // 원호에 가까운 3차 Bézier 제어점 길이
+            const P c1{a.first + ix * hdl, a.second + iy * hdl}, c2{b.first - ox * hdl, b.second - oy * hdl};
+            const double arc = r_eff * phi;
+            const int n = std::max(4, (int)std::ceil(arc / prm.step));
+            const int check = std::max(n, (int)std::ceil(arc / map_model.metadata.resolution));
+            bool ok = true;
+            for (int k = 0; k <= check && ok; ++k) {
+                double s = (double)k / check, u = 1 - s;
+                ok = free_at(u*u*u*a.first + 3*u*u*s*c1.first + 3*u*s*s*c2.first + s*s*s*b.first,
+                             u*u*u*a.second + 3*u*u*s*c1.second + 3*u*s*s*c2.second + s*s*s*b.second);
+            }
+            if (!ok) continue;  // 곡선이 팽창 장애물에 걸린다 -> 크기를 줄여 다시
+            for (int k = 0; k <= n; ++k) {
+                double s = (double)k / n, u = 1 - s;
+                out.push_back({u*u*u*a.first + 3*u*u*s*c1.first + 3*u*s*s*c2.first + s*s*s*b.first,
+                               u*u*u*a.second + 3*u*u*s*c1.second + 3*u*s*s*c2.second + s*s*s*b.second});
+            }
+            done = true;
+        }
+        if (!done) out.push_back(cur);  // 곡선화 실패: 원래 코너 (정지·회전)
+    }
+    out.push_back(path.back());
+    return out;
 }
 
 }  // namespace fms

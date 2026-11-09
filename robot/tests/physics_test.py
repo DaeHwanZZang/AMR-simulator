@@ -432,6 +432,33 @@ def test_loop_map():
     r.stop()
 
 
+def _corner_run(rid, extra):
+    """gen_loop 에서 (1,9) -> (12,12): 한 노드 구간 안에 90도 코너가 있다. (소요 시간, 코너 구간 최소 속도, 에러, 최종 자세)"""
+    m = f"{REPO}/maps/gen_loop/fms_map.json"
+    r = Robot(rid, 1, 9, mapfile=m, extra=extra)
+    t0 = time.time()
+    r.order(rid.lower(), ["12,12,0"])
+    s = r.idle_done(rid.lower(), 90)
+    dur = time.time() - t0
+    rows = [x for x in r.csv_rows() if x["order_id"] == rid.lower()]
+    # 코너(12,9) 근처 1.2 m 안에서의 실제 속도
+    near = [abs(float(x["v_fwd"])) for x in rows if math.hypot(float(x["x"]) - 12, float(x["y"]) - 9) < 1.2]
+    errs = r.state["errors"]
+    p = r.pose()
+    r.stop()
+    return s, dur, (min(near) if near else None), errs, p, max((abs(float(x["v_fwd"])) for x in rows), default=0)
+
+
+def test_curve():
+    """곡선 주행: 90도 코너에서 서지 않고 지나간다. --no-smooth-path 는 코너에서 선다 (비교)."""
+    s, dur, vmin, errs, p, vmax = _corner_run("C1", [])
+    check("curve: completes without error", s is not None and not errs and dist((p["x"], p["y"]), (12, 12)) < 0.05, f"state={s and s['state']} errors={errs} pose={p}")
+    check("curve: does not stop at the 90deg corner", vmin is not None and vmin >= 0.3, f"min v near corner={vmin} (vmax={vmax:.2f}) dur={dur:.1f}s")
+    s2, dur2, vmin2, errs2, p2, _ = _corner_run("C2", ["--no-smooth-path"])
+    check("curve: --no-smooth-path still completes (stops at corner)", s2 is not None and not errs2 and dist((p2["x"], p2["y"]), (12, 12)) < 0.05, f"state={s2 and s2['state']} errors={errs2} min v={vmin2} dur={dur2:.1f}s")
+    check("curve: smooth is faster than no-smooth", dur < dur2, f"{dur:.1f}s vs {dur2:.1f}s")
+
+
 def test_longrun():
     # 55 m 가로지르기: 벽 창(window)이 여러 번 다시 잡힌다. 자세가 끊기지 않아야 한다.
     r = Robot("R1", 2, 3)
@@ -624,7 +651,7 @@ def test_script():
 
 ALL = {
     "move": test_move, "straight": test_straight, "dock": test_dock_park, "collision": test_collision,
-    "default": test_default_localized, "script": test_script, "lazy": test_lazy_plan,
+    "default": test_default_localized, "script": test_script, "curve": test_curve, "lazy": test_lazy_plan,
     "pause": test_pause_cancel, "ghost": test_ghost_start, "lowfric": test_low_friction, "slip": test_normal_slip_small,
     "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
 }

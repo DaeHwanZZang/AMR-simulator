@@ -152,6 +152,11 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
   - 교통 구역: 맵 폴더 `annotations.json` 의 `occupancy` 구역과 노드 `allowed_zone_ids`, `Order.traffic_control`. 허가 없는 구역은 재계획에서 막고 직선 이동은 `TRAFFIC_BLOCKED`(FATAL). 구역 정의는 FMS 가 만든 번들에서 온다 (이 리포에는 편집기가 없다).
   - 복도 중앙 주행: planner A* 에 벽 근접 비용을 더한다. `--no-center-path`, `--center-weight`(6), `--center-reach`(1.5 m).
   - 오더를 받으면 경로계획 전에 State 를 바로 한 번 발행한다 (`on_order_received`).
+- **곡선 주행 (기본 켜짐, `--no-smooth-path` 로 끔)**:
+  - 계획: `plan_segment_path()` 가 구간(노드 1개)의 A* 경유점을 (PSO 뒤에) `smooth_path()`(`planner.cpp`)로 다듬는다. 중간 코너마다 접선이 이어지는 3차 Bézier(목표 반경 0.6 m, 접선 길이는 이웃 구간의 45% 이하)를 샘플(0.1 m)로 넣는다. 샘플이 계획용 팽창 grid 의 비-주행 칸에 걸리면 크기를 절반씩 줄이고, 끝내 안 되면 그 코너는 원래대로 둔다(정지·회전). 꺾임각 0.05 rad 미만(직선)/2.6 rad 초과(U턴)는 곡선화하지 않는다. `SmoothParams`.
+  - 추종: `TrapezoidalKinematics::set_path(path, pursuit=true)` 면 `step_ideal` 이 경유점 대신 속도 비례 전방 주시점(0.35 + 0.5 v, 최대 1 m)을 겨냥하고(Pure Pursuit), 곡률 속도 제한(`curvature_speed_cap`: v ≤ 0.8 w_max / κ, 그 지점까지 감속 가능한 범위)을 건다. 경로를 따라 끌고 가지 않고 heading 방향으로 나아가며(조향은 주시점이 한다), 지나친 점은 걷어 낸다. 마지막 점 접근·정지·최종 정렬·3 cm 도착·`goal_` 재걸기는 기존 규칙 그대로다. 곡선을 달리는 중 방위 허용치는 0.6 rad, 서 있다 출발할 때는 0.15 rad(주시점 방위가 추정 노이즈에 흔들려서).
+  - FMS 노드는 곡선으로 통과하지 않는다: 노드마다 정지·정렬한다(위 "경로계획"). 곡선은 한 노드 구간 안의 A* 코너에만 적용된다. STRAIGHT/DOCK 진입·탈출은 별도 직선 제어라 해당 없다.
+  - `State.local_path` 는 이제 곡선 샘플이 포함된 추종 경로다(직선 구간은 끝점만). 남은 단계(Global/Local 분리, 장애물 우회, 워커)는 M2~M4 로 미구현.
 - **직선 이동 / 도킹 / 주차** (v1.4):
   - `straight_`(StraightMotion: ACTION/DOCK_IN/UNDOCK)가 있으면 `tick` 은 `tick_straight` 만 돈다. 경로계획 없이 `kinematics.set_straight()` 로 heading 을 유지한 채 목표점까지 간다. PAUSE/e-stop 은 kinematics 쪽 목표를 지우므로 executor 가 목표를 들고 있다가 재개 때 다시 건다. `replan()` 은 `straight_` 가 있으면 아무것도 안 한다.
   - STRAIGHT: 노드 도착·정렬 후 노드 theta 방향 `distance` 만큼.

@@ -27,6 +27,15 @@ constexpr double kMovingSpeed = 0.05;            // m/s, "달리는 중" 기준
 constexpr double kVelocityBand = 0.3;            // m/s
 constexpr double kAngularBand = 0.5;             // rad/s
 
+// Pure Pursuit (곡선 경로). 전방 주시 거리 = clamp(min + gain * 속도), 곡률 속도 제한은 각속도 한계의 일부만 쓴다.
+constexpr double kLookaheadMin = 0.35;           // m
+constexpr double kLookaheadMax = 1.0;            // m
+constexpr double kLookaheadGain = 0.5;           // s
+constexpr double kPursuitHeadingTolerance = 0.6; // rad, 곡선을 달리는 중에는 이 안이면 멈추지 않고 조향한다
+constexpr double kPursuitStartTolerance = 0.15;  // rad, 서 있다가 출발할 때 (전방 주시점 방위는 추정 노이즈에 흔들린다)
+constexpr double kCurveOmegaFraction = 0.8;      // 곡선에서 쓰는 각속도 비율 (여유)
+constexpr double kCurveMinSpeed = 0.2;           // m/s, 곡률 제한이 아무리 강해도 이 속도 밑으로는 내리지 않는다 (서는 건 모퉁이 규칙이 한다)
+
 constexpr double kWaypointReach = 0.05;       // m, 물리 모드: 이 안의 경유점은 이미 닿은 것으로 보고 건너뛴다 (마지막 점 제외)
 constexpr double kAimMinDist = 0.02;          // m, 물리 모드: 목표 경유점이 이보다 가까우면 방위를 목표로 돌리지 않고 유지한다 (도착 허용 3 cm 보다 작아야 마지막 보정 접근이 된다)
 constexpr double kStraightAlong = 0.01;       // m, 직선 이동 도착: 진행 방향 남은 거리 (옆 방향 오차는 직선으로 못 고친다)
@@ -59,6 +68,9 @@ double TrapezoidalKinematics::stop_distance_ahead() const {
     if (remaining_.empty()) return 0.0;
     double total = std::hypot(remaining_[0].first - x, remaining_[0].second - y);
     double prev_dir = std::atan2(remaining_[0].second - y, remaining_[0].first - x);
+    // 곡선 경로: 첫 점이 코앞이면 로봇->첫 점 방향은 추정 노이즈라 모퉁이 판정에 쓰지 않는다
+    if (pursuit_ && remaining_.size() > 1 && total < 0.3)
+        prev_dir = std::atan2(remaining_[1].second - remaining_[0].second, remaining_[1].first - remaining_[0].first);
     for (size_t i = 0; i + 1 < remaining_.size(); ++i) {
         double dx = remaining_[i + 1].first - remaining_[i].first, dy = remaining_[i + 1].second - remaining_[i].second;
         double len = std::hypot(dx, dy);
@@ -69,6 +81,48 @@ double TrapezoidalKinematics::stop_distance_ahead() const {
         prev_dir = dir;
     }
     return total;
+}
+
+std::pair<double, double> TrapezoidalKinematics::lookahead_point(double dist) const {
+    double px = x, py = y, left = dist;
+    for (const auto& p : remaining_) {
+        double seg = std::hypot(p.first - px, p.second - py);
+        if (seg >= left && seg > 1e-9) {
+            double f = left / seg;
+            return {px + (p.first - px) * f, py + (p.second - py) * f};
+        }
+        left -= seg;
+        px = p.first; py = p.second;
+    }
+    return remaining_.back();
+}
+
+double TrapezoidalKinematics::curvature_speed_cap() const {
+    // 앞쪽 각 꼭짓점의 곡률 κ = (방향 변화) / (이웃 구간 평균 길이). 거기서 허용 속도는 각속도 한계로 정해지고,
+    // 지금 속도는 그 지점까지 감속할 수 있는 범위(v^2 = v_i^2 + 2 d s)여야 한다.
+    double cap = max_velocity;
+    if (remaining_.size() < 2) return cap;
+    const double w_lim = kCurveOmegaFraction * max_angular_velocity;
+    const double horizon = max_velocity * max_velocity / (2 * std::max(max_deceleration, 1e-3)) + 1.0;
+    double s = std::hypot(remaining_[0].first - x, remaining_[0].second - y);  // 로봇 -> remaining_[i] 경로 길이
+    double prev_len = -1.0, prev_dir = 0.0;
+    for (size_t i = 0; i + 1 < remaining_.size() && s <= horizon; ++i) {
+        double dx = remaining_[i + 1].first - remaining_[i].first, dy = remaining_[i + 1].second - remaining_[i].second;
+        double len = std::hypot(dx, dy);
+        if (len < 1e-9) continue;
+        double dir = std::atan2(dy, dx);
+        if (prev_len > 0) {
+            double dth = std::abs(normalize_angle(dir - prev_dir));
+            if (dth > 0.02) {
+                double kappa = dth / (0.5 * (prev_len + len));
+                double vi = std::clamp(w_lim / kappa, kCurveMinSpeed, max_velocity);
+                cap = std::min(cap, std::sqrt(vi * vi + 2 * max_deceleration * s));
+            }
+        }
+        s += len;
+        prev_len = len; prev_dir = dir;
+    }
+    return cap;
 }
 
 void TrapezoidalKinematics::advance(double dist) {
@@ -157,14 +211,28 @@ RobotKinematicState TrapezoidalKinematics::step_ideal(double dt) {
                std::hypot(remaining_[0].first - x, remaining_[0].second - y) < kWaypointReach)
             remaining_.erase(remaining_.begin());
     }
+    if (world_ && pursuit_) {
+        // 곡선 경로: 이미 지나친 점(경로 진행 방향으로 로봇이 점을 넘어섰다)도 걷어 낸다. 옆으로 비껴 있는 점을 향해 가지 않게.
+        while (remaining_.size() > 1) {
+            double vx = remaining_[1].first - remaining_[0].first, vy = remaining_[1].second - remaining_[0].second;
+            if ((remaining_[0].first - x) * vx + (remaining_[0].second - y) * vy > 0) break;
+            remaining_.erase(remaining_.begin());
+        }
+    }
     double remaining_dist = remaining_length();
     bool has_target = false;
     double heading_error = 0.0;
 
 
     //경로가 남았을 때 목적지까지의 방향으로 회전
+    const bool pursuit = world_ && pursuit_ && !remaining_.empty();
     if (remaining_dist > 1e-9) {
-        double dx = remaining_[0].first - x, dy = remaining_[0].second - y;
+        double ax = remaining_[0].first, ay = remaining_[0].second;
+        if (pursuit) {  // 곡선 경로: 속도에 비례한 전방 주시점을 겨냥한다
+            auto la = lookahead_point(std::clamp(kLookaheadMin + kLookaheadGain * velocity_, kLookaheadMin, kLookaheadMax));
+            ax = la.first; ay = la.second;
+        }
+        double dx = ax - x, dy = ay - y;
         bool too_close = world_ && std::hypot(dx, dy) < kAimMinDist;  // 방위가 노이즈에 좌우된다 -> 지금 방위 유지
         heading_error = rotate_step(too_close ? theta : std::atan2(dy, dx), dt);
         has_target = true;
@@ -178,10 +246,12 @@ RobotKinematicState TrapezoidalKinematics::step_ideal(double dt) {
 
     // 목표 방향으로 정렬되기 전까지는 직진하지 않는다 (제자리 회전 후 전진).
     double facing_tol = kHeadingTolerance;
-    if (world_ && remaining_dist > 1e-9) facing_tol = velocity_ > kMovingSpeed ? kMovingHeadingTolerance : kStartHeadingTolerance;
+    if (world_ && remaining_dist > 1e-9) facing_tol = velocity_ > kMovingSpeed ? (pursuit ? kPursuitHeadingTolerance : kMovingHeadingTolerance)
+                                              : (pursuit ? kPursuitStartTolerance : kStartHeadingTolerance);
     bool facing = !has_target || std::abs(heading_error) < facing_tol;
 
     double accel;
+    double vtop = max_velocity;
     double stop_limit = remaining_dist;  // 이번 tick 에 이 거리 이상은 가지 않는다 (모퉁이에서 서기 위해)
     if (!facing || remaining_dist < 1e-9) {
         accel = velocity_ > 1e-9 ? -max_deceleration : 0.0;
@@ -189,14 +259,24 @@ RobotKinematicState TrapezoidalKinematics::step_ideal(double dt) {
         double stop_dist = max_deceleration > 0 ? (velocity_ * velocity_) / (2 * max_deceleration) : 0.0;
         // 물리 모드는 모퉁이(큰 꺾임)에서 서도록 거기까지를 감속 기준으로 쓴다
         double brake_ahead = world_ ? stop_distance_ahead() : remaining_dist;
+        const double vlim = pursuit ? std::min(max_velocity, curvature_speed_cap()) : max_velocity;
         if (brake_ahead <= stop_dist) accel = -max_deceleration;
-        else if (velocity_ < max_velocity) accel = max_acceleration;
+        else if (velocity_ < vlim) accel = max_acceleration;
+        else if (pursuit && velocity_ > vlim + 0.02) accel = -max_deceleration;  // 곡률/모퉁이 앞에서 속도를 줄인다
         else accel = 0.0;
         stop_limit = brake_ahead;
+        vtop = vlim;
     }
-    double new_velocity = std::max(0.0, std::min(max_velocity, velocity_ + accel * dt));
+    double new_velocity = std::max(0.0, std::min(accel > 0 ? vtop : max_velocity, velocity_ + accel * dt));
     double move_dist = facing ? std::min({(velocity_ + new_velocity) / 2 * dt, remaining_dist, stop_limit}) : 0.0;
-    advance(move_dist);
+    if (pursuit && remaining_.size() > 1) {
+        // 곡선 경로: 경유점을 향해 직선으로 끌고 가지 않고 지금 heading 으로 나아간다 (조향은 전방 주시점이 한다).
+        // 지나간 점은 위에서 걷어 낸다. 마지막 점이 남으면 아래 else 처럼 정확히 그 점으로 들어간다.
+        x += std::cos(theta) * move_dist;
+        y += std::sin(theta) * move_dist;
+    } else {
+        advance(move_dist);
+    }
 
     velocity_ = remaining_length() > 1e-9 ? new_velocity : 0.0;
     acceleration_ = accel;

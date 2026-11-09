@@ -35,8 +35,11 @@ public:
           max_deceleration(max_d), max_angular_velocity(max_angular_v), max_angular_acceleration(max_angular_a) {}
 
     // 경로가 바뀌면 최종 정렬 목표(final_theta_)는 해제한다. 필요하면 set_final_theta 로 다시 지정.
-    void set_path(std::vector<std::pair<double, double>> waypoints) {
+    // pursuit=true 면 (곡선으로 다듬은 촘촘한 경로) 경유점을 하나씩 겨냥하지 않고 속도에 비례한 전방 주시점을 겨냥하며,
+    // 곡률에 맞춰 속도를 줄인다 (Pure Pursuit). 마지막 지점 도착/정지/최종 정렬은 같은 규칙이다.
+    void set_path(std::vector<std::pair<double, double>> waypoints, bool pursuit = false) {
         goal_ = waypoints.empty() ? std::nullopt : std::optional(waypoints.back());
+        pursuit_ = pursuit;
         remaining_ = std::move(waypoints);
         final_theta_.reset();
         straight_.reset();
@@ -85,6 +88,7 @@ private:
 
     // -- 물리 모드 --
     PhysicsWorld* world_ = nullptr;
+    bool pursuit_ = false;                            // set_path 의 pursuit
     std::optional<std::pair<double, double>> goal_;  // 경로 마지막 지점. 이상 궤적이 끝났는데 실제로는 못 닿았으면 다시 건다
     double straight_theta_ = 0.0;                     // 직선 이동 중 유지할 heading
     Straight straight_goal_{0, 0, 0};                 // 직선 이동의 원래 목표. straight_ 목표는 매 tick 진행선 위로 투영한다
@@ -102,6 +106,8 @@ private:
 
     double remaining_length() const;
     double stop_distance_ahead() const;
+    std::pair<double, double> lookahead_point(double dist) const;  // 지금 위치에서 경로를 dist 만큼 따라간 점
+    double curvature_speed_cap() const;                            // 앞쪽 곡률 때문에 지금 허용되는 최고 속도
     void advance(double dist);
     // target_theta 로 사다리꼴 각가속도 프로파일을 따라 회전. 회전 후 남은 각도 오차 반환.
     double rotate_step(double target_theta, double dt);

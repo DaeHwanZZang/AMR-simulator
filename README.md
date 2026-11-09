@@ -120,6 +120,12 @@ build/bin/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK 
     --param entry=FORWARD --param undock_distance=0.6
 ```
 
+### 곡선 주행
+
+경로의 중간 코너를 Bézier 곡선으로 다듬고 Pure Pursuit 로 추종해서 일반 코너에서 서지 않고 지나간다(`gen_loop` 90° 코너 최소 속도 약 0.7 m/s,
+끄면 0). 공간이 부족한 코너와 출발/최종 자세 정렬은 이전처럼 정지·회전한다. FMS 노드(오더 노드)마다 정지·정렬하는 규칙은 그대로다.
+`--no-smooth-path` 로 끄면 코너마다 정지·회전한다(비교용). 구조는 CLAUDE.md "곡선 주행".
+
 ### 텍스트 스크립트로 job 만들기 (`send_order --script`)
 
 FMS 없이 동작을 텍스트 파일에 순서대로 적으면 Order 하나(= job 하나)로 묶어 발행한다. 로봇 쪽은 달라지지 않는다.

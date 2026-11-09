@@ -40,6 +40,7 @@
         {"if": "record", "args": ["--record", "{record}"]},
         {"if": "gui", "args": ["--gui"]},
         {"if": "path_refine", "args": ["--path-refine"]},
+        {"if": "no_smooth", "args": ["--no-smooth-path"]},
         {"if": "obstacle_zone", "args": [
           "--obstacle-zone", "{obstacle_zone}",
           "--obstacle-spawn-interval", "{obstacle_spawn_interval}",
@@ -59,6 +60,7 @@
         {"key": "y", "label": "시작 y (m)", "type": "float", "default": 0.0},
         {"key": "theta", "label": "시작 theta (rad)", "type": "float", "default": 0.0},
         {"key": "gui", "label": "제어판(GUI) 창", "type": "bool", "default": false},
+        {"key": "no_smooth", "label": "곡선 주행 끄기 (코너마다 정지·회전)", "type": "bool", "default": false},
         {"key": "path_refine", "label": "PSO 경로 다듬기", "type": "bool", "default": false},
         {"group": "물리", "key": "robot_width", "label": "로봇 폭 (m)", "type": "float", "default": 0.5},
         {"group": "물리", "key": "robot_length", "label": "로봇 길이 (m)", "type": "float", "default": 0.7},

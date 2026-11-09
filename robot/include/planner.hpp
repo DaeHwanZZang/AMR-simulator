@@ -36,4 +36,19 @@ std::vector<std::pair<double, double>> plan_path(
     const std::vector<std::string>* allowed_zone_ids = nullptr,
     const ClearanceField* clearance = nullptr, const CenterlineParams* centering = nullptr);
 
+// 곡선 주행. A* 경유점의 중간 코너를 접선이 이어지는 3차 Bézier 샘플로 바꾼다 (시작/끝 점은 그대로).
+// 곡선 샘플이 계획용 팽창 grid 의 비-주행 칸에 걸리면 크기를 절반씩 줄이고, 끝내 안 되면 그 코너는 원래대로 둔다.
+// 꺾임각이 min_turn 미만(거의 직선)이거나 max_turn 초과(U턴 급)면 곡선화하지 않는다.
+struct SmoothParams {
+    double radius = 0.6;     // m, 목표 코너 반경 (구간이 짧으면 작아진다)
+    double min_turn = 0.05;  // rad
+    double max_turn = 2.6;   // rad
+    double step = 0.1;       // m, 샘플 간격
+};
+std::vector<std::pair<double, double>> smooth_path(
+    const MapModel& map_model, const std::vector<std::pair<double, double>>& path,
+    double robot_width = 0.5, double robot_length = 0.7,
+    const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles = nullptr,
+    const std::vector<std::string>* allowed_zone_ids = nullptr, const SmoothParams& params = SmoothParams());
+
 }  // namespace fms

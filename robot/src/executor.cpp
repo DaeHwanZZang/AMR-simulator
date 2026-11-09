@@ -556,7 +556,7 @@ void OrderExecutor::try_dynamic_replan(const std::vector<DynamicObstacle>& detec
     for (auto& o : detected) obstacles.emplace_back(o.x, o.y, o.width, o.height);
     try {
         auto path = plan_segment_path(&obstacles);
-        kinematics.set_path(path);
+        kinematics.set_path(path, smooth_enabled && map != nullptr);
         kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
         log::info("[%s] replanned around dynamic obstacle (%zu detected)", robot_id.c_str(), detected.size());
     } catch (const PlanningError& e) {
@@ -754,7 +754,7 @@ void OrderExecutor::replan() {
     try {
         auto path = plan_segment_path();
         log::info("[%s] path planned: %zu waypoints", robot_id.c_str(), path.size());
-        kinematics.set_path(path);
+        kinematics.set_path(path, smooth_enabled && map != nullptr);
         kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
     } catch (const PlanningError& e) {
         log::error("[%s] path planning failed: %s", robot_id.c_str(), e.what());
@@ -794,6 +794,8 @@ std::vector<std::pair<double, double>> OrderExecutor::plan_segment_path(
         if (path_refine.enabled && !dynamic_obstacles && seg.size() >= 2 && map->occupancy_zones.empty()) {
             seg = refine_path(*map, *clearance_, start, seg, robot_width, path_refine);
         }
+        // 곡선 주행: 중간 코너를 Bézier 로 다듬는다 (PSO 이후). 실패한 코너는 원래대로 둔다.
+        if (smooth_enabled) seg = smooth_path(*map, seg, robot_width, robot_length, dynamic_obstacles, &allowed, smooth);
         full_path.insert(full_path.end(), seg.begin(), seg.end());
         segment_wp_bounds_.push_back(full_path.size());
         start = target;

@@ -48,6 +48,7 @@ struct Args {
     std::string log_level = "INFO";
     bool gui = false;
     bool path_refine = false;
+    bool smooth_path = true;              // 곡선 주행 (코너 Bézier + Pure Pursuit)
     bool center_path = true;              // 복도 중앙 주행 (A* 벽 근접 페널티)
     double center_weight = 6.0, center_reach = 1.5;
     double friction = 0.8;                // 바퀴-바닥 마찰계수 (물리)
@@ -109,6 +110,7 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--log-level") a.log_level = next(i);
         else if (k == "--gui") a.gui = true;
         else if (k == "--path-refine") a.path_refine = true;
+        else if (k == "--no-smooth-path") a.smooth_path = false;
         else if (k == "--no-center-path") a.center_path = false;
         else if (k == "--center-weight") a.center_weight = std::stod(next(i));
         else if (k == "--center-reach") a.center_reach = std::stod(next(i));
@@ -139,6 +141,7 @@ bool parse_args(int argc, char** argv, Args& a) {
                 "  --require-localization (UNLOCALIZED 로 시작, INIT_POSITION 힌트/제어판 전에는 오더 거절. 기본은 시작 자세에서 바로 LOCALIZED)\n"
                 "  --seed N --speed-noise R --log-level LV --gui\n"
                 "  --path-refine (A* 경로를 PSO 로 다듬기, 기본 꺼짐)\n"
+                "  --no-smooth-path (곡선 주행 끄기 = 코너마다 정지·회전, 비교용)\n"
                 "  --no-center-path (복도 중앙 주행 끄기 = 최단 경로) --center-weight W (기본 6) --center-reach M (기본 1.5)\n"
                 "  --friction MU (바퀴-바닥 마찰계수, 기본 0.8. 낮으면 슬립이 생긴다) --mass KG (기본 60)\n"
                 "  --loc-rate HZ (라이다 위치보정 주기, 기본 5. 0 이면 보정 없는 순수 오도메트리)\n"
@@ -318,6 +321,7 @@ int main(int argc, char** argv) {
     }
 
     executor.path_refine.enabled = args.path_refine;
+    executor.smooth_enabled = args.smooth_path;
     executor.centerline.enabled = args.center_path;
     executor.centerline.weight = args.center_weight;
     executor.centerline.reach = args.center_reach;
