@@ -17,6 +17,7 @@
 #include "map_model.hpp"
 #include "path_refine.hpp"
 #include "planner.hpp"
+#include "local_planner.hpp"
 #include "physics_world.hpp"
 #include "recorder.hpp"
 #include "scan_matcher.hpp"
@@ -40,6 +41,8 @@ public:
     PathRefineParams path_refine;   // enabled=false 가 기본 (A* 결과 그대로 사용)
     bool smooth_enabled = true;     // 곡선 주행 (코너 Bézier + Pure Pursuit). --no-smooth-path 로 끔
     SmoothParams smooth;
+    LocalPlanner local_planner;     // 장애물 우회 (config.radius = --local-plan-radius)
+    double local_plan_rate = 5.0;   // Hz, --local-plan-rate
     CenterlineParams centerline;    // 복도 중앙 주행. enabled=true 가 기본 (--no-center-path 로 끔)
     std::unique_ptr<Recorder> recorder;  // 있으면 tick 마다 한 줄 기록 (--record)
     // 로컬라이징 (가상 라이다 + 스캔 매칭). 힌트를 받고 localize_time 초 뒤에 매칭 결과로 끝난다
@@ -144,11 +147,11 @@ private:
     std::optional<std::pair<std::string, int>> last_completed_;
 
     std::vector<int> segment_;  // 지금 계획/주행 중인 목적지 노드 (항상 최대 1개: 도착한 뒤에 다음 노드를 계획한다)
-    // 이번 세그먼트 경로계획 결과. segment_wp_bounds_[k] = segment_[k] 노드에
-    // 도달하는 시점의 누적 경유점 개수. 세그먼트 중간에서 멈췄다가(EMERGENCY/PAUSE/
-    // MANUAL) 재개할 때 이미 지나온 노드로 되돌아가지 않도록 진행도를 추적한다.
-    std::vector<size_t> segment_wp_bounds_;
-    size_t segment_wp_total_ = 0;
+    // 구간의 정상 경로(장애물 없이 계획한 최종 경로). 장애물 우회/복귀의 기준이 된다.
+    std::vector<std::pair<double, double>> leg_nominal_;
+    size_t leg_progress_ = 0;      // leg_nominal_ 에서 로봇이 지나는 구간 번호 (단조 증가)
+    bool detour_active_ = false;   // 우회 경로를 따라가는 중
+    double since_local_plan_ = 1.0;
     std::optional<Action> acting_;
     double acting_elapsed_ = 0.0;
 
@@ -180,7 +183,6 @@ private:
     void fail_action(const char* error_type, const std::string& desc);
 
     double sim_time_ = 0.0;  // 시작 후 누적 tick 시간 (기록용)
-    double since_dynamic_replan_ = 0.0;
     std::set<std::string> detected_obstacle_ids_;
     std::vector<DynamicObstacle> last_detected_;
 
@@ -190,7 +192,9 @@ private:
     bool apply_order_update(const Order& order);
     std::vector<DynamicObstacle> update_detections();
     bool path_blocked_by(const std::vector<DynamicObstacle>& detected) const;
-    void try_dynamic_replan(const std::vector<DynamicObstacle>& detected);
+    // 장애물 처리: 달리면서 우회/복귀. true 면 이번 tick 은 정지(대기)로 처리했다.
+    bool handle_obstacles(double dt, const std::vector<DynamicObstacle>& detected);
+    void restore_nominal();
     bool check_collision(double x, double y, double prev_x, double prev_y);
     void tick_logic(double dt);
     void record_sample(double dt);
@@ -206,7 +210,6 @@ private:
     void replan();
     std::vector<std::pair<double, double>> plan_segment_path(
         const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles = nullptr);
-    void consume_reached_nodes();
     void on_segment_arrived();
     void clear_order();
     void set_action_status(const std::string& action_id, ActionStatus st);

@@ -31,6 +31,8 @@ constexpr double kAngularBand = 0.5;             // rad/s
 constexpr double kLookaheadMin = 0.35;           // m
 constexpr double kLookaheadMax = 1.0;            // m
 constexpr double kLookaheadGain = 0.5;           // s
+constexpr double kCutLimit = 0.04;           // m, 곡선에서 허용하는 코너 안쪽 가로지름
+constexpr double kLookaheadFloor = 0.3;         // m, 곡률 때문에 줄여도 이 밑으로는 안 내린다
 constexpr double kPursuitHeadingTolerance = 0.6; // rad, 곡선을 달리는 중에는 이 안이면 멈추지 않고 조향한다
 constexpr double kPursuitStartTolerance = 0.15;  // rad, 서 있다가 출발할 때 (전방 주시점 방위는 추정 노이즈에 흔들린다)
 constexpr double kCurveOmegaFraction = 0.8;      // 곡선에서 쓰는 각속도 비율 (여유)
@@ -95,6 +97,25 @@ std::pair<double, double> TrapezoidalKinematics::lookahead_point(double dist) co
         px = p.first; py = p.second;
     }
     return remaining_.back();
+}
+
+double TrapezoidalKinematics::max_curvature_ahead(double horizon) const {
+    // 앞 horizon(m) 안 꼭짓점들의 곡률 κ = (방향 변화) / (이웃 구간 평균 길이) 중 최대
+    double kmax = 0.0, s = std::hypot(remaining_[0].first - x, remaining_[0].second - y);
+    double prev_len = -1.0, prev_dir = 0.0;
+    for (size_t i = 0; i + 1 < remaining_.size() && s <= horizon; ++i) {
+        double dx = remaining_[i + 1].first - remaining_[i].first, dy = remaining_[i + 1].second - remaining_[i].second;
+        double len = std::hypot(dx, dy);
+        if (len < 1e-9) continue;
+        double dir = std::atan2(dy, dx);
+        if (prev_len > 0) {
+            double dth = std::abs(normalize_angle(dir - prev_dir));
+            if (dth > 0.02) kmax = std::max(kmax, dth / (0.5 * (prev_len + len)));
+        }
+        s += len;
+        prev_len = len; prev_dir = dir;
+    }
+    return kmax;
 }
 
 double TrapezoidalKinematics::curvature_speed_cap() const {
@@ -178,7 +199,7 @@ RobotKinematicState TrapezoidalKinematics::step_straight(double dt) {
     angular_velocity_ = 0.0;
     double dx = straight_->tx - x, dy = straight_->ty - y;
     double dist = std::hypot(dx, dy);
-    double vmax = std::min(max_velocity, straight_->max_speed);
+    double vmax = std::min({max_velocity, speed_cap, straight_->max_speed});
     double stop_dist = max_deceleration > 0 ? (velocity_ * velocity_) / (2 * max_deceleration) : 0.0;
     double accel;
     if (dist <= stop_dist) accel = -max_deceleration;
@@ -229,7 +250,11 @@ RobotKinematicState TrapezoidalKinematics::step_ideal(double dt) {
     if (remaining_dist > 1e-9) {
         double ax = remaining_[0].first, ay = remaining_[0].second;
         if (pursuit) {  // 곡선 경로: 속도에 비례한 전방 주시점을 겨냥한다
-            auto la = lookahead_point(std::clamp(kLookaheadMin + kLookaheadGain * velocity_, kLookaheadMin, kLookaheadMax));
+            // 전방 주시점이 멀면 곡선 안쪽을 가로지른다 (원호에서 현 오차 ~ L^2 / 8R). 코너 곡률이 크면 주시 거리를 줄인다
+            double look = std::clamp(kLookaheadMin + kLookaheadGain * velocity_, kLookaheadMin, kLookaheadMax);
+            double kmax = max_curvature_ahead(look + 0.3);
+            if (kmax > 1e-3) look = std::clamp(std::sqrt(8.0 * kCutLimit / kmax), kLookaheadFloor, look);
+            auto la = lookahead_point(look);
             ax = la.first; ay = la.second;
         }
         double dx = ax - x, dy = ay - y;
@@ -251,7 +276,8 @@ RobotKinematicState TrapezoidalKinematics::step_ideal(double dt) {
     bool facing = !has_target || std::abs(heading_error) < facing_tol;
 
     double accel;
-    double vtop = max_velocity;
+    const double vmax_eff = std::min(max_velocity, speed_cap);
+    double vtop = vmax_eff;
     double stop_limit = remaining_dist;  // 이번 tick 에 이 거리 이상은 가지 않는다 (모퉁이에서 서기 위해)
     if (!facing || remaining_dist < 1e-9) {
         accel = velocity_ > 1e-9 ? -max_deceleration : 0.0;
@@ -259,7 +285,7 @@ RobotKinematicState TrapezoidalKinematics::step_ideal(double dt) {
         double stop_dist = max_deceleration > 0 ? (velocity_ * velocity_) / (2 * max_deceleration) : 0.0;
         // 물리 모드는 모퉁이(큰 꺾임)에서 서도록 거기까지를 감속 기준으로 쓴다
         double brake_ahead = world_ ? stop_distance_ahead() : remaining_dist;
-        const double vlim = pursuit ? std::min(max_velocity, curvature_speed_cap()) : max_velocity;
+        const double vlim = pursuit ? std::min(vmax_eff, curvature_speed_cap()) : vmax_eff;
         if (brake_ahead <= stop_dist) accel = -max_deceleration;
         else if (velocity_ < vlim) accel = max_acceleration;
         else if (pursuit && velocity_ > vlim + 0.02) accel = -max_deceleration;  // 곡률/모퉁이 앞에서 속도를 줄인다
@@ -267,7 +293,7 @@ RobotKinematicState TrapezoidalKinematics::step_ideal(double dt) {
         stop_limit = brake_ahead;
         vtop = vlim;
     }
-    double new_velocity = std::max(0.0, std::min(accel > 0 ? vtop : max_velocity, velocity_ + accel * dt));
+    double new_velocity = std::max(0.0, std::min(accel > 0 ? vtop : vmax_eff, velocity_ + accel * dt));
     double move_dist = facing ? std::min({(velocity_ + new_velocity) / 2 * dt, remaining_dist, stop_limit}) : 0.0;
     if (pursuit && remaining_.size() > 1) {
         // 곡선 경로: 경유점을 향해 직선으로 끌고 가지 않고 지금 heading 으로 나아간다 (조향은 전방 주시점이 한다).

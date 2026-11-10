@@ -13,7 +13,6 @@ namespace fms {
 
 namespace {
 
-double _DYNAMIC_REPLAN_RETRY = 1.0;
 double _SENSOR_HYSTERESIS_MARGIN = 0.5;
 double _STRAIGHT_SPEED = 0.2;  // m/s, STRAIGHT/DOCK/PARK 의 params.speed 기본값
 
@@ -411,6 +410,8 @@ void OrderExecutor::record_sample(double dt) {
 }
 
 void OrderExecutor::tick_logic(double dt) {
+    // 센서가 보는 거리 안에서 설 수 있는 속도로 제한한다: v^2 / (2 a) <= sensor_range - 0.5 (여유 20% 포함)
+    kinematics.speed_cap = std::sqrt(2.0 * 0.8 * std::max(kinematics.max_deceleration, 1e-3) * std::max(0.0, sensor_range - 0.5));
     tick_localization(dt);
     check_battery();
     obstacle_field.tick(dt);
@@ -460,22 +461,10 @@ void OrderExecutor::tick_logic(double dt) {
             return;
         }
     }
-    if (path_blocked_by(detected)) {
-        auto kin_state = kinematics.hold(dt);
-        battery.step(dt, kin_state.velocity);
-        set_busy(BusySubState::WAITING);
-        since_dynamic_replan_ += dt;
-        if (since_dynamic_replan_ >= _DYNAMIC_REPLAN_RETRY) {
-            since_dynamic_replan_ = 0.0;
-            try_dynamic_replan(detected);
-        }
-        return;
-    }
-    since_dynamic_replan_ = 0.0;
+    if (handle_obstacles(dt, detected)) return;
 
     double prev_x = physics->x(), prev_y = physics->y();  // 충돌 롤백은 참 자세 기준
     auto kin_state = kinematics.step(dt);
-    consume_reached_nodes();
     battery.step(dt, kin_state.velocity);
 
     if (check_collision(kin_state.x, kin_state.y, prev_x, prev_y)) return;
@@ -550,17 +539,71 @@ bool OrderExecutor::path_blocked_by(const std::vector<DynamicObstacle>& detected
     return false;
 }
 
-void OrderExecutor::try_dynamic_replan(const std::vector<DynamicObstacle>& detected) {
-    if (map == nullptr || segment_.empty()) return;
-    std::vector<std::tuple<double, double, double, double>> obstacles;
-    for (auto& o : detected) obstacles.emplace_back(o.x, o.y, o.width, o.height);
-    try {
-        auto path = plan_segment_path(&obstacles);
-        kinematics.set_path(path, smooth_enabled && map != nullptr);
+bool OrderExecutor::handle_obstacles(double dt, const std::vector<DynamicObstacle>& detected) {
+    since_local_plan_ += dt;
+    std::vector<LpRect> rects;
+    for (auto& o : detected) rects.emplace_back(o.x, o.y, o.width, o.height);
+    const bool can_plan = map != nullptr && leg_nominal_.size() >= 2 && !segment_.empty();
+    const LpPoint pos{kinematics.x, kinematics.y};
+
+    if (rects.empty()) {
+        if (detour_active_ && can_plan) restore_nominal();
+        detour_active_ = false;
+        return false;
+    }
+    // 현재 경로가 장애물과 겹치는가 (겹치지 않으면 지금 경로를 유지한다)
+    std::vector<LpPoint> pts = {pos};
+    for (auto& p : kinematics.get_state().local_path) pts.push_back(p);
+    const double blocked_at = lp_blocked_distance(pts, rects, robot_width);
+    if (blocked_at < 0) return false;
+
+    // 막혔다: 달리면서 우회를 시도한다 (local_plan_rate 간격)
+    if (can_plan && since_local_plan_ >= 1.0 / std::max(local_plan_rate, 0.1)) {
+        since_local_plan_ = 0.0;
+        leg_progress_ = lp_advance_progress(leg_nominal_, leg_progress_, pos);
+        if ((centerline.enabled || path_refine.enabled) && !clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
+        const auto& allowed = nodes_[segment_.back()].allowed_zone_ids;
+        auto t0 = std::chrono::steady_clock::now();
+        auto path = local_planner.detour(*map, pos, leg_nominal_, leg_progress_, rects, robot_width, robot_length, &allowed,
+                                         clearance_.get(), &centerline, smooth_enabled ? &smooth : nullptr);
+        local_planner.record(robot_id, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (path) {
+            kinematics.set_path(*path, smooth_enabled);
+            kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
+            if (!detour_active_) log::info("[%s] detour around %zu obstacle(s)", robot_id.c_str(), rects.size());
+            detour_active_ = true;
+            return false;
+        }
+    }
+    // 우회로를 못 찾았다: 막힌 지점 앞에서 설 수 있는 여유가 없어졌을 때만 선다 (그전까지는 계속 접근하며 재시도)
+    const double v = kinematics.get_state().velocity;
+    const double stop_dist = v * v / (2 * std::max(kinematics.max_deceleration, 1e-3));
+    if (blocked_at <= stop_dist + 0.3) {
+        auto kin_state = kinematics.hold(dt);
+        battery.step(dt, kin_state.velocity);
+        set_busy(BusySubState::WAITING);
+        return true;
+    }
+    return false;
+}
+
+void OrderExecutor::restore_nominal() {
+    // 장애물이 사라졌다. 이미 정상 경로 위에 있으면 그대로 두고, 벗어나 있으면 정상 경로의 조금 앞 지점으로 복귀한다.
+    const LpPoint pos{kinematics.x, kinematics.y};
+    leg_progress_ = lp_advance_progress(leg_nominal_, leg_progress_, pos);
+    const auto& a = leg_nominal_[leg_progress_];
+    const auto& b = leg_nominal_[leg_progress_ + 1];
+    double vx = b.first - a.first, vy = b.second - a.second, len2 = vx * vx + vy * vy;
+    double u = len2 > 0 ? std::clamp(((pos.first - a.first) * vx + (pos.second - a.second) * vy) / len2, 0.0, 1.0) : 0.0;
+    if (std::hypot(a.first + u * vx - pos.first, a.second + u * vy - pos.second) < 0.15) return;  // 이미 정상 경로 위
+    auto path = local_planner.rejoin(*map, pos, leg_nominal_, leg_progress_, robot_width, smooth_enabled ? &smooth : nullptr);
+    if (path) {
+        kinematics.set_path(*path, smooth_enabled);
         kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
-        log::info("[%s] replanned around dynamic obstacle (%zu detected)", robot_id.c_str(), detected.size());
-    } catch (const PlanningError& e) {
-        log::debug("[%s] no detour around dynamic obstacle, keeping wait: %s", robot_id.c_str(), e.what());
+        log::info("[%s] rejoining the planned path", robot_id.c_str());
+    } else {
+        log::info("[%s] no direct way back to the planned path -- replanning the leg", robot_id.c_str());
+        replan();
     }
 }
 
@@ -732,8 +775,6 @@ std::pair<double, double> OrderExecutor::approach_point(const OrderNode& node) c
 void OrderExecutor::replan() {
     if (straight_) return;  // 직선 이동 중 (끝나면 finish_straight 가 다시 부른다)
     segment_.clear();
-    segment_wp_bounds_.clear();
-    segment_wp_total_ = 0;
     if (motion_inhibited() || order_id_.empty()) {
         kinematics.set_path({});
         return;
@@ -754,6 +795,10 @@ void OrderExecutor::replan() {
     try {
         auto path = plan_segment_path();
         log::info("[%s] path planned: %zu waypoints", robot_id.c_str(), path.size());
+        leg_nominal_ = path;
+        leg_progress_ = 0;
+        detour_active_ = false;
+        since_local_plan_ = 1.0;
         kinematics.set_path(path, smooth_enabled && map != nullptr);
         kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
     } catch (const PlanningError& e) {
@@ -775,17 +820,13 @@ std::vector<std::pair<double, double>> OrderExecutor::plan_segment_path(
         targets.push_back(docking ? approach_point(n) : std::make_pair(n.position.x, n.position.y));
     }
 
-    segment_wp_bounds_.clear();
-    if (map == nullptr) {
-        for (size_t k = 0; k < targets.size(); ++k) segment_wp_bounds_.push_back(k + 1);
-        segment_wp_total_ = targets.size();
-        return targets;
-    }
+    if (map == nullptr) return targets;
 
     std::vector<std::pair<double, double>> full_path;
     std::pair<double, double> start = {kinematics.x, kinematics.y};
-    for (auto& target : targets) {
-        const auto& allowed = nodes_[segment_[segment_wp_bounds_.size()]].allowed_zone_ids;
+    for (size_t k = 0; k < targets.size(); ++k) {
+        const auto& target = targets[k];
+        const auto& allowed = nodes_[segment_[k]].allowed_zone_ids;
         if ((centerline.enabled || path_refine.enabled) && !clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
         // 복도 중앙 주행은 동적 장애물 회피 경로에도 쓴다 (장애물은 grid 에서 막히고, 거리 장은 벽 기준 선호만 준다).
         auto seg = plan_path(*map, start, target, robot_width, robot_length, dynamic_obstacles, &allowed,
@@ -797,35 +838,9 @@ std::vector<std::pair<double, double>> OrderExecutor::plan_segment_path(
         // 곡선 주행: 중간 코너를 Bézier 로 다듬는다 (PSO 이후). 실패한 코너는 원래대로 둔다.
         if (smooth_enabled) seg = smooth_path(*map, seg, robot_width, robot_length, dynamic_obstacles, &allowed, smooth);
         full_path.insert(full_path.end(), seg.begin(), seg.end());
-        segment_wp_bounds_.push_back(full_path.size());
         start = target;
     }
-    segment_wp_total_ = full_path.size();
     return full_path;
-}
-
-void OrderExecutor::consume_reached_nodes() {
-    // 세그먼트 중간 노드를 물리적으로 지나갈 때마다 current_index_ 를 전진시킨다.
-    // 이래야 EMERGENCY/PAUSE/MANUAL 로 멈췄다 재개할 때 replan 이 "다음 미도달
-    // 노드" 부터 계획하고, 이미 지나온 경유지로 되돌아가지 않는다.
-    // 세그먼트의 마지막 노드는 on_segment_arrived 가 처리한다 (action 실행 포함).
-    if (segment_.empty() || segment_wp_bounds_.size() != segment_.size()) return;
-    int remaining = (int)kinematics.get_state().local_path.size();
-    int consumed = (int)segment_wp_total_ - remaining;
-    if (consumed <= 0) return;
-
-    int passed = 0;
-    for (size_t k = 0; k + 1 < segment_.size(); ++k)
-        if (consumed >= (int)segment_wp_bounds_[k]) passed = (int)k + 1;
-    if (passed <= 0) return;
-
-    int last_reached = segment_[passed - 1];
-    if (last_reached + 1 <= current_index_) return;
-    auto& node = nodes_[last_reached];
-    last_node_id_ = node.node_id;
-    last_node_sequence_id_ = node.sequence_id;
-    current_index_ = last_reached + 1;
-    log::info("[%s] node passed: %s (seq %d)", robot_id.c_str(), node.node_id.c_str(), node.sequence_id);
 }
 
 void OrderExecutor::on_segment_arrived() {
@@ -910,15 +925,14 @@ void OrderExecutor::clear_order() {
     nodes_.clear();
     current_index_ = 0;
     segment_.clear();
-    segment_wp_bounds_.clear();
-    segment_wp_total_ = 0;
     acting_ = std::nullopt;
     acting_elapsed_ = 0.0;
     action_states_.clear();
     straight_.reset();  // docked_ 는 남긴다 (다음 이동 때 먼저 언도킹)
     kinematics.set_path({});
     battery.charging = docked_charging();
-    since_dynamic_replan_ = 0.0;
+    leg_nominal_.clear();
+    detour_active_ = false;
     set_base(idle_state());
 }
 

@@ -33,7 +33,7 @@ LDFLAGS := -L $(BREW)/opt/mosquitto/lib -L $(BREW)/opt/cjson/lib -lmosquitto -lc
 CORE_SRC := src/schemas.cpp src/map_model.cpp src/kinematics.cpp src/localizer.cpp \
             src/dynamic_obstacles.cpp src/planner.cpp src/executor.cpp src/comm.cpp \
             src/map_sync.cpp src/path_refine.cpp src/physics_world.cpp src/recorder.cpp \
-            src/scan_matcher.cpp src/chargers.cpp
+            src/scan_matcher.cpp src/chargers.cpp src/local_planner.cpp
 CORE_OBJ := $(addprefix $(OBJ)/,$(CORE_SRC:.cpp=.o))
 GUI_OBJ := $(OBJ)/src/gui.o
 MAIN_OBJ := $(OBJ)/src/main.o

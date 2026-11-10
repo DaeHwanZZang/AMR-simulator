@@ -116,7 +116,7 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
   - 한 tick 안의 순서: MQTT 수신(`comm.drain()`) → `map_sync.take_ready()` 로 새 맵 교체 → GUI 명령 처리 → `executor.tick(dt)` → 상태 발행.
 - **스레드 모델**: `--gui` 면 `robot_loop` 를 백그라운드 스레드로, Qt 이벤트루프를 메인 스레드로 돌린다. 공유 상태는 `exec_mutex` 로 보호한다. GUI→루프 명령은 `CommandQueue` (`robot/include/command_queue.hpp`: Move/Relocalize/Start/Stop/Estop/Mode/Configure/ResyncMap/SetBattery) 로 보낸다. 맵 다운로드는 별도 워커 스레드(`MapSync`)라 tick 을 막지 않는다. `executor` 를 건드리는 코드는 항상 이 락 규칙을 따라야 한다.
 - **`OrderExecutor` (`executor.cpp`, 가장 큼)**:
-  - 처리 범위: 오더 상태머신 (released/order_update_id/거절 규칙), e-stop/PAUSE/MANUAL, 노드 단위 경로계획(현재 목적지 노드 하나까지만 계획하고 도착·정렬 뒤 다음 노드를 계획한다. 중간 노드 theta 도 지켜진다), 액션(PICK/DROP/CHARGE/WAIT/STRAIGHT/DOCK/PARK), 충돌 감지, 동적 장애물 재계획.
+  - 처리 범위: 오더 상태머신 (released/order_update_id/거절 규칙), e-stop/PAUSE/MANUAL, 노드 단위 경로계획(현재 목적지 노드 하나까지만 계획하고 도착·정렬 뒤 다음 노드를 계획한다. 중간 노드 theta 도 지켜진다), 액션(PICK/DROP/CHARGE/WAIT/STRAIGHT/DOCK/PARK), 충돌 감지, 동적 장애물 우회(`handle_obstacles`).
   - 소유 객체: `PhysicsWorld`(MuJoCo, `physics`), `TrapezoidalKinematics`(사다리꼴 궤적 = 명령 생성기, 위의 world 를 가리킨다), `BatterySim`, `DynamicObstacleField`, `Recorder`(`--record` 일 때만). 멤버 선언 순서가 중요하다: `physics` 가 `kinematics` 보다 먼저여야 한다.
   - `tick(dt)` 는 `dt` 를 0.1 초로 자른 뒤 `tick_logic` 을 돌고 `Recorder` 에 한 줄 쓴다. 움직이지 않는 분기(idle/액션/대기)는 `kinematics.brake(dt)` 를 불러 굴러가던 로봇을 감속시킨다.
   - `map` 포인터는 소유하지 않는다. `main` 의 `map_model`/`synced_map` 이 소유한다. 맵 교체는 `set_map()` 으로만 한다.
@@ -154,9 +154,19 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
   - 오더를 받으면 경로계획 전에 State 를 바로 한 번 발행한다 (`on_order_received`).
 - **곡선 주행 (기본 켜짐, `--no-smooth-path` 로 끔)**:
   - 계획: `plan_segment_path()` 가 구간(노드 1개)의 A* 경유점을 (PSO 뒤에) `smooth_path()`(`planner.cpp`)로 다듬는다. 중간 코너마다 접선이 이어지는 3차 Bézier(목표 반경 0.6 m, 접선 길이는 이웃 구간의 45% 이하)를 샘플(0.1 m)로 넣는다. 샘플이 계획용 팽창 grid 의 비-주행 칸에 걸리면 크기를 절반씩 줄이고, 끝내 안 되면 그 코너는 원래대로 둔다(정지·회전). 꺾임각 0.05 rad 미만(직선)/2.6 rad 초과(U턴)는 곡선화하지 않는다. `SmoothParams`.
-  - 추종: `TrapezoidalKinematics::set_path(path, pursuit=true)` 면 `step_ideal` 이 경유점 대신 속도 비례 전방 주시점(0.35 + 0.5 v, 최대 1 m)을 겨냥하고(Pure Pursuit), 곡률 속도 제한(`curvature_speed_cap`: v ≤ 0.8 w_max / κ, 그 지점까지 감속 가능한 범위)을 건다. 경로를 따라 끌고 가지 않고 heading 방향으로 나아가며(조향은 주시점이 한다), 지나친 점은 걷어 낸다. 마지막 점 접근·정지·최종 정렬·3 cm 도착·`goal_` 재걸기는 기존 규칙 그대로다. 곡선을 달리는 중 방위 허용치는 0.6 rad, 서 있다 출발할 때는 0.15 rad(주시점 방위가 추정 노이즈에 흔들려서).
+  - 추종: `TrapezoidalKinematics::set_path(path, pursuit=true)` 면 `step_ideal` 이 경유점 대신 속도 비례 전방 주시점(0.35 + 0.5 v, 최대 1 m)을 겨냥하고(Pure Pursuit), 곡률 속도 제한(`curvature_speed_cap`: v ≤ 0.8 w_max / κ, 그 지점까지 감속 가능한 범위)을 건다. 경로를 따라 끌고 가지 않고 heading 방향으로 나아가며(조향은 주시점이 한다), 지나친 점은 걷어 낸다. 마지막 점 접근·정지·최종 정렬·3 cm 도착·`goal_` 재걸기는 기존 규칙 그대로다. 곡선을 달리는 중 방위 허용치는 0.6 rad, 서 있다 출발할 때는 0.15 rad(주시점 방위가 추정 노이즈에 흔들려서). 전방 주시 거리는 앞쪽 곡률이 크면 줄인다(현 오차 L²/8R ≤ 4 cm, 최소 0.3 m): 좁은 복도 코너에서 안쪽 벽을 스치던 문제(COLLISION)를 잡았다. `smooth_path` 는 A* 팽창보다 5 cm 더 넉넉한 여유(`SmoothParams::extra_clearance`)를 요구한다.
   - FMS 노드는 곡선으로 통과하지 않는다: 노드마다 정지·정렬한다(위 "경로계획"). 곡선은 한 노드 구간 안의 A* 코너에만 적용된다. STRAIGHT/DOCK 진입·탈출은 별도 직선 제어라 해당 없다.
-  - `State.local_path` 는 이제 곡선 샘플이 포함된 추종 경로다(직선 구간은 끝점만). 남은 단계(Global/Local 분리, 장애물 우회, 워커)는 M2~M4 로 미구현.
+  - `State.local_path` 는 이제 곡선 샘플이 포함된 추종 경로다(직선 구간은 끝점만). 장애물 우회(M2)는 아래 절. 아직 없는 것: Global 예상 경로 + `navigation` 디버그 토픽 + 뷰어 표시(M3), 계획 워커 스레드(M4, 필요할 때만).
+- **장애물 우회 (로컬 계획, 달리면서)** (`local_planner.cpp`, `executor.cpp` `handle_obstacles`/`restore_nominal`):
+  - 감지: 센서 반경(`--sensor-range`, 기본 3 m) 안의 동적 장애물(사각형 좌표)만 안다. 현재 위치만 쓰고 이동 예측은 없다(가로지르는 장애물에는 반응이 늦을 수 있다). 유효 지평선 = `min(--local-plan-radius, sensor_range)`.
+  - `replan()` 이 구간의 정상 경로(`leg_nominal_`, 장애물 없이 계획한 곡선 경로)를 저장한다. 장애물이 있어도 정상 경로는 장애물 없이 만든다.
+  - 현재 경로(`local_path`)가 장애물(+반폭 5 cm 덜)과 겹치지 않으면 그대로 간다(경로 유지). 겹치면 `--local-plan-rate`(5 Hz) 간격으로 `LocalPlanner::detour()`: 정상 경로 위 막힘 구간을 찾고 그 뒤 `rejoin_margin`(1 m) 지점(창 밖이면 창 안에서 가장 먼 자유 지점)을 합류점으로 삼아, 로봇 중심 반경 R 창(`plan_path_window`: 정적 팽창 grid 를 잘라 장애물 사각형 + 반폭 + `plan_margin` 0.15 m 를 막고 A*)에서 우회 경로를 구하고 정상 경로 꼬리를 이어 `smooth_polyline` 으로 다듬는다. 곡선은 `plan_margin` 의 절반까지만 코너를 자를 수 있다. 달리고 있어도 서지 않고 새 경로로 갈아탄다.
+  - 우회로를 못 찾으면 막힌 지점까지 거리가 제동거리(`v^2/2a`) + 0.3 m 이하일 때만 `hold()`(WAITING) 한다. 그 전에는 접근하면서 재시도한다.
+  - 장애물이 사라지면 `restore_nominal()`: 이미 정상 경로 15 cm 안이면 그대로, 아니면 정상 경로 위 0.5 m 앞으로 `rejoin()`(직선 시야가 막히면 구간 재계획).
+  - 속도 제한: `kinematics.speed_cap = sqrt(2 * 0.8 * a_dec * (sensor_range - 0.5))` (기본 설정 약 1.7 m/s 라 영향 없음).
+  - 계획 시간은 `LocalPlanner::record()` 가 `local plan: n= p95= ms` 로 로그에 남긴다 (첫 호출과 20 회마다). 워커 스레드 없이 tick 안에서 동기 계산한다(p95 수십 ms 이하).
+  - 직선 액션(STRAIGHT/DOCK 진입·탈출)은 우회하지 않고 장애물이 비킬 때까지 기다린다.
+  - 한계: 로봇끼리 상호작용 없음, 반경 밖 큰 우회(예: 복도 전체 차단 뒤 먼 길)는 자동으로 하지 않고 기다린다.
 - **직선 이동 / 도킹 / 주차** (v1.4):
   - `straight_`(StraightMotion: ACTION/DOCK_IN/UNDOCK)가 있으면 `tick` 은 `tick_straight` 만 돈다. 경로계획 없이 `kinematics.set_straight()` 로 heading 을 유지한 채 목표점까지 간다. PAUSE/e-stop 은 kinematics 쪽 목표를 지우므로 executor 가 목표를 들고 있다가 재개 때 다시 건다. `replan()` 은 `straight_` 가 있으면 아무것도 안 한다.
   - STRAIGHT: 노드 도착·정렬 후 노드 theta 방향 `distance` 만큼.
@@ -167,7 +177,7 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
 - **경로계획**: `planner.cpp` A* (로봇 크기 반영, 동적 장애물 사각형 입력). 장애물은 센서 범위(`--sensor-range`) 안에서만 인식한다. README 의 known issue 참고.
 - **PSO 경로 다듬기** (`path_refine.cpp`, `--path-refine`, 기본 꺼짐):
   - 위치: `plan_segment_path()` 에서 구간별 A* 결과의 중간 경유점을 PSO 로 미세 조정한다.
-  - 경유점 **개수와 목표점은 바꾸지 않는다** (`segment_wp_bounds_` 진행도 추적 때문). 세그먼트는 항상 노드 1개다.
+  - 경유점 **개수와 목표점은 바꾸지 않는다** (도착 판정과 곡선화 입력이 그대로이도록). 세그먼트는 항상 노드 1개다.
   - 동적 장애물 회피 경로에는 적용하지 않는다 (거리 장이 정적 맵 기준이라서).
   - 충돌 샘플이 A* 보다 늘면 원본을 쓴다.
   - 거리 장(`ClearanceField`)은 executor 가 lazy 생성하고 `set_map()` 에서 버린다. seed 는 `--seed` 와 로봇 id 에서 파생한다.

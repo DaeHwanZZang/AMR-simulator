@@ -4,7 +4,7 @@
 시나리오: move straight dock collision pause ghost lowfric slip loop longrun obstacle dockint gui topic estimate localization unlocalized charger battery default (생략하면 전부)
 mosquitto 를 자체 포트(18851)로 띄우므로 이미 떠 있는 브로커와 부딪히지 않는다. 로봇 로그와 기록 CSV 는 임시 폴더에 남는다.
 """
-import csv, glob, json, math, os, shutil, signal, subprocess, sys, tempfile, threading, time
+import csv, glob, json, math, os, re, shutil, signal, subprocess, sys, tempfile, threading, time
 
 import paho.mqtt.client as mqtt
 
@@ -446,15 +446,17 @@ def _corner_run(rid, extra):
     errs = r.state["errors"]
     p = r.pose()
     r.stop()
-    return s, dur, (min(near) if near else None), errs, p, max((abs(float(x["v_fwd"])) for x in rows), default=0)
+    wall = max((float(x["wall_force"]) for x in rows), default=0.0)
+    return s, dur, (min(near) if near else None), errs, p, max((abs(float(x["v_fwd"])) for x in rows), default=0), wall
 
 
 def test_curve():
     """곡선 주행: 90도 코너에서 서지 않고 지나간다. --no-smooth-path 는 코너에서 선다 (비교)."""
-    s, dur, vmin, errs, p, vmax = _corner_run("C1", [])
+    s, dur, vmin, errs, p, vmax, wall = _corner_run("C1", [])
     check("curve: completes without error", s is not None and not errs and dist((p["x"], p["y"]), (12, 12)) < 0.05, f"state={s and s['state']} errors={errs} pose={p}")
     check("curve: does not stop at the 90deg corner", vmin is not None and vmin >= 0.3, f"min v near corner={vmin} (vmax={vmax:.2f}) dur={dur:.1f}s")
-    s2, dur2, vmin2, errs2, p2, _ = _corner_run("C2", ["--no-smooth-path"])
+    check("curve: no wall contact along the curve (force < 20 N)", wall < 20.0, f"max wall force={wall:.1f} N")
+    s2, dur2, vmin2, errs2, p2, _, _ = _corner_run("C2", ["--no-smooth-path"])
     check("curve: --no-smooth-path still completes (stops at corner)", s2 is not None and not errs2 and dist((p2["x"], p2["y"]), (12, 12)) < 0.05, f"state={s2 and s2['state']} errors={errs2} min v={vmin2} dur={dur2:.1f}s")
     check("curve: smooth is faster than no-smooth", dur < dur2, f"{dur:.1f}s vs {dur2:.1f}s")
 
@@ -476,24 +478,102 @@ def test_longrun():
     r.stop()
 
 
+def _place(rid, oid_x, oid_y, w, h):
+    subprocess.run([f"{REPO}/build/bin/place_obstacle", rid, "--port", str(PORT), "--x", str(oid_x), "--y", str(oid_y), "--width", str(w), "--height", str(h)], capture_output=True)
+
+
+def _clear(rid):
+    subprocess.run([f"{REPO}/build/bin/place_obstacle", rid, "--port", str(PORT), "--clear"], capture_output=True)
+
+
 def test_obstacle():
-    r = Robot("O1", 3, 6)
-    r.order("b1", ["30,6,0"])
-    r.wait(lambda s: s["pose"]["x"] > 8 and s["velocity"] > 0.8, 30)
-    subprocess.run([f"{REPO}/build/bin/place_obstacle", "O1", "--port", str(PORT), "--x", "20", "--y", "6", "--width", "1.0", "--height", "3.0"], capture_output=True)
+    # 1 m 복도가 완전히 막히고 우회로는 로컬 계획 창(5 m) 밖: 서서 기다리다가 치우면 간다
+    m = f"{REPO}/maps/gen_loop/fms_map.json"
+    r = Robot("O1", 1, 9, mapfile=m)
+    r.order("b1", ["12,9,0"])
+    r.wait(lambda s: s["pose"]["x"] > 1.3, 20)
+    _place("O1", 3.5, 9, 0.6, 0.6)
     s = r.wait(lambda s: s["sub_state"] == "WAITING" if s.get("sub_state") else False, 20)
-    check("obstacle: robot waits when path blocked", s is not None)
-    time.sleep(4)
+    check("obstacle: robot waits when the corridor is fully blocked", s is not None)
+    time.sleep(3)
+    p = r.pose()
+    check("obstacle: stops short of the obstacle", s is not None and p["x"] < 3.5 - 0.3 - 0.25 and r.state["state"] != "ERROR", f"pose={p} state={r.state['state']}")
     rows = r.csv_rows()
     amax = 0.0
     for a, b in zip(rows, rows[1:]):
         if abs(float(a["v_fwd"])) > 0.6:
             amax = max(amax, abs(float(b["v_fwd"]) - float(a["v_fwd"])) / max(1e-3, float(b["t"]) - float(a["t"])))
     check("obstacle: no abrupt stops from cruise speed (|a| < 2 m/s^2 above 0.6 m/s)", amax < 2.0, f"max |a|={amax:.2f}")
-    subprocess.run([f"{REPO}/build/bin/place_obstacle", "O1", "--port", str(PORT), "--clear"], capture_output=True)
-    s = r.idle_done("b1", 60)
+    _clear("O1")
+    s = r.idle_done("b1", 90)
     p = r.pose()
-    check("obstacle: resumes and arrives after clearing", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.04, f"pose={p}")
+    check("obstacle: resumes and arrives after clearing", s is not None and dist((p["x"], p["y"]), (12, 9)) < 0.05, f"pose={p}")
+    r.stop()
+
+
+def _local_plan_p95(rid):
+    p95 = None
+    with open(f"{SCR}/{rid}.log") as f:
+        for line in f:
+            m = re.search(r"local plan: n=\d+ p95=([\d.]+) ms", line)
+            if m:
+                p95 = float(m.group(1))
+    return p95
+
+
+def test_detour():
+    """넓은 홀: 경로 위 1x3 상자를 서지 않고 돌아간다 (달리면서 우회). 몸체가 상자와 겹치지 않고, 계획 시간 p95 <= 200 ms."""
+    r = Robot("D2", 3, 6)
+    r.order("dt1", ["30,6,0"])
+    r.wait(lambda s: s["pose"]["x"] > 8 and s["velocity"] > 0.8, 30)
+    t_place = time.time()
+    _place("D2", 20, 6, 1.0, 3.0)
+    s = r.idle_done("dt1", 90)
+    p = r.pose()
+    with r.lock:
+        waited = any(st.get("sub_state") == "WAITING" and st["pose"]["x"] > 10 for st in r.states)
+        errs = [e["error_type"] for st in r.states for e in st.get("errors", [])]
+    check("detour: arrives at the goal without error", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.05 and not errs, f"pose={p} errors={errs}")
+    check("detour: never stops to wait", not waited)
+    rows = [x for x in r.csv_rows() if x["order_id"] == "dt1"]
+    def gap(x):   # 몸체 중심에서 상자(20,6, 1x3)까지의 거리 (원판 반지름 0.21 보다 커야 겹치지 않는다)
+        dx = max(abs(float(x["x"]) - 20) - 0.5, 0.0)
+        dy = max(abs(float(x["y"]) - 6) - 1.5, 0.0)
+        return math.hypot(dx, dy)
+    mingap = min(gap(x) for x in rows)
+    check("detour: body never overlaps the obstacle (center gap > 0.21 m)", mingap > 0.21, f"min gap={mingap:.3f} m")
+    near = [abs(float(x["v_fwd"])) for x in rows if 16 < float(x["x"]) < 24]
+    check("detour: keeps moving while passing (min v > 0.25 m/s)", near and min(near) > 0.25, f"min v={min(near) if near else None}")
+    p95 = _local_plan_p95("D2")
+    check("detour: local plan time p95 <= 200 ms", p95 is not None and p95 <= 200.0, f"p95={p95} ms")
+    r.stop()
+
+
+def test_detour_clear():
+    """우회 중 장애물을 치우면 정상 경로로 복귀해서 도착한다."""
+    r = Robot("D3", 3, 6)
+    r.order("dc1", ["30,6,0"])
+    r.wait(lambda s: s["pose"]["x"] > 8 and s["velocity"] > 0.8, 30)
+    _place("D3", 20, 6, 1.0, 3.0)
+    s = r.wait(lambda s: abs(s["pose"]["y"] - 6) > 0.8, 40)
+    check("detour_clear: robot leaves the straight line to go around", s is not None, f"pose={r.pose()}")
+    _clear("D3")
+    s = r.idle_done("dc1", 90)
+    p = r.pose()
+    errs = r.state["errors"]
+    check("detour_clear: rejoins and arrives after the obstacle is gone", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.05 and not errs, f"pose={p} errors={errs}")
+    r.stop()
+
+
+def test_zone_obstacles():
+    """가로지르는 장애물(구역 스폰, 시드 고정) 속에서 장거리 오더가 충돌 없이 끝난다 (현재 위치만 보므로 늦게 반응할 수 있다)."""
+    r = Robot("Z1", 3, 6, extra=["--obstacle-zone", "14,2,24,10", "--obstacle-spawn-interval", "2", "--obstacle-max-count", "3",
+                                  "--obstacle-width", "0.6", "--obstacle-height", "0.6", "--obstacle-speed", "0.5", "--obstacle-seed", "7"])
+    r.order("z1", ["30,6,0"])
+    s = r.idle_done("z1", 150)
+    p = r.pose()
+    errs = [e["error_type"] for st in r.states for e in st.get("errors", [])]
+    check("zone obstacles: completes without COLLISION", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.05 and "COLLISION" not in errs, f"pose={p} errors={set(errs)}")
     r.stop()
 
 
@@ -653,7 +733,7 @@ ALL = {
     "move": test_move, "straight": test_straight, "dock": test_dock_park, "collision": test_collision,
     "default": test_default_localized, "script": test_script, "curve": test_curve, "lazy": test_lazy_plan,
     "pause": test_pause_cancel, "ghost": test_ghost_start, "lowfric": test_low_friction, "slip": test_normal_slip_small,
-    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
+    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "detour": test_detour, "detour_clear": test_detour_clear, "zone": test_zone_obstacles, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
 }
 
 if __name__ == "__main__":

@@ -270,6 +270,81 @@ std::vector<std::pair<double, double>> plan_path(
     return waypoints;
 }
 
+const std::vector<uint8_t>& static_planning_grid(const MapModel& map_model, double robot_width) {
+    int radius_px = (int)std::ceil((robot_width / 2) / map_model.metadata.resolution);
+    return get_inflated_grid(map_model, radius_px);
+}
+
+std::vector<std::pair<double, double>> plan_path_window(
+    const MapModel& map_model, std::pair<double, double> start, std::pair<double, double> goal,
+    std::pair<double, double> center, double radius_m, double robot_width, double robot_length,
+    const std::vector<std::tuple<double, double, double, double>>& obstacles,
+    const std::vector<std::string>* allowed_zone_ids, const ClearanceField* clearance, const CenterlineParams* centering) {
+    const std::vector<std::string> empty;
+    const auto& allowed = allowed_zone_ids ? *allowed_zone_ids : empty;
+    const double traffic_margin = std::hypot(robot_width, robot_length) / 2 + 0.1;
+    const double res = map_model.metadata.resolution;
+    const int W = map_model.metadata.width_px, H = map_model.metadata.height_px;
+    const auto& full = static_planning_grid(map_model, robot_width);
+
+    auto c_px = map_model.world_to_pixel(center.first, center.second);
+    const int r_px = (int)std::ceil(radius_m / res);
+    const int x0 = std::max(0, c_px.first - r_px), x1 = std::min(W - 1, c_px.first + r_px);
+    const int y0 = std::max(0, c_px.second - r_px), y1 = std::min(H - 1, c_px.second + r_px);
+    if (x0 > x1 || y0 > y1) throw PlanningError("local window is outside the map");
+    const int ww = x1 - x0 + 1, hh = y1 - y0 + 1;
+    std::vector<uint8_t> grid((size_t)ww * hh);
+    for (int y = 0; y < hh; ++y)
+        std::copy(full.begin() + (size_t)(y0 + y) * W + x0, full.begin() + (size_t)(y0 + y) * W + x0 + ww, grid.begin() + (size_t)y * ww);
+    // 감지된 장애물 (+ 로봇 반폭) 을 막힘으로
+    const double margin = robot_width / 2;
+    for (auto& [ox, oy, ow, oh] : obstacles) {
+        auto a = map_model.world_to_pixel(ox - ow / 2 - margin, oy - oh / 2 - margin);
+        auto b = map_model.world_to_pixel(ox + ow / 2 + margin, oy + oh / 2 + margin);
+        int ax = std::max(x0, std::min(a.first, b.first)), bx = std::min(x1, std::max(a.first, b.first));
+        int ay = std::max(y0, std::min(a.second, b.second)), by = std::min(y1, std::max(a.second, b.second));
+        for (int y = ay; y <= by; ++y) for (int x = ax; x <= bx; ++x) grid[(size_t)(y - y0) * ww + (x - x0)] = 0;
+    }
+    if (!map_model.occupancy_zones.empty()) {
+        for (int y = 0; y < hh; ++y) for (int x = 0; x < ww; ++x) {
+            const auto p = map_model.pixel_to_world(x + x0, y + y0);
+            if (map_model.traffic_blocked(p.first, p.second, traffic_margin, allowed)) grid[(size_t)y * ww + x] = 0;
+        }
+    }
+    auto s_px = map_model.world_to_pixel(start.first, start.second);
+    auto g_px = map_model.world_to_pixel(goal.first, goal.second);
+    Px s{s_px.first - x0, s_px.second - y0}, g{g_px.first - x0, g_px.second - y0};
+    if (s.first < 0 || s.first >= ww || s.second < 0 || s.second >= hh || g.first < 0 || g.first >= ww || g.second < 0 || g.second >= hh)
+        throw PlanningError("start or goal is outside the local window");
+    if (s == g) return {goal};
+    {   // 이미 장애물 여유 안쪽에 들어와 있어도 빠져나갈 수 있게, 시작점 주변 0.3 m 는 정적으로 비어 있으면 연다
+        const int rr = (int)std::ceil(0.3 / res);
+        for (int dy = -rr; dy <= rr; ++dy) for (int dx = -rr; dx <= rr; ++dx) {
+            int x = s.first + dx, y = s.second + dy;
+            if (dx * dx + dy * dy > rr * rr || x < 0 || x >= ww || y < 0 || y >= hh) continue;
+            if (full[(size_t)(y + y0) * W + (x + x0)] == 2) grid[(size_t)y * ww + x] = 2;
+        }
+    }
+    grid[(size_t)s.second * ww + s.first] = 2;  // 시작/끝 칸은 항상 통과 가능 (plan_path 와 같은 규칙)
+    grid[(size_t)g.second * ww + g.first] = 2;
+
+    const bool centered = clearance && centering && centering->enabled && centering->weight > 0 && centering->reach > 0;
+    const double reach_px = centered ? centering->reach / res : 0.0;
+    std::function<double(int, int)> factor = [&](int px, int py) {
+        double d = std::min(clearance->dist_at(px + x0, py + y0), reach_px);
+        double gap = 1.0 - d / reach_px;
+        return 1.0 + centering->weight * gap * gap;
+    };
+    auto path_px = astar(s, g, grid, ww, hh, centered ? &factor : nullptr);
+    if (!path_px) throw PlanningError("no detour inside the local window");
+    auto wp_px = centered ? simplify_within(*path_px, grid, ww, hh, centering->tolerance / res) : simplify(*path_px, grid, ww, hh);
+    std::vector<std::pair<double, double>> out;
+    for (auto& p : wp_px) out.push_back(map_model.pixel_to_world(p.first + x0, p.second + y0));
+    if (out.empty()) out = {goal}; else out.back() = goal;
+    out.front() = start;
+    return out;
+}
+
 std::vector<std::pair<double, double>> smooth_path(
     const MapModel& map_model, const std::vector<std::pair<double, double>>& path, double robot_width, double robot_length,
     const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles,
@@ -278,12 +353,20 @@ std::vector<std::pair<double, double>> smooth_path(
     const std::vector<std::string> empty;
     const auto& allowed = allowed_zone_ids ? *allowed_zone_ids : empty;
     const double traffic_margin = std::hypot(robot_width, robot_length) / 2 + 0.1;
-    const std::vector<uint8_t> grid = planning_grid(map_model, robot_width, dynamic_obstacles, allowed, traffic_margin);
+    // 곡선은 A* 팽창(반폭)보다 5 cm 더 넉넉한 여유를 요구한다 (추종 오차와 몸체 반지름 차이를 흡수)
+    const std::vector<uint8_t> grid = planning_grid(map_model, robot_width + 2 * prm.extra_clearance, dynamic_obstacles, allowed, traffic_margin);
     const int w = map_model.metadata.width_px, h = map_model.metadata.height_px;
     auto free_at = [&](double x, double y) {
         auto [px, py] = map_model.world_to_pixel(x, y);
         return px >= 0 && px < w && py >= 0 && py < h && grid[(size_t)py * w + px] == 2;
     };
+    return smooth_polyline(path, free_at, map_model.metadata.resolution, prm);
+}
+
+std::vector<std::pair<double, double>> smooth_polyline(
+    const std::vector<std::pair<double, double>>& path, const std::function<bool(double, double)>& free_at,
+    double resolution, const SmoothParams& prm) {
+    if (path.size() < 3) return path;
     using P = std::pair<double, double>;
     std::vector<P> out = {path.front()};
     for (size_t i = 1; i + 1 < path.size(); ++i) {
@@ -305,7 +388,7 @@ std::vector<std::pair<double, double>> smooth_path(
             const P c1{a.first + ix * hdl, a.second + iy * hdl}, c2{b.first - ox * hdl, b.second - oy * hdl};
             const double arc = r_eff * phi;
             const int n = std::max(4, (int)std::ceil(arc / prm.step));
-            const int check = std::max(n, (int)std::ceil(arc / map_model.metadata.resolution));
+            const int check = std::max(n, (int)std::ceil(arc / resolution));
             bool ok = true;
             for (int k = 0; k <= check && ok; ++k) {
                 double s = (double)k / check, u = 1 - s;

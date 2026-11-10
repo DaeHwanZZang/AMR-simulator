@@ -27,6 +27,7 @@ public:
     double x, y, theta;
     double max_velocity, max_acceleration, max_deceleration;
     double max_angular_velocity, max_angular_acceleration;
+    double speed_cap = 1e9;  // 바깥(executor)이 정하는 추가 속도 상한 (센서 거리 안에서 설 수 있는 속도). 유효 최고 속도 = min(max_velocity, speed_cap)
 
     TrapezoidalKinematics(double x_, double y_, double theta_ = 0.0, double max_v = 1.0,
                            double max_a = 0.5, double max_d = 0.5, double max_angular_v = 1.57,
@@ -107,6 +108,7 @@ private:
     double remaining_length() const;
     double stop_distance_ahead() const;
     std::pair<double, double> lookahead_point(double dist) const;  // 지금 위치에서 경로를 dist 만큼 따라간 점
+    double max_curvature_ahead(double horizon) const;              // 앞 horizon m 안의 최대 곡률
     double curvature_speed_cap() const;                            // 앞쪽 곡률 때문에 지금 허용되는 최고 속도
     void advance(double dist);
     // target_theta 로 사다리꼴 각가속도 프로파일을 따라 회전. 회전 후 남은 각도 오차 반환.

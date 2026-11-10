@@ -41,6 +41,7 @@
         {"if": "gui", "args": ["--gui"]},
         {"if": "path_refine", "args": ["--path-refine"]},
         {"if": "no_smooth", "args": ["--no-smooth-path"]},
+        "--local-plan-radius", "{local_plan_radius}", "--local-plan-rate", "{local_plan_rate}",
         {"if": "obstacle_zone", "args": [
           "--obstacle-zone", "{obstacle_zone}",
           "--obstacle-spawn-interval", "{obstacle_spawn_interval}",
@@ -80,6 +81,8 @@
         {"group": "실험/FMS", "key": "seed", "label": "난수 시드 (비우면 로봇 ID 기반)", "type": "str", "default": ""},
         {"group": "실험/FMS", "key": "map_cache", "label": "SET_MAP 맵 캐시 폴더 (비우면 map_cache)", "type": "str", "default": ""},
         {"group": "물리", "key": "record", "label": "데이터 기록 폴더 (비우면 꺼짐)", "type": "str", "default": ""},
+        {"group": "물리", "key": "local_plan_radius", "label": "장애물 우회 계획 반경 (m)", "type": "float", "default": 5.0},
+        {"group": "물리", "key": "local_plan_rate", "label": "장애물 우회 계획 주기 (Hz)", "type": "float", "default": 5.0},
         {"group": "물리", "key": "sensor_range", "label": "장애물 감지 반경 (m)", "type": "float", "default": 3.0},
         {"group": "물리", "key": "log_level", "label": "로그 레벨", "type": "choice", "choices": ["DEBUG", "INFO", "WARNING"], "default": "INFO"},
         {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_zone", "label": "구역 XMIN,YMIN,XMAX,YMAX", "type": "str", "default": ""},

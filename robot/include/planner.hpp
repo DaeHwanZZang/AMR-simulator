@@ -1,6 +1,7 @@
 // 로컬 경로계획 A* (robot_client/planner.py 포팅)
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -44,11 +45,29 @@ struct SmoothParams {
     double min_turn = 0.05;  // rad
     double max_turn = 2.6;   // rad
     double step = 0.1;       // m, 샘플 간격
+    double extra_clearance = 0.05;  // m, smooth_path 가 A* 팽창보다 더 요구하는 벽 여유
 };
 std::vector<std::pair<double, double>> smooth_path(
     const MapModel& map_model, const std::vector<std::pair<double, double>>& path,
     double robot_width = 0.5, double robot_length = 0.7,
     const std::vector<std::tuple<double, double, double, double>>* dynamic_obstacles = nullptr,
     const std::vector<std::string>* allowed_zone_ids = nullptr, const SmoothParams& params = SmoothParams());
+
+// 곡선화 코어. free_at(x, y) 가 true 인 곳만 곡선이 지나갈 수 있다 (smooth_path 와 로컬 계획이 공유).
+std::vector<std::pair<double, double>> smooth_polyline(
+    const std::vector<std::pair<double, double>>& path, const std::function<bool(double, double)>& free_at,
+    double resolution, const SmoothParams& params = SmoothParams());
+
+// 정적 팽창 grid (2 = 주행 가능, 복사 없음, 교통 구역/동적 장애물 미반영). 맵당 로봇 반폭별로 캐시된다.
+const std::vector<uint8_t>& static_planning_grid(const MapModel& map_model, double robot_width);
+
+// 로컬 계획: center 반경 radius_m 의 창만 잘라 (정적 팽창 + 감지된 장애물 사각형[+반폭] + 허가 없는 구역) A* 를 돈다.
+// obstacles: world 좌표 사각형 (x, y 중심, width, height). start/goal 은 창 안이어야 하고, 길이 없으면 PlanningError.
+std::vector<std::pair<double, double>> plan_path_window(
+    const MapModel& map_model, std::pair<double, double> start, std::pair<double, double> goal,
+    std::pair<double, double> center, double radius_m, double robot_width, double robot_length,
+    const std::vector<std::tuple<double, double, double, double>>& obstacles,
+    const std::vector<std::string>* allowed_zone_ids = nullptr, const ClearanceField* clearance = nullptr,
+    const CenterlineParams* centering = nullptr);
 
 }  // namespace fms
