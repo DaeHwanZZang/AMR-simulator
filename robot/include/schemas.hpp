@@ -306,6 +306,34 @@ struct PhysicsDebug {
     std::string to_json_string() const;
 };
 
+// =============================================================================
+// NavigationDebug : Robot -> 뷰어 (프로토콜 밖)
+// =============================================================================
+// Global 예상 경로(현재 위치부터 Order 의 남은 노드를 순서대로 잇는 정적 맵 기준 경로)와 Local 계획 상태.
+// sim/v1/{id}/navigation, retained. 변경 시(+ 5 s 하트비트)만 발행하고 Order 종료/취소 땐 status=IDLE 과 빈 경로로 비운다.
+// 실제로 추종하는 경로는 State.local_path 다 (여기는 예상 경로).
+struct NavigationDebug {
+    long long header_id = 0;
+    double timestamp = 0.0;
+    std::string robot_id;
+    std::string order_id;             // 비어 있으면 Order 없음
+    int version = 0;                  // Global 경로가 바뀔 때마다 증가
+    std::string status = "IDLE";      // IDLE | READY | PLANNING(계속 계산 중) | PARTIAL(어느 구간 계획 실패)
+    int current_index = 0;            // 지금 향하는 노드 번호
+    std::vector<std::pair<double, double>> global_path;
+    int released_points = 0;          // global_path 앞쪽 이만큼이 released 노드까지의 구간 (뒤는 아직 주행 허가 없음)
+    bool truncated = false;           // 노드가 많아 앞쪽 일부만 계산했다
+    int failed_node = -1;             // 계획에 실패한 노드 번호 (없으면 -1)
+    std::string failed_reason;
+    bool detour_active = false;       // Local 우회/재경로 중
+    bool has_local_goal = false;
+    double local_goal_x = 0, local_goal_y = 0;  // 우회 경로가 정상 경로에 합류하는 지점
+    double plan_radius = 0;           // m, 로컬 계획 반경 (min(--local-plan-radius, --sensor-range))
+    double plan_rate = 0;             // Hz
+
+    std::string to_json_string() const;
+};
+
 constexpr const char* TOPIC_PREFIX = "fms/v1";
 
 std::string topic_order(const std::string& robot_id);
@@ -314,5 +342,6 @@ std::string topic_connection(const std::string& robot_id);
 std::string topic_instant(const std::string& robot_id);
 std::string topic_sim_teleport(const std::string& robot_id);  // sim/v1/{id}/teleport (시뮬 전용, 프로토콜 밖)
 std::string topic_physics(const std::string& robot_id);
+std::string topic_sim_navigation(const std::string& robot_id);  // sim/v1/{id}/navigation (디버그, retained)
 
 }  // namespace fms

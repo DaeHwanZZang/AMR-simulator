@@ -14,6 +14,7 @@ namespace fms {
 namespace {
 
 double _SENSOR_HYSTERESIS_MARGIN = 0.5;
+double _GLOBAL_REPLAN_RETRY = 1.0;  // 로컬 우회 실패 시 구간 전체 재계획 재시도 간격 (s)
 double _STRAIGHT_SPEED = 0.2;  // m/s, STRAIGHT/DOCK/PARK 의 params.speed 기본값
 
 // Liang-Barsky: 선분 a->b 가 사각형 [rx0,rx1]x[ry0,ry1] 과 겹치는가.
@@ -183,6 +184,7 @@ void OrderExecutor::set_map(const MapModel* new_map, std::string map_uid, std::s
     physics->set_map(new_map);
     clearance_.reset();
     matcher_.reset();
+    invalidate_global();
     chargers_ = new_map ? load_chargers(new_map->base_dir) : std::vector<Charger>{};
     if (other_map && require_localization) set_unlocalized("map changed");
     current_map_uid_ = std::move(map_uid);
@@ -249,6 +251,7 @@ bool OrderExecutor::accept_order(const Order& order) {
     order_update_id_ = order.order_update_id;
     nodes_ = order.nodes;
     current_index_ = 0;
+    invalidate_global();
     action_states_.clear();
     for (auto& n : nodes_)
         if (n.action) set_action_status(n.action->action_id, ActionStatus::WAITING);
@@ -267,6 +270,7 @@ bool OrderExecutor::apply_order_update(const Order& order) {
     size_t old_len = nodes_.size();
     order_update_id_ = order.order_update_id;
     nodes_ = order.nodes;
+    invalidate_global();
     for (auto& n : nodes_) {
         if (!n.action) continue;
         bool known = std::any_of(action_states_.begin(), action_states_.end(),
@@ -575,6 +579,24 @@ bool OrderExecutor::handle_obstacles(double dt, const std::vector<DynamicObstacl
             return false;
         }
     }
+    // 로컬 창 안에 우회로가 없다 (복도 전체가 막혔거나 창 밖으로 돌아가야 한다): 구간 전체를 장애물을 반영해 다시 계획한다.
+    // 정상 경로(leg_nominal_)는 그대로 둔다. 길이 없으면 아래에서 선다. 재시도는 1 초 간격.
+    since_global_replan_ += dt;
+    if (can_plan && since_global_replan_ >= _GLOBAL_REPLAN_RETRY) {
+        since_global_replan_ = 0.0;
+        std::vector<std::tuple<double, double, double, double>> obs;
+        for (auto& r : rects) obs.emplace_back(std::get<0>(r), std::get<1>(r), std::get<2>(r), std::get<3>(r));
+        try {
+            auto path = plan_segment_path(&obs);
+            kinematics.set_path(path, smooth_enabled);
+            kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
+            if (!detour_active_) log::info("[%s] rerouted the whole leg around %zu obstacle(s)", robot_id.c_str(), rects.size());
+            detour_active_ = true;
+            return false;
+        } catch (const PlanningError& e) {
+            log::debug("[%s] no route around the obstacle: %s", robot_id.c_str(), e.what());
+        }
+    }
     // 우회로를 못 찾았다: 막힌 지점 앞에서 설 수 있는 여유가 없어졌을 때만 선다 (그전까지는 계속 접근하며 재시도)
     const double v = kinematics.get_state().velocity;
     const double stop_dist = v * v / (2 * std::max(kinematics.max_deceleration, 1e-3));
@@ -798,6 +820,7 @@ void OrderExecutor::replan() {
         leg_nominal_ = path;
         leg_progress_ = 0;
         detour_active_ = false;
+        ++nav_version_;
         since_local_plan_ = 1.0;
         kinematics.set_path(path, smooth_enabled && map != nullptr);
         kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
@@ -933,6 +956,7 @@ void OrderExecutor::clear_order() {
     battery.charging = docked_charging();
     leg_nominal_.clear();
     detour_active_ = false;
+    invalidate_global();
     set_base(idle_state());
 }
 
@@ -1044,6 +1068,148 @@ bool OrderExecutor::sim_teleport(double x, double y, double theta, const std::st
     });
     log::warning("[%s] teleported: (%.2f, %.2f, %.2f)", robot_id.c_str(), x, y, theta);
     return true;
+}
+
+std::pair<double, double> OrderExecutor::node_end_point(const OrderNode& n) const {
+    if (n.action) {
+        switch (n.action->action_type) {
+            case ActionType::DOCK:
+            case ActionType::PARK: return approach_point(n);  // 다음 이동은 언도킹으로 시작한다
+            case ActionType::STRAIGHT: {
+                double d = param_double(n.action->params, "distance", 0.0);
+                return {n.position.x + d * std::cos(n.position.theta), n.position.y + d * std::sin(n.position.theta)};
+            }
+            default: break;
+        }
+    }
+    return {n.position.x, n.position.y};
+}
+
+std::vector<std::pair<double, double>> OrderExecutor::node_tail(const OrderNode& n) const {
+    std::vector<std::pair<double, double>> tail;
+    if (!n.action) return tail;
+    auto t = n.action->action_type;
+    if (t == ActionType::DOCK || t == ActionType::PARK) tail.emplace_back(n.position.x, n.position.y);  // 접근점 -> 진입 완료 자세
+    else if (t == ActionType::STRAIGHT) tail.push_back(node_end_point(n));
+    return tail;
+}
+
+OrderExecutor::GlobalLeg OrderExecutor::plan_global_leg(std::pair<double, double> start, int node_index) {
+    GlobalLeg leg;
+    const OrderNode& n = nodes_[node_index];
+    bool docking = n.action && (n.action->action_type == ActionType::DOCK || n.action->action_type == ActionType::PARK);
+    std::pair<double, double> target = docking ? approach_point(n) : std::make_pair(n.position.x, n.position.y);
+    try {
+        if (map == nullptr) {
+            leg.path = {start, target};
+        } else {
+            if ((centerline.enabled || path_refine.enabled) && !clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
+            leg.path = plan_path(*map, start, target, robot_width, robot_length, nullptr, &n.allowed_zone_ids,
+                                 clearance_.get(), &centerline);
+            if (smooth_enabled)
+                leg.path = smooth_path(*map, leg.path, robot_width, robot_length, nullptr, &n.allowed_zone_ids, smooth);
+        }
+        for (auto& p : node_tail(n)) leg.path.push_back(p);
+        leg.ok = true;
+    } catch (const PlanningError& e) {
+        leg.error = e.what();
+    }
+    return leg;
+}
+
+std::optional<NavigationDebug> OrderExecutor::take_navigation(long long header_id, double timestamp) {
+    constexpr int kLookahead = 16;      // 현재 노드부터 이만큼 앞까지 계산한다
+    constexpr int kBudgetPerTick = 2;   // tick 당 새로 계획하는 구간 수 (tick 을 오래 막지 않으려고)
+    NavigationDebug nav;
+    nav.header_id = header_id;
+    nav.timestamp = timestamp;
+    nav.robot_id = robot_id;
+    nav.order_id = order_id_;
+    nav.current_index = current_index_;
+    nav.plan_radius = std::min(local_planner.config.radius, sensor_range);
+    nav.plan_rate = local_plan_rate;
+    nav.detour_active = detour_active_;
+
+    if (!order_id_.empty() && !nodes_.empty()) {
+        nav.status = "READY";
+        auto& g = nav.global_path;
+        auto append = [&](const std::vector<std::pair<double, double>>& pts) {
+            for (auto& p : pts)
+                if (g.empty() || std::hypot(p.first - g.back().first, p.second - g.back().second) > 1e-6) g.push_back(p);
+        };
+        const int n_nodes = (int)nodes_.size();
+        const int last = std::min(n_nodes, current_index_ + kLookahead);
+        nav.truncated = last < n_nodes;
+        std::pair<double, double> start = {kinematics.x, kinematics.y};
+        int i = current_index_;
+        bool released_run = true;
+        auto mark_released = [&](int idx) {
+            if (released_run && nodes_[idx].released) nav.released_points = (int)g.size();
+            else released_run = false;
+        };
+        if (i < n_nodes && !segment_.empty() && !leg_nominal_.empty()) {   // 지금 주행 중인 구간의 정상 경로
+            append(leg_nominal_);
+            append(node_tail(nodes_[i]));
+            start = node_end_point(nodes_[i]);
+            mark_released(i);
+            ++i;
+        } else if (i > 0 && i <= n_nodes) {
+            start = node_end_point(nodes_[i - 1]);
+        }
+        int budget = kBudgetPerTick;
+        for (; i < last; ++i) {
+            auto it = global_cache_.find(i);
+            if (it == global_cache_.end()) {
+                if (budget-- <= 0) { nav.status = "PLANNING"; break; }
+                it = global_cache_.emplace(i, plan_global_leg(start, i)).first;
+                ++nav_version_;
+            }
+            if (!it->second.ok) {
+                nav.status = "PARTIAL";
+                nav.failed_node = i;
+                nav.failed_reason = it->second.error;
+                break;
+            }
+            append(it->second.path);
+            start = node_end_point(nodes_[i]);
+            mark_released(i);
+        }
+    }
+    nav.version = nav_version_;
+
+    // 우회 경로가 정상 경로에 다시 붙는 지점 = 정상 경로에서 마지막으로 벗어난 점의 다음 점
+    if (detour_active_ && leg_nominal_.size() >= 2) {
+        const auto& lp = kinematics.get_state().local_path;
+        auto off_nominal = [&](const std::pair<double, double>& p) {
+            double best = 1e9;
+            for (size_t k = 0; k + 1 < leg_nominal_.size(); ++k) {
+                auto [ax, ay] = leg_nominal_[k];
+                auto [bx, by] = leg_nominal_[k + 1];
+                double dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy;
+                double t = L2 > 1e-12 ? std::clamp(((p.first - ax) * dx + (p.second - ay) * dy) / L2, 0.0, 1.0) : 0.0;
+                best = std::min(best, std::hypot(p.first - (ax + t * dx), p.second - (ay + t * dy)));
+            }
+            return best > 0.10;
+        };
+        int last_off = -1;
+        for (int k = 0; k < (int)lp.size(); ++k) if (off_nominal(lp[k])) last_off = k;
+        if (last_off >= 0 && last_off + 1 < (int)lp.size()) {
+            nav.has_local_goal = true;
+            nav.local_goal_x = lp[last_off + 1].first;
+            nav.local_goal_y = lp[last_off + 1].second;
+        }
+    }
+
+    char sig[256];
+    std::snprintf(sig, sizeof sig, "%s|%d|%d|%s|%d|%d|%.1f,%.1f", nav.order_id.c_str(), nav.current_index, nav.version,
+                  nav.status.c_str(), (int)nav.detour_active, (int)nav.has_local_goal,
+                  nav.has_local_goal ? nav.local_goal_x : 0.0, nav.has_local_goal ? nav.local_goal_y : 0.0);
+    const bool changed = nav_sig_ != sig;
+    if (changed && sim_time_ - nav_sent_at_ < 0.2) return std::nullopt;  // 변경이 잦아도 5 Hz 까지만
+    if (!changed && sim_time_ - nav_sent_at_ < 5.0) return std::nullopt;  // 하트비트 (retained 라 재접속은 브로커가 해 준다)
+    nav_sig_ = sig;
+    nav_sent_at_ = sim_time_;
+    return nav;
 }
 
 PhysicsDebug OrderExecutor::build_physics(long long header_id, double timestamp) const {

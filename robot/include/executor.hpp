@@ -3,6 +3,7 @@
 #pragma once
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -106,6 +107,9 @@ public:
     State build_state(long long header_id, double timestamp) const;
     // 뷰어/GUI 디버그용 물리 관측값 (fms/v1/{id}/physics). 프로토콜이 아니다
     PhysicsDebug build_physics(long long header_id, double timestamp) const;
+    // Global 예상 경로 + Local 계획 상태 (sim/v1/{id}/navigation). 바뀌었을 때(+하트비트)만 값이 있다.
+    // 미래 구간 계획은 여기서 tick 당 최대 2 구간씩 이어서 한다 (main 이 매 tick 부른다).
+    std::optional<NavigationDebug> take_navigation(long long header_id, double timestamp);
 
     // GUI/콘솔 설정 변경 (IDLE 일 때만 허용, main 이 호출)
     OperatingMode mode() const { return mode_; }
@@ -152,8 +156,21 @@ private:
     size_t leg_progress_ = 0;      // leg_nominal_ 에서 로봇이 지나는 구간 번호 (단조 증가)
     bool detour_active_ = false;   // 우회 경로를 따라가는 중
     double since_local_plan_ = 1.0;
+    double since_global_replan_ = 1.0;  // 로컬 우회가 안 될 때 구간 전체 재계획(장애물 반영)을 시도하는 간격
     std::optional<Action> acting_;
     double acting_elapsed_ = 0.0;
+
+    // Global 예상 경로 캐시: 노드 번호 -> 그 노드까지의 구간 (정적 맵 기준, 이전 노드 끝점에서 시작).
+    // 현재 구간은 leg_nominal_ 을 쓴다. Order/맵이 바뀌면 비운다. 주행 판단에는 쓰이지 않는다 (표시 전용).
+    struct GlobalLeg { bool ok = false; std::string error; std::vector<std::pair<double, double>> path; };
+    std::map<int, GlobalLeg> global_cache_;
+    int nav_version_ = 0;
+    std::string nav_sig_ = "?";
+    double nav_sent_at_ = -1e9;
+    void invalidate_global() { global_cache_.clear(); ++nav_version_; }
+    GlobalLeg plan_global_leg(std::pair<double, double> start, int node_index);
+    std::pair<double, double> node_end_point(const OrderNode& n) const;   // 노드 액션까지 끝난 뒤 로봇이 있는 곳
+    std::vector<std::pair<double, double>> node_tail(const OrderNode& n) const;  // 구간 목표 뒤에 이어지는 직선 (도킹 진입, STRAIGHT)
 
     // 경로계획 없는 직선 이동 (STRAIGHT 액션, DOCK/PARK 진입, 언도킹). 있으면 tick 이 이것만 돌린다.
     // kinematics 쪽 직선 목표는 PAUSE/E-STOP 에서 지워지므로 여기 목표를 들고 있다가 재개 때 다시 건다.

@@ -487,17 +487,16 @@ def _clear(rid):
 
 
 def test_obstacle():
-    # 1 m 복도가 완전히 막히고 우회로는 로컬 계획 창(5 m) 밖: 서서 기다리다가 치우면 간다
-    m = f"{REPO}/maps/gen_loop/fms_map.json"
-    r = Robot("O1", 1, 9, mapfile=m)
-    r.order("b1", ["12,9,0"])
-    r.wait(lambda s: s["pose"]["x"] > 1.3, 20)
-    _place("O1", 3.5, 9, 0.6, 0.6)
+    # 홀 전체를 가로막는 상자(1 x 200): 우회로도 재경로도 없다 -> 서서 기다리다가 치우면 간다
+    r = Robot("O1", 3, 6)
+    r.order("b1", ["30,6,0"])
+    r.wait(lambda s: s["pose"]["x"] > 8 and s["velocity"] > 0.8, 30)
+    _place("O1", 20, 6, 1.0, 200.0)
     s = r.wait(lambda s: s["sub_state"] == "WAITING" if s.get("sub_state") else False, 20)
-    check("obstacle: robot waits when the corridor is fully blocked", s is not None)
+    check("obstacle: robot waits when no route exists", s is not None)
     time.sleep(3)
     p = r.pose()
-    check("obstacle: stops short of the obstacle", s is not None and p["x"] < 3.5 - 0.3 - 0.25 and r.state["state"] != "ERROR", f"pose={p} state={r.state['state']}")
+    check("obstacle: stops short of the obstacle", s is not None and p["x"] < 20 - 0.5 - 0.21 and r.state["state"] != "ERROR", f"pose={p} state={r.state['state']}")
     rows = r.csv_rows()
     amax = 0.0
     for a, b in zip(rows, rows[1:]):
@@ -507,7 +506,24 @@ def test_obstacle():
     _clear("O1")
     s = r.idle_done("b1", 90)
     p = r.pose()
-    check("obstacle: resumes and arrives after clearing", s is not None and dist((p["x"], p["y"]), (12, 9)) < 0.05, f"pose={p}")
+    check("obstacle: resumes and arrives after clearing", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.05, f"pose={p}")
+    r.stop()
+
+
+def test_reroute():
+    """로컬 창(5 m) 안에 우회로가 없어도 구간 전체를 다시 계획해 다른 길로 간다 (gui_map 0,0 -> 10.26,10.23, 8.3,0 에 1.5x3 상자)."""
+    m = f"{REPO}/maps/gui_map/fms_map.json"
+    r = Robot("G1", 0, 0, mapfile=m)
+    r.order("rr1", ["10.26,10.23,0"])
+    r.wait(lambda s: s["pose"]["x"] > 3, 30)
+    _place("G1", 8.3, 0, 1.5, 3.0)
+    s = r.idle_done("rr1", 120)
+    p = r.pose()
+    errs = [e["error_type"] for st in r.states for e in st.get("errors", [])]
+    check("reroute: arrives at the goal without error", s is not None and dist((p["x"], p["y"]), (10.26, 10.23)) < 0.05 and not errs, f"pose={p} errors={errs}")
+    with open(f"{SCR}/G1.log") as f:
+        log = f.read()
+    check("reroute: the leg was replanned around the obstacle", "rerouted the whole leg" in log or "detour around" in log)
     r.stop()
 
 
@@ -629,6 +645,44 @@ def test_physics_topic():
     r.stop()
 
 
+def test_navigation():
+    """sim/v1/{id}/navigation: Global 예상 경로가 마지막 노드까지 중간 노드를 거쳐 이어지고, 우회 중엔 detour_active, 끝나면 비운다."""
+    m = f"{REPO}/maps/gui_map/fms_map.json"
+    r = Robot("N1", 0, 0, mapfile=m)
+    got = []
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    c.on_message = lambda cl, u, msg: got.append(json.loads(msg.payload))
+    c.connect("localhost", PORT)
+    c.subscribe("sim/v1/N1/navigation", 1)
+    c.loop_start()
+    time.sleep(1.0)
+    check("navigation: idle message (retained/heartbeat) before any order", got and got[-1]["status"] == "IDLE" and got[-1]["global_path"] == [])
+    r.order("n1", ["3,0", "10.26,10.23,0"])
+    t0 = time.time()
+    while time.time() - t0 < 10 and not (got and got[-1]["order_id"] == "n1" and got[-1]["status"] == "READY"):
+        time.sleep(0.1)
+    d = got[-1]
+    gp = d["global_path"]
+    check("navigation: global path published for the order", d["order_id"] == "n1" and d["status"] == "READY" and len(gp) > 5, f"status={d['status']} n={len(gp)}")
+    if gp:
+        check("navigation: global path ends at the last node", dist(gp[-1], (10.26, 10.23)) < 0.05, f"end={gp[-1]}")
+        check("navigation: global path passes the middle node in order", min(dist(p, (3, 0)) for p in gp) < 0.05 and
+              min(range(len(gp)), key=lambda i: dist(gp[i], (3, 0))) < min(range(len(gp)), key=lambda i: dist(gp[i], (10.26, 10.23))))
+        check("navigation: plan radius reported", abs(d["plan_radius"] - 3.0) < 1e-6 or d["plan_radius"] > 0, f"radius={d['plan_radius']}")
+    r.wait(lambda s: s["pose"]["x"] > 4, 30)
+    _place("N1", 8.3, 0, 1.5, 3.0)
+    t0 = time.time()
+    while time.time() - t0 < 40 and not any(g["detour_active"] for g in got):
+        time.sleep(0.2)
+    check("navigation: detour_active reported while avoiding", any(g["detour_active"] for g in got))
+    s = r.idle_done("n1", 120)
+    time.sleep(6)   # 하트비트/변경 반영
+    d = got[-1]
+    check("navigation: cleared after the order ends", s is not None and d["status"] == "IDLE" and d["global_path"] == [], f"status={d['status']} n={len(d['global_path'])}")
+    c.loop_stop()
+    r.stop()
+
+
 def test_estimated_pose():
     """보정 없음(--loc-rate 0): 제어와 State.pose 는 순수 오도메트리로 돈다. 저마찰이면 참 자세가 추정에서 벌어진다."""
     r = Robot("E1", 3, 3, extra=["--friction", "0.3", "--loc-rate", "0"])
@@ -733,7 +787,7 @@ ALL = {
     "move": test_move, "straight": test_straight, "dock": test_dock_park, "collision": test_collision,
     "default": test_default_localized, "script": test_script, "curve": test_curve, "lazy": test_lazy_plan,
     "pause": test_pause_cancel, "ghost": test_ghost_start, "lowfric": test_low_friction, "slip": test_normal_slip_small,
-    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "detour": test_detour, "detour_clear": test_detour_clear, "zone": test_zone_obstacles, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
+    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "reroute": test_reroute, "navigation": test_navigation, "detour": test_detour, "detour_clear": test_detour_clear, "zone": test_zone_obstacles, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
 }
 
 if __name__ == "__main__":

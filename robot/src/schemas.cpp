@@ -502,6 +502,46 @@ Order Order::from_json_string(const std::string& payload) {
 
 // -- PhysicsDebug -----------------------------------------------------
 
+std::string NavigationDebug::to_json_string() const {
+    auto r3 = [](double v) { return std::round(v * 1000) / 1000; };
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "header_id", (double)header_id);
+    cJSON_AddNumberToObject(root, "timestamp", timestamp);
+    cJSON_AddStringToObject(root, "robot_id", robot_id.c_str());
+    cJSON_AddStringToObject(root, "order_id", order_id.c_str());
+    cJSON_AddNumberToObject(root, "version", version);
+    cJSON_AddStringToObject(root, "status", status.c_str());
+    cJSON_AddNumberToObject(root, "current_index", current_index);
+    cJSON* path = cJSON_CreateArray();
+    for (auto& [x, y] : global_path) {
+        cJSON* p = cJSON_CreateArray();
+        cJSON_AddItemToArray(p, cJSON_CreateNumber(r3(x)));
+        cJSON_AddItemToArray(p, cJSON_CreateNumber(r3(y)));
+        cJSON_AddItemToArray(path, p);
+    }
+    cJSON_AddItemToObject(root, "global_path", path);
+    cJSON_AddNumberToObject(root, "released_points", released_points);
+    cJSON_AddBoolToObject(root, "truncated", truncated);
+    cJSON_AddNumberToObject(root, "failed_node", failed_node);
+    cJSON_AddStringToObject(root, "failed_reason", failed_reason.c_str());
+    cJSON_AddBoolToObject(root, "detour_active", detour_active);
+    if (has_local_goal) {
+        cJSON* g = cJSON_CreateArray();
+        cJSON_AddItemToArray(g, cJSON_CreateNumber(r3(local_goal_x)));
+        cJSON_AddItemToArray(g, cJSON_CreateNumber(r3(local_goal_y)));
+        cJSON_AddItemToObject(root, "local_goal", g);
+    } else {
+        cJSON_AddNullToObject(root, "local_goal");
+    }
+    cJSON_AddNumberToObject(root, "plan_radius", r3(plan_radius));
+    cJSON_AddNumberToObject(root, "plan_rate", r3(plan_rate));
+    char* txt = cJSON_PrintUnformatted(root);
+    std::string result(txt);
+    free(txt);
+    cJSON_Delete(root);
+    return result;
+}
+
 std::string PhysicsDebug::to_json_string() const {
     auto r5 = [](double v) { return std::round(v * 100000) / 100000; };
     auto pair = [&](const double* a) {
@@ -713,6 +753,7 @@ std::string topic_order(const std::string& id) { return std::string(TOPIC_PREFIX
 std::string topic_state(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/state"; }
 std::string topic_connection(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/connection"; }
 std::string topic_physics(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/physics"; }
+std::string topic_sim_navigation(const std::string& id) { return "sim/v1/" + id + "/navigation"; }
 std::string topic_instant(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/instant"; }
 std::string topic_sim_teleport(const std::string& id) { return "sim/v1/" + id + "/teleport"; }
 

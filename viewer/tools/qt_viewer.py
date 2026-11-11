@@ -36,7 +36,7 @@ from PySide6.QtGui import (
     QBrush, QColor, QFont, QIcon, QImage, QPainterPath, QPen, QPixmap, QPolygonF,
 )
 from PySide6.QtWidgets import (
-    QGraphicsLineItem, QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
+    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
     QGraphicsRectItem, QGraphicsScene, QGraphicsView,
     QLabel, QMainWindow,
 )
@@ -120,6 +120,7 @@ class RobotView:
     map_uid: Optional[str] = None           # 로봇이 보고한 State.map_id (FMS 맵 uid). None = 로컬 --map / 모름
     # -- 물리 디버그 (fms/v1/{id}/physics, 로봇이 tick 마다(20 Hz) 발행). 없으면 State 값만 쓴다 --
     physics: Optional[dict] = None
+    nav: Optional[dict] = None              # sim/v1/{id}/navigation: Global 예상 경로 + Local 계획 상태 (변경 시에만 옴)
     physics_at: float = 0.0
     accel: float = 0.0                      # 측정 속도의 미분 (EMA)
     peak_slip: float = 0.0                  # 오더 동안 최대 |slip|
@@ -275,6 +276,38 @@ class _RobotItem:
         self.goal_label.setZValue(7)
         scene.addItem(self.goal_label)
 
+        # Global 예상 경로 (얇은 선: 허가된 구간 실선, 아직 주행 허가 없는 뒤쪽은 점선) -- 굵은 Local(추종) 경로와 구분
+        g_pen = QPen(color.lighter(160))
+        g_pen.setWidthF(1.0)
+        g_pen.setCosmetic(True)
+        self.global_item = QGraphicsPathItem()
+        self.global_item.setPen(g_pen)
+        self.global_item.setZValue(2.8)
+        scene.addItem(self.global_item)
+        g2_pen = QPen(g_pen)
+        g2_pen.setStyle(Qt.DotLine)
+        self.global_rest_item = QGraphicsPathItem()
+        self.global_rest_item.setPen(g2_pen)
+        self.global_rest_item.setZValue(2.8)
+        scene.addItem(self.global_rest_item)
+        # 로컬 계획 반경 (점선 원) + 우회 합류점(Local 목표, 마름모)
+        r_pen = QPen(QColor("#ffd60a"))
+        r_pen.setWidthF(1.0)
+        r_pen.setCosmetic(True)
+        r_pen.setStyle(Qt.DashLine)
+        self.radius_item = QGraphicsEllipseItem()
+        self.radius_item.setPen(r_pen)
+        self.radius_item.setZValue(2.4)
+        scene.addItem(self.radius_item)
+        lg_pen = QPen(QColor("#ffd60a"))
+        lg_pen.setWidthF(2.0)
+        lg_pen.setCosmetic(True)
+        self.local_goal_item = QGraphicsPathItem()
+        self.local_goal_item.setPen(lg_pen)
+        self.local_goal_item.setBrush(QBrush(QColor(255, 214, 10, 90)))
+        self.local_goal_item.setZValue(3.8)
+        scene.addItem(self.local_goal_item)
+
         # 지나온 궤적 (실제 물리 자세)
         trail_pen = QPen(color)
         trail_pen.setWidthF(1.3)
@@ -340,7 +373,8 @@ class _RobotItem:
         self.obstacle_items: list[QGraphicsRectItem] = []
 
     def remove(self, scene: QGraphicsScene) -> None:
-        for item in (self.body, self.label, self.path_item, self.leg_item, self.wp_item, self.goal_item,
+        for item in (self.global_item, self.global_rest_item, self.radius_item, self.local_goal_item,
+                     self.body, self.label, self.path_item, self.leg_item, self.wp_item, self.goal_item,
                      self.goal_label, self.trail_item, self.odom, self.gt, self.gt_label, self.gt_trail_item, self.vel_item, *self.obstacle_items):
             scene.removeItem(item)
 
@@ -416,6 +450,66 @@ class _RobotItem:
         br = self.goal_label.boundingRect()
         self.goal_label.setPos(g.x() - br.width() / 2, g.y() - gr - br.height() - 2)
         self.goal_label.setOpacity(alpha)
+
+    def update_navigation_items(self, meta, view: RobotView, show_global: bool, show_local: bool, alpha: float) -> None:
+        """Global 예상 경로(얇은 선), 로컬 계획 반경, 우회 합류점. 지난 부분은 로봇에 가장 가까운 점까지 잘라 낸다."""
+        empty = QPainterPath()
+        nav = view.nav
+        pts = (nav or {}).get("global_path") or []
+        if show_global and len(pts) >= 2:
+            # 로봇에서 가장 가까운 점부터 (앞쪽 일부 구간에서만 찾아 교차/근접한 먼 구간으로 건너뛰지 않는다)
+            start_i = 0
+            best = 1e18
+            for i, (x, y) in enumerate(pts):
+                d = (x - view.dx) ** 2 + (y - view.dy) ** 2
+                if d < best:
+                    best, start_i = d, i
+                if d > best + 25.0 and i > start_i + 50:
+                    break
+            rel = int(nav.get("released_points", len(pts)))
+            solid, dotted = QPainterPath(), QPainterPath()
+            cur = world_to_scene(meta, view.dx, view.dy)
+            solid.moveTo(cur)
+            for i in range(start_i, len(pts)):
+                q = world_to_scene(meta, pts[i][0], pts[i][1])
+                if i < rel:
+                    solid.lineTo(q)
+                else:
+                    if i == max(rel, start_i):
+                        dotted.moveTo(world_to_scene(meta, *pts[i - 1]) if i > 0 else q)
+                    dotted.lineTo(q)
+            self.global_item.setPath(solid)
+            self.global_rest_item.setPath(dotted)
+            self.global_item.setOpacity(alpha)
+            self.global_rest_item.setOpacity(alpha)
+        else:
+            self.global_item.setPath(empty)
+            self.global_rest_item.setPath(empty)
+
+        radius = float((nav or {}).get("plan_radius") or 0.0)
+        active = show_local and nav is not None and nav.get("order_id") and radius > 0
+        if active:
+            rpx = radius / meta.resolution
+            c = world_to_scene(meta, view.dx, view.dy)
+            self.radius_item.setRect(c.x() - rpx, c.y() - rpx, 2 * rpx, 2 * rpx)
+            self.radius_item.setOpacity(alpha * (0.9 if nav.get("detour_active") else 0.35))
+            self.radius_item.setVisible(True)
+        else:
+            self.radius_item.setVisible(False)
+        goal = (nav or {}).get("local_goal")
+        if show_local and goal:
+            g = world_to_scene(meta, goal[0], goal[1])
+            r = 0.16 / meta.resolution
+            dia = QPainterPath()
+            dia.moveTo(g.x(), g.y() - r)
+            dia.lineTo(g.x() + r, g.y())
+            dia.lineTo(g.x(), g.y() + r)
+            dia.lineTo(g.x() - r, g.y())
+            dia.closeSubpath()
+            self.local_goal_item.setPath(dia)
+            self.local_goal_item.setOpacity(alpha)
+        else:
+            self.local_goal_item.setPath(empty)
 
     def update_physics_items(self, meta, view: RobotView, show_trail: bool, show_gt: bool, show_odom: bool,
                              alpha: float, now: float) -> None:
@@ -559,6 +653,8 @@ class MapCanvas(QGraphicsView):
         self._robot_items: dict[str, _RobotItem] = {}
         self._show_grid = True
         self._show_planned_path = True
+        self._show_global = True
+        self._show_local_plan = True
         self._show_physics_hud = True
         self._show_trail = True
         self._show_gt = True
@@ -760,7 +856,7 @@ class MapCanvas(QGraphicsView):
         legend = "■ OCCUPIED   ■ UNKNOWN   ■ FREE"
         if self._zone_items:
             legend += "     ▨ PROHIBIT   ▨ ELEVATOR   ▨ SLOW   ▨ ONEWAY  (z 토글)"
-        legend += "\n키: t 경로  p 물리패널  l 궤적  o GT(참 위치)  i 순수오도(노란)  f 시점고정  k 지우기  g 격자  r 보기초기화"
+        legend += "\n키: t 경로  n Global경로(얇은선)  m 계획반경/합류점  p 물리패널  l 궤적  o GT(참 위치)  i 순수오도(노란)  f 시점고정  k 지우기  g 격자  r 보기초기화"
         self.legend_label.setText(legend)
 
     def set_status(self, note: str) -> None:
@@ -952,6 +1048,14 @@ class MapCanvas(QGraphicsView):
         ]
         return "\n".join(lines)
 
+    def update_navigation(self, robot_id: str, data: dict, now: float = 0.0) -> None:
+        """로봇이 발행한 Global 예상 경로/Local 계획 상태 (sim/v1/{id}/navigation). 표시 전용."""
+        view = self.robots.get(robot_id)
+        if view is None:
+            view = RobotView(robot_id=robot_id)
+            self.robots[robot_id] = view
+        view.nav = data if data.get("order_id") else None   # 빈 메시지 = Order 종료/취소
+
     def set_connection(self, robot_id: str, connection: str, now: float = 0.0) -> None:
         view = self.robots.get(robot_id)
         if view is None:
@@ -1016,6 +1120,7 @@ class MapCanvas(QGraphicsView):
             if robot_id == self._follow:
                 self.centerOn(world_to_scene(m, view.dx, view.dy))   # 줌은 그대로, 중심만 로봇에 고정
             item.update_path(m, view, self._show_planned_path, 0.25 if stale else 0.75)
+            item.update_navigation_items(m, view, self._show_global, self._show_local_plan, 0.25 if stale else 0.8)
             item.update_physics_items(m, view, self._show_trail, self._show_gt, self._show_odom, 0.25 if stale else 0.9, now)
             item.update_obstacles(self._scene, m, view, 0.25 if stale else 0.85)
 
@@ -1098,6 +1203,10 @@ class MapCanvas(QGraphicsView):
             self._refresh_map_pixmap()
         elif key == "t":
             self._show_planned_path = not self._show_planned_path
+        elif key == "n":
+            self._show_global = not self._show_global
+        elif key == "m":
+            self._show_local_plan = not self._show_local_plan
         elif key == "p":
             self._show_physics_hud = not self._show_physics_hud
             self._layout_hud()
@@ -1153,6 +1262,9 @@ class FleetViewWindow(QMainWindow):
 
     def update_physics(self, *a, **kw) -> None:
         self.canvas.update_physics(*a, **kw)
+
+    def update_navigation(self, *a, **kw) -> None:
+        self.canvas.update_navigation(*a, **kw)
 
     def refresh(self, now: float = 0.0) -> None:
         self.canvas.refresh(now)

@@ -395,6 +395,7 @@ int main(int argc, char** argv) {
             while (auto cmd = command_queue.pop()) dispatch_gui_command(executor, comm, map_sync, *cmd);
             executor.tick(dt);
             since_state += dt;
+            if (auto nav = executor.take_navigation(comm.next_header_id(), clock.now())) comm.publish_navigation(*nav);
             comm.publish_physics(executor.build_physics(0, clock.now()));  // 뷰어 디버그 토픽: tick 마다 (20 Hz)
             if (since_state >= STATE_PERIOD) {
                 since_state = 0.0;

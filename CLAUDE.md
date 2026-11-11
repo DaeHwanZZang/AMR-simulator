@@ -156,17 +156,26 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
   - 계획: `plan_segment_path()` 가 구간(노드 1개)의 A* 경유점을 (PSO 뒤에) `smooth_path()`(`planner.cpp`)로 다듬는다. 중간 코너마다 접선이 이어지는 3차 Bézier(목표 반경 0.6 m, 접선 길이는 이웃 구간의 45% 이하)를 샘플(0.1 m)로 넣는다. 샘플이 계획용 팽창 grid 의 비-주행 칸에 걸리면 크기를 절반씩 줄이고, 끝내 안 되면 그 코너는 원래대로 둔다(정지·회전). 꺾임각 0.05 rad 미만(직선)/2.6 rad 초과(U턴)는 곡선화하지 않는다. `SmoothParams`.
   - 추종: `TrapezoidalKinematics::set_path(path, pursuit=true)` 면 `step_ideal` 이 경유점 대신 속도 비례 전방 주시점(0.35 + 0.5 v, 최대 1 m)을 겨냥하고(Pure Pursuit), 곡률 속도 제한(`curvature_speed_cap`: v ≤ 0.8 w_max / κ, 그 지점까지 감속 가능한 범위)을 건다. 경로를 따라 끌고 가지 않고 heading 방향으로 나아가며(조향은 주시점이 한다), 지나친 점은 걷어 낸다. 마지막 점 접근·정지·최종 정렬·3 cm 도착·`goal_` 재걸기는 기존 규칙 그대로다. 곡선을 달리는 중 방위 허용치는 0.6 rad, 서 있다 출발할 때는 0.15 rad(주시점 방위가 추정 노이즈에 흔들려서). 전방 주시 거리는 앞쪽 곡률이 크면 줄인다(현 오차 L²/8R ≤ 4 cm, 최소 0.3 m): 좁은 복도 코너에서 안쪽 벽을 스치던 문제(COLLISION)를 잡았다. `smooth_path` 는 A* 팽창보다 5 cm 더 넉넉한 여유(`SmoothParams::extra_clearance`)를 요구한다.
   - FMS 노드는 곡선으로 통과하지 않는다: 노드마다 정지·정렬한다(위 "경로계획"). 곡선은 한 노드 구간 안의 A* 코너에만 적용된다. STRAIGHT/DOCK 진입·탈출은 별도 직선 제어라 해당 없다.
-  - `State.local_path` 는 이제 곡선 샘플이 포함된 추종 경로다(직선 구간은 끝점만). 장애물 우회(M2)는 아래 절. 아직 없는 것: Global 예상 경로 + `navigation` 디버그 토픽 + 뷰어 표시(M3), 계획 워커 스레드(M4, 필요할 때만).
+  - `State.local_path` 는 이제 곡선 샘플이 포함된 추종 경로다(직선 구간은 끝점만). 장애물 우회(M2)는 아래 절. Global 예상 경로/`navigation` 토픽/뷰어 표시(M3)는 아래 "Global 예상 경로" 항. 아직 없는 것: 계획 워커 스레드(M4, 필요할 때만).
 - **장애물 우회 (로컬 계획, 달리면서)** (`local_planner.cpp`, `executor.cpp` `handle_obstacles`/`restore_nominal`):
   - 감지: 센서 반경(`--sensor-range`, 기본 3 m) 안의 동적 장애물(사각형 좌표)만 안다. 현재 위치만 쓰고 이동 예측은 없다(가로지르는 장애물에는 반응이 늦을 수 있다). 유효 지평선 = `min(--local-plan-radius, sensor_range)`.
   - `replan()` 이 구간의 정상 경로(`leg_nominal_`, 장애물 없이 계획한 곡선 경로)를 저장한다. 장애물이 있어도 정상 경로는 장애물 없이 만든다.
   - 현재 경로(`local_path`)가 장애물(+반폭 5 cm 덜)과 겹치지 않으면 그대로 간다(경로 유지). 겹치면 `--local-plan-rate`(5 Hz) 간격으로 `LocalPlanner::detour()`: 정상 경로 위 막힘 구간을 찾고 그 뒤 `rejoin_margin`(1 m) 지점(창 밖이면 창 안에서 가장 먼 자유 지점)을 합류점으로 삼아, 로봇 중심 반경 R 창(`plan_path_window`: 정적 팽창 grid 를 잘라 장애물 사각형 + 반폭 + `plan_margin` 0.15 m 를 막고 A*)에서 우회 경로를 구하고 정상 경로 꼬리를 이어 `smooth_polyline` 으로 다듬는다. 곡선은 `plan_margin` 의 절반까지만 코너를 자를 수 있다. 달리고 있어도 서지 않고 새 경로로 갈아탄다.
-  - 우회로를 못 찾으면 막힌 지점까지 거리가 제동거리(`v^2/2a`) + 0.3 m 이하일 때만 `hold()`(WAITING) 한다. 그 전에는 접근하면서 재시도한다.
+  - 로컬 창 안에 우회로가 없으면(복도 전체 차단, 창 밖으로 돌아가야 함) **구간 전체를 장애물을 반영해 다시 계획**한다(`plan_segment_path(&obs)`, 1 초 간격 재시도, 정상 경로 `leg_nominal_` 은 그대로). 이 단계가 먼 길로 도는 Global 재경로다 (gui_map 0,0 -> 10.26,10.23 에 8.3,0 1.5x3 상자 시험으로 필요함이 확인됨). 재경로 중 장애물이 사라지면 `restore_nominal()` 이 직선 시야가 막혀 있으므로 구간을 다시 계획한다.
+  - 재경로도 실패하면(길이 없음) 막힌 지점까지 거리가 제동거리(`v^2/2a`) + 0.3 m 이하일 때만 `hold()`(WAITING) 한다. 그 전에는 접근하면서 재시도한다.
   - 장애물이 사라지면 `restore_nominal()`: 이미 정상 경로 15 cm 안이면 그대로, 아니면 정상 경로 위 0.5 m 앞으로 `rejoin()`(직선 시야가 막히면 구간 재계획).
   - 속도 제한: `kinematics.speed_cap = sqrt(2 * 0.8 * a_dec * (sensor_range - 0.5))` (기본 설정 약 1.7 m/s 라 영향 없음).
   - 계획 시간은 `LocalPlanner::record()` 가 `local plan: n= p95= ms` 로 로그에 남긴다 (첫 호출과 20 회마다). 워커 스레드 없이 tick 안에서 동기 계산한다(p95 수십 ms 이하).
   - 직선 액션(STRAIGHT/DOCK 진입·탈출)은 우회하지 않고 장애물이 비킬 때까지 기다린다.
-  - 한계: 로봇끼리 상호작용 없음, 반경 밖 큰 우회(예: 복도 전체 차단 뒤 먼 길)는 자동으로 하지 않고 기다린다.
+  - 한계: 로봇끼리 상호작용 없음, 이동 예측 없음. 재경로는 장애물이 보이는 동안 1 초마다 구간 전체 A* 를 돌려 큰 맵에서는 느릴 수 있다(워커 스레드 미구현).
+- **Global 예상 경로 + `navigation` 토픽 (M3)** (`executor.cpp` `take_navigation`/`plan_global_leg`, `schemas.hpp` `NavigationDebug`):
+  - 표시 전용이다. 주행 판단에는 쓰지 않는다 (실제 추종은 `State.local_path`, 노드 단위 계획은 그대로).
+  - 구성: 현재 구간은 `leg_nominal_`(장애물 없는 정상 경로) 꼬리, 이어서 남은 노드를 정적 맵 기준으로 이전 노드 끝점에서 계획한 구간(`global_cache_`, 현재 노드부터 16 노드까지, tick 당 최대 2 구간씩 이어서 계산). DOCK/PARK 는 접근점 -> 진입 자세, STRAIGHT 는 끝점까지 반영한다. PSO 는 안 쓴다. 아직 released 안 된 노드도 포함하고 `released_points` 로 허가 구간 끝을 알린다.
+  - 캐시는 Order 수신/갱신/종료, 맵 교체 때 비우고 `version` 을 올린다. 로컬 우회만으로는 다시 계산하지 않는다. 한 구간이 실패하면 거기까지만 그리고 `status=PARTIAL`, `failed_node`/`failed_reason` 을 싣는다 (현재 구간 주행은 막지 않는다).
+  - 토픽 `sim/v1/{id}/navigation` (retained, QoS 1, 프로토콜 밖, `main` 이 tick 마다 `take_navigation` 을 불러 값이 있을 때만 발행). 서명(order/현재 노드/version/status/우회 여부/합류점)이 바뀔 때 최대 5 Hz, 안 바뀌면 5 s 하트비트. Order 종료/취소 땐 `status=IDLE` + 빈 경로로 비운다. 필드: `order_id version status current_index global_path released_points truncated failed_node failed_reason detour_active local_goal plan_radius plan_rate`. `local_goal` = 우회 경로가 정상 경로에 다시 붙는 점(정상 경로에서 10 cm 넘게 벗어난 마지막 점의 다음 점), `plan_radius` = min(--local-plan-radius, --sensor-range).
+  - 뷰어: `fleet_monitor.py` 가 구독해 `update_navigation` 으로 넘긴다 (`TOPIC_NAVIGATION_ALL` 은 공유 `common/schemas.py` 를 안 건드리려고 fleet_monitor 안에 둔다). `qt_viewer.py` 가 Global 얇은 선(허가 구간 실선, 뒤는 점선, 로봇 가까운 점부터), 계획 반경 점선 원(우회 중 진하게), 합류점 마름모를 그린다. 키 `n` Global, `m` 반경/합류점. Local(추종) 경로는 기존 굵은 선.
+  - 필드를 바꾸면 `schemas.cpp` `NavigationDebug::to_json_string` 과 `qt_viewer.py` `update_navigation_items` 를 같이 고친다.
+  - 시험: `physics_test.py navigation` (Global 끝점/중간 노드 순서, 우회 중 `detour_active`, 종료 후 비움).
 - **직선 이동 / 도킹 / 주차** (v1.4):
   - `straight_`(StraightMotion: ACTION/DOCK_IN/UNDOCK)가 있으면 `tick` 은 `tick_straight` 만 돈다. 경로계획 없이 `kinematics.set_straight()` 로 heading 을 유지한 채 목표점까지 간다. PAUSE/e-stop 은 kinematics 쪽 목표를 지우므로 executor 가 목표를 들고 있다가 재개 때 다시 건다. `replan()` 은 `straight_` 가 있으면 아무것도 안 한다.
   - STRAIGHT: 노드 도착·정렬 후 노드 theta 방향 `distance` 만큼.
@@ -193,7 +202,7 @@ DOCK/PARK, 충전기·배터리, 충돌, 일시정지/취소, 벽 안 시작, �
   - 문법: `MOVE x y [theta]`(노드 하나, rad 또는 `90deg`), `PICK|DROP|CHARGE|WAIT [초] [key=value..]`, `STRAIGHT|DOCK|PARK key=value..`(직전 MOVE 노드에 붙는 액션), `START`/`END`(선택, END 뒤 명령은 오류), 주석 `//` `#`. 줄 앞 번호는 GOTO 라벨(중복 불가)이고 없어도 된다.
   - 반복: `GOTO 줄번호 횟수` (줄 앞 번호가 라벨). 횟수만큼 점프하고 파일을 읽는 단계에서 노드로 펼쳐 한 Order 로 보낸다. 횟수 없는 GOTO(무한 반복)는 Order 가 정적 노드 목록이라 지원하지 않고 오류를 낸다. 노드 5000개 / 실행 20만 문장 상한. 안쪽 GOTO 는 바깥 루프가 다시 돌 때 횟수가 새로 시작한다. 예시 `scripts/examples/loop_job.txt`.
   - 한 노드에는 액션이 하나뿐이라 액션이 연달아 오면 같은 좌표 노드를 자동 복제한다 (길이 0 구간은 로봇이 문제없이 지나간다, `physics_test.py script`). 첫 액션 앞에는 MOVE 가 있어야 한다.
-  - 액션 인자는 로봇과 같은 검증(`Action::from_json`)을 미리 돌려 줄 번호와 함께 오류를 낸다. `--order-id` 기본값은 파일명. 예시는 `scripts/examples/demo_job.txt`, 런처에는 "스크립트 실행" 항목이 있다.
+  - 액션 인자는 로봇과 같은 검증(`Action::from_json`)을 미리 돌려 줄 번호와 함께 오류를 낸다. `--order-id` 기본값은 `파일명-HHMMSS` (파일명만 쓰면 같은 스크립트 재전송을 로봇이 "이미 끝난 오더" 로 무시한다). 예시는 `scripts/examples/demo_job.txt`, 런처에는 "스크립트 실행" 항목이 있다.
 - **C++ `tools/`**: `send_order`, `place_obstacle`, `obstacle_zone` 은 별도 실행 파일이고 `schemas.o` 만 링크한다. `mqtt_once.hpp` 는 1회 발행 헬퍼다.
 
 ## 아키텍처 (Python 도구, `tools/`)

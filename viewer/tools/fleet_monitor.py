@@ -53,6 +53,7 @@ from tools.map_viewer import MapViewer  # noqa: E402
 log = logging.getLogger("monitor")
 
 TOPIC_ORDER_ALL = f"{TOPIC_PREFIX}/+/order"
+TOPIC_NAVIGATION_ALL = "sim/v1/+/navigation"   # 디버그 토픽 (프로토콜 밖, 공유 schemas.py 에는 넣지 않는다)
 REFRESH_PERIOD_MS = 100
 
 
@@ -99,7 +100,7 @@ class FleetMonitor:
         if reason_code != 0:
             log.error("브로커 접속 실패: %s", reason_code)
             return
-        topics = [(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1), (TOPIC_PHYSICS_ALL, 0)]
+        topics = [(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1), (TOPIC_PHYSICS_ALL, 0), (TOPIC_NAVIGATION_ALL, 1)]
         if self.watch_orders:
             topics.append((TOPIC_ORDER_ALL, 1))
         client.subscribe(topics)
@@ -109,6 +110,12 @@ class FleetMonitor:
         try:
             payload = msg.payload.decode("utf-8")
         except UnicodeDecodeError:
+            return
+        if msg.topic.endswith("/navigation"):  # Global 경로/Local 계획 디버그 (retained, 변경 시에만)
+            try:
+                self._inbox.put(("navigation", json.loads(payload)))
+            except ValueError:
+                pass
             return
         if msg.topic.endswith("/physics"):  # 디버그 토픽: 스키마 없이 dict 로 넘긴다
             try:
@@ -139,10 +146,10 @@ class FleetMonitor:
             except queue.Empty:
                 break
             changed = True
-            if isinstance(message, tuple):  # ("physics", dict)
-                update_physics = getattr(self.viewer, "update_physics", None)  # matplotlib 뷰어엔 없다
-                if update_physics is not None:
-                    update_physics(message[1]["robot_id"], message[1], now=now)
+            if isinstance(message, tuple):  # ("physics" | "navigation", dict)
+                update = getattr(self.viewer, "update_" + message[0], None)  # matplotlib 뷰어엔 없다
+                if update is not None:
+                    update(message[1]["robot_id"], message[1], now=now)
                 continue
             if isinstance(message, State):
                 self.robot_maps[message.robot_id] = (message.map_id, message.map_version)

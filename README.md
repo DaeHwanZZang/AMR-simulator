@@ -129,7 +129,7 @@ build/bin/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK 
 ### 장애물 우회
 
 센서 반경(기본 3 m) 안에서 동적 장애물이 경로를 막으면, 서지 않고 달리면서 로봇 중심 반경 5 m 창에서 우회 경로를 다시 계획해 갈아탄다(`--local-plan-radius`, `--local-plan-rate`).
-장애물이 사라지면 원래 경로로 복귀한다. 우회로가 창 안에 없으면(복도 전체가 막힘 등) 막힌 지점 앞에서 서서 기다리다가 치워지면 간다.
+장애물이 사라지면 원래 경로로 복귀한다. 우회로가 창 안에 없으면 구간 전체를 장애물을 반영해 다시 계획해서 다른 길로 가고(1 초 간격 재시도), 길이 아예 없으면 막힌 지점 앞에서 서서 기다리다가 치워지면 간다.
 장애물은 현재 감지된 위치만 쓰고 이동을 예측하지 않는다(가로지르는 장애물에는 늦게 반응할 수 있다). 구조는 CLAUDE.md "장애물 우회".
 
 ### 텍스트 스크립트로 job 만들기 (`send_order --script`)
@@ -156,7 +156,7 @@ FMS 없이 동작을 텍스트 파일에 순서대로 적으면 Order 하나(= j
 
 ```bash
 build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt --dry-run   # 발행 없이 컴파일 결과만 출력
-build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt             # order_id 기본값 = 파일명
+build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt             # order_id 기본값 = 파일명-HHMMSS (재전송해도 새 오더로 처리)
 ```
 
 ### 물리 시뮬레이션 (MuJoCo)
@@ -212,6 +212,8 @@ build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt             
 `--loc-rate 0` 이면 추정이 그대로 벌어진다. 낮은 마찰 + 보정 주기가 느리면 제자리 회전에서 보정 지연 때문에 추정이 흔들릴 수 있다 (5 Hz, gain 0.15 는 μ 0.3 까지 완주).
 기록 CSV 에는 `x y theta` (GT), `odom_*` (보정 전), `est_*` (보정된 추정) 가 모두 있다. 노이즈에도 경유점 방위가 흔들리지 않도록
 `kinematics.cpp` 가 5 cm 안의 경유점은 건너뛰고 2 cm 안이면 방위를 유지한다.
+
+**Global 예상 경로 (`navigation` 토픽)**: 로봇이 `sim/v1/{id}/navigation` (retained)으로 현재 위치부터 Order 마지막 노드까지의 예상 경로(정적 맵 기준, 중간 노드 순서대로)와 로컬 계획 상태(우회 중 여부, 합류점, 계획 반경)를 변경 시에만 발행한다. 표시 전용이다. 뷰어는 Global 을 얇은 선(주행 허가 전 구간은 점선), 실제 추종 경로(`State.local_path`)를 굵은 선으로 그리고, 계획 반경과 합류점을 보인다. 키 `n` Global 토글, `m` 반경/합류점 토글.
 
 **뷰어 물리 디버그**: 로봇이 `fms/v1/{id}/physics` 토픽으로 tick 마다(20 Hz) 물리 관측값을 발행한다. `State` 는 `extra=forbid` 라
 필드를 더할 수 없어서 따로 뺐고, 프로토콜이 아니라서 FMS 와 맞출 필요가 없다 (뷰어만 읽는다). 내용: 실제 자세/속도(`v_fwd`, `v_lat`, `yaw_rate`),
