@@ -1,6 +1,7 @@
 // tools/send_order.py 포팅. 임시 FMS 대역 -- 오더/즉시명령 발행.
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -286,7 +287,14 @@ int main(int argc, char** argv) {
     order.order_update_id = update_id;
     std::string summary;
     if (!script_file.empty()) {
-        if (!order_id_set) order_id = std::filesystem::path(script_file).stem().string();
+        // 기본 오더 ID = 파일명-시각(HHMMSS). 파일명만 쓰면 같은 스크립트를 다시 보낼 때 로봇이
+        // "이미 끝난 오더" 로 무시한다 (같은 order_id + update 0)
+        if (!order_id_set) {
+            char stamp[16];
+            std::time_t now = std::time(nullptr);
+            std::strftime(stamp, sizeof stamp, "%H%M%S", std::localtime(&now));
+            order_id = std::filesystem::path(script_file).stem().string() + "-" + stamp;
+        }
         order.order_id = order_id;
         try { order.nodes = parse_script(script_file, order_id); }
         catch (const std::exception& e) { std::cerr << e.what() << "\n"; return 1; }
