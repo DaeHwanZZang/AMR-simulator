@@ -1,0 +1,22 @@
+{
+  "_설명": "월드 장애물을 먼저 놓고 로봇을 나중에 띄운다. 나중에 뜬 로봇도 장애물을 보고 피해야 한다 (retained 토픽). 두 번째 로봇은 더 늦게 뜬다.",
+  "map": "maps/empty_hall1/fms_map.json",
+  "timeout": 120,
+  "obstacles": [
+    {"id": "box", "x": 10, "y": 6, "width": 0.6, "height": 0.6, "at": 0}
+  ],
+  "robots": [
+    {"id": "A", "x": 5, "y": 6, "theta": 0, "at": 2},
+    {"id": "B", "x": 5, "y": 8, "theta": 0, "at": 6}
+  ],
+  "orders": [
+    {"robot": "A", "at": 4, "path": ["15,6,0"]},
+    {"robot": "B", "at": 9, "path": ["15,6.6,0"]}
+  ],
+  "expect": [
+    {"robot": "A", "pose": [15, 6], "tol": 0.05},
+    {"robot": "B", "pose": [15, 6.6], "tol": 0.05},
+    {"no_fatal": true},
+    {"min_separation": 0.45}
+  ]
+}

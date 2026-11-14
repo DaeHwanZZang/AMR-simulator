@@ -9,12 +9,18 @@
 // 가면 모델을 다시 컴파일한다 (상태는 이어받는다). 그래서 맵이 커도 tick 비용이 일정하다.
 #pragma once
 
+#include <algorithm>
 #include <memory>
 
 #include "localizer.hpp"
 #include "map_model.hpp"
 
 namespace fms {
+
+// 충돌 원판 반지름을 폭/2 보다 이만큼 줄인다 (planner 팽창이 픽셀 단위라 최악 ~1.5 cm 가까이 갈 수 있다)
+inline constexpr double kBodySkin = 0.04;
+// 몸체 충돌 원판 반지름. 벽 접촉(MuJoCo)과 동적 장애물/다른 로봇 겹침 판정(executor)이 같은 값을 쓴다.
+inline double body_disc_radius(double width) { return std::max(0.05, width / 2 - kBodySkin); }
 
 struct RobotSpec {
     double width = 0.5, length = 0.7;  // 충돌 상자 크기 (m). 벽에 닿는 건 이 상자뿐이다

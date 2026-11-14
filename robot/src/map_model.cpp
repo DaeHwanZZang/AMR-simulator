@@ -1,3 +1,4 @@
+#include <limits>
 #include "map_model.hpp"
 
 #include <cjson/cJSON.h>
@@ -83,6 +84,24 @@ MapModel MapModel::load(const std::string& metadata_path) {
         cJSON* z;
         cJSON_ArrayForEach(z, zones) {
             cJSON* type = cJSON_GetObjectItemCaseSensitive(z, "type");
+            if (cJSON_IsString(type) && std::string(type->valuestring) == "slow") {
+                // 감속 구역: 임의 다각형 + speed_limit. 값이 잘못됐으면 맵을 거부하지 않고 그 구역만 건너뛴다.
+                cJSON* sid = cJSON_GetObjectItemCaseSensitive(z, "zone_id");
+                cJSON* limit = cJSON_GetObjectItemCaseSensitive(z, "speed_limit");
+                cJSON* spoly = cJSON_GetObjectItemCaseSensitive(z, "polygon");
+                if (!cJSON_IsNumber(limit) || !(limit->valuedouble > 0) || !cJSON_IsArray(spoly)) continue;
+                SlowZone slow{cJSON_IsString(sid) ? sid->valuestring : "", {}, limit->valuedouble};
+                cJSON* sp;
+                bool ok = true;
+                cJSON_ArrayForEach(sp, spoly) {
+                    cJSON* x = cJSON_GetObjectItemCaseSensitive(sp, "x");
+                    cJSON* y = cJSON_GetObjectItemCaseSensitive(sp, "y");
+                    if (!cJSON_IsNumber(x) || !cJSON_IsNumber(y)) { ok = false; break; }
+                    slow.polygon.emplace_back(x->valuedouble, y->valuedouble);
+                }
+                if (ok && slow.polygon.size() >= 3) model.slow_zones.push_back(std::move(slow));
+                continue;
+            }
             if (!cJSON_IsString(type) || std::string(type->valuestring) != "occupancy") continue;
             cJSON* id = cJSON_GetObjectItemCaseSensitive(z, "zone_id");
             cJSON* poly = cJSON_GetObjectItemCaseSensitive(z, "polygon");
@@ -114,6 +133,22 @@ MapModel MapModel::load(const std::string& metadata_path) {
         }
     }
     return model;
+}
+
+double MapModel::speed_limit_at(double x, double y) const {
+    double limit = std::numeric_limits<double>::infinity();
+    for (const auto& z : slow_zones) {
+        // ray casting (common/map_annotations.py Zone.contains 와 같은 규칙)
+        bool inside = false;
+        const size_t n = z.polygon.size();
+        for (size_t i = 0, j = n - 1; i < n; j = i++) {
+            const auto& [xi, yi] = z.polygon[i];
+            const auto& [xj, yj] = z.polygon[j];
+            if (((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+        }
+        if (inside) limit = std::min(limit, z.speed_limit);
+    }
+    return limit;
 }
 
 bool MapModel::traffic_blocked(double x, double y, double margin, const std::vector<std::string>& allowed) const {

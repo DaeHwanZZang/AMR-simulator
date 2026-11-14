@@ -1,6 +1,7 @@
 // 로컬 경로계획 A* (robot_client/planner.py 포팅)
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -57,6 +58,9 @@ std::vector<std::pair<double, double>> smooth_path(
 std::vector<std::pair<double, double>> smooth_polyline(
     const std::vector<std::pair<double, double>>& path, const std::function<bool(double, double)>& free_at,
     double resolution, const SmoothParams& params = SmoothParams());
+
+// 팽창 코어 (시험용으로 공개). grid 값 2 = FREE. 반지름 radius_px 원판 안에 비-FREE 칸이 있는 칸을 0 으로 만든다.
+std::vector<uint8_t> inflate_grid(const std::vector<uint8_t>& grid, int w, int h, int radius_px);
 
 // 정적 팽창 grid (2 = 주행 가능, 복사 없음, 교통 구역/동적 장애물 미반영). 맵당 로봇 반폭별로 캐시된다.
 const std::vector<uint8_t>& static_planning_grid(const MapModel& map_model, double robot_width);

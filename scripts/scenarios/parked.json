@@ -1,0 +1,18 @@
+{
+  "_설명": "A 의 직선 경로 한가운데에 B 가 서 있다. A 는 B 를 돌아서 가고 B 는 영향을 받지 않는다.",
+  "map": "maps/empty_hall1/fms_map.json",
+  "timeout": 90,
+  "robots": [
+    {"id": "A", "x": 5, "y": 6, "theta": 0},
+    {"id": "B", "x": 12, "y": 6, "theta": 1.57}
+  ],
+  "orders": [
+    {"robot": "A", "at": 1, "path": ["20,6,0"]}
+  ],
+  "expect": [
+    {"robot": "A", "pose": [20, 6], "tol": 0.05},
+    {"robot": "B", "pose": [12, 6], "tol": 0.05},
+    {"no_fatal": true},
+    {"min_separation": 0.45}
+  ]
+}

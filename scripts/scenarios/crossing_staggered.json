@@ -1,0 +1,19 @@
+{
+  "_설명": "두 로봇의 경로가 (13, 6) 에서 직각으로 만나지만 B 가 3 초 늦게 출발한다. A 가 먼저 지나가고 B 는 필요하면 비켜 간다.",
+  "map": "maps/empty_hall1/fms_map.json",
+  "timeout": 120,
+  "robots": [
+    {"id": "A", "x": 8, "y": 6, "theta": 0},
+    {"id": "B", "x": 13, "y": 1, "theta": 1.57}
+  ],
+  "orders": [
+    {"robot": "A", "at": 1, "path": ["18,6,0"]},
+    {"robot": "B", "at": 4, "path": ["13,10.5,1.57"]}
+  ],
+  "expect": [
+    {"robot": "A", "pose": [18, 6], "tol": 0.05},
+    {"robot": "B", "pose": [13, 10.5], "tol": 0.05},
+    {"no_fatal": true},
+    {"min_separation": 0.45}
+  ]
+}

@@ -21,7 +21,6 @@ namespace {
 
 constexpr double kTimestep = 0.002;        // MuJoCo 적분 간격 (s). tick 50 ms 안에서 25 번 돈다
 constexpr double kWallHeight = 0.5;        // 벽 상자 높이 (m)
-constexpr double kBodySkin = 0.04;         // 충돌 원판 반지름을 폭/2 보다 이만큼 줄인다 (planner 팽창이 픽셀 단위라 최악 ~1.5 cm 가까이 갈 수 있다)
 constexpr double kCasterRadius = 0.04;
 constexpr double kBucket = 4.0;            // 벽 공간 색인 버킷 크기 (m)
 constexpr double kWindowHalf = 8.0;        // 로봇 주변 이 반경 안의 벽만 모델에 넣는다 (m)
@@ -157,7 +156,7 @@ std::string make_xml(const RobotSpec& s, double x, double y, double theta, const
     o.precision(9);
     const double R = s.wheel_radius, B = track_of(s);
     const double hl = s.length / 2;
-    const double body_r = std::max(0.05, s.width / 2 - kBodySkin);  // 충돌 원판 반지름
+    const double body_r = body_disc_radius(s.width);  // 충돌 원판 반지름
     const double caster_x = std::max(0.05, hl - 0.07);
     const double caster_z = -(R - kCasterRadius);
     o << "<mujoco>\n"
@@ -299,7 +298,7 @@ struct PhysicsWorld::Impl {
         const auto& grid = map->classify_grid();
         const auto& md = map->metadata;
         const double res = md.resolution;
-        const double r = std::max(0.05, spec.width / 2 - kBodySkin);
+        const double r = body_disc_radius(spec.width);
         int px0 = (int)std::floor((x - r - md.origin_x) / res), px1 = (int)std::floor((x + r - md.origin_x) / res);
         int py0 = (int)std::floor((y - r - md.origin_y) / res), py1 = (int)std::floor((y + r - md.origin_y) / res);
         for (int py = py0; py <= py1; ++py)

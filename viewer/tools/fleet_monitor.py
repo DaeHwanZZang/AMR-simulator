@@ -6,7 +6,7 @@
 
     python tools/fleet_monitor.py maps/warehouse/warehouse.json
 
-**순수 관측자다.** 로봇에게 아무것도 보내지 않고, 로봇을 시뮬레이션하지도 않는다.
+**관측자다.** 발행하는 건 뷰어의 월드 장애물 배치/삭제(`publish_world_obstacle`)뿐이고, 로봇을 시뮬레이션하지도 않는다.
 화면에 보이는 모든 값은 로봇 프로세스가 스스로 보고한 것이다. 모니터를 꺼도
 로봇들은 그대로 돌아가고, 로봇이 없으면 빈 맵만 보인다.
 
@@ -54,11 +54,14 @@ log = logging.getLogger("monitor")
 
 TOPIC_ORDER_ALL = f"{TOPIC_PREFIX}/+/order"
 TOPIC_NAVIGATION_ALL = "sim/v1/+/navigation"   # 디버그 토픽 (프로토콜 밖, 공유 schemas.py 에는 넣지 않는다)
+# 월드 장애물 (시뮬 전용, 프로토콜 밖). 장애물 하나당 retained 토픽 하나, 빈 페이로드 = 삭제. 로봇(comm.cpp)도 같은 토픽을 구독한다
+TOPIC_WORLD_OBSTACLE_PREFIX = "sim/v1/world/obstacles/"
+TOPIC_WORLD_OBSTACLES_ALL = TOPIC_WORLD_OBSTACLE_PREFIX + "+"
 REFRESH_PERIOD_MS = 100
 
 
 class FleetMonitor:
-    """MQTT 를 구독해 MapViewer 에 밀어넣는다. 발행은 하지 않는다."""
+    """MQTT 를 구독해 MapViewer 에 밀어넣는다. 발행은 월드 장애물 배치/삭제(publish_world_obstacle)뿐이다."""
 
     def __init__(self, viewer: MapViewer, host: str = "localhost", port: int = 1883,
                  watch_orders: bool = True,
@@ -94,13 +97,27 @@ class FleetMonitor:
         self._client.loop_stop()
         self._client.disconnect()
 
+    def publish_world_obstacle(self, obstacle_id: str, rect: Optional[dict]) -> bool:
+        """월드 장애물을 놓거나(rect = {x, y, width, height[, map_id]}) 지운다(rect = None).
+
+        뷰어의 유일한 발행 경로다. 장애물 하나 = retained 토픽 하나(sim/v1/world/obstacles/{id}, 빈 페이로드 = 삭제)라서
+        모든 로봇이 같은 장애물을 보고, 나중에 뜬 로봇과 뷰어도 받는다. 메인(Qt) 스레드에서 부른다 (paho publish 는 스레드 안전)."""
+        try:
+            payload = json.dumps(rect) if rect is not None else b""
+            self._client.publish(TOPIC_WORLD_OBSTACLE_PREFIX + obstacle_id, payload, qos=1, retain=True)
+        except Exception as e:  # noqa: BLE001 -- 발행 실패가 뷰어를 죽이면 안 된다
+            log.warning("월드 장애물 발행 실패 (%s): %s", obstacle_id, e)
+            return False
+        return True
+
     # -- paho 콜백 (네트워크 스레드) -----------------------------------------
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
         if reason_code != 0:
             log.error("브로커 접속 실패: %s", reason_code)
             return
-        topics = [(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1), (TOPIC_PHYSICS_ALL, 0), (TOPIC_NAVIGATION_ALL, 1)]
+        topics = [(TOPIC_STATE_ALL, 0), (TOPIC_CONNECTION_ALL, 1), (TOPIC_PHYSICS_ALL, 0), (TOPIC_NAVIGATION_ALL, 1),
+                  (TOPIC_WORLD_OBSTACLES_ALL, 1)]
         if self.watch_orders:
             topics.append((TOPIC_ORDER_ALL, 1))
         client.subscribe(topics)
@@ -110,6 +127,19 @@ class FleetMonitor:
         try:
             payload = msg.payload.decode("utf-8")
         except UnicodeDecodeError:
+            return
+        if msg.topic.startswith(TOPIC_WORLD_OBSTACLE_PREFIX):  # 월드 장애물 (retained). 빈 페이로드 = 삭제
+            oid = msg.topic[len(TOPIC_WORLD_OBSTACLE_PREFIX):]
+            rect = None
+            if payload:
+                try:
+                    data = json.loads(payload)
+                    rect = {"x": float(data["x"]), "y": float(data["y"]),
+                            "width": float(data.get("width", 0.4)), "height": float(data.get("height", 0.4)),
+                            "map_id": data.get("map_id") or None}
+                except (ValueError, KeyError, TypeError):
+                    return
+            self._inbox.put(("world_obstacle", {"id": oid, "rect": rect}))
             return
         if msg.topic.endswith("/navigation"):  # Global 경로/Local 계획 디버그 (retained, 변경 시에만)
             try:
@@ -146,8 +176,12 @@ class FleetMonitor:
             except queue.Empty:
                 break
             changed = True
-            if isinstance(message, tuple):  # ("physics" | "navigation", dict)
+            if isinstance(message, tuple):  # ("physics" | "navigation" | "world_obstacle", dict)
                 update = getattr(self.viewer, "update_" + message[0], None)  # matplotlib 뷰어엔 없다
+                if message[0] == "world_obstacle":
+                    if update is not None:
+                        update(message[1]["id"], message[1]["rect"])
+                    continue
                 if update is not None:
                     update(message[1]["robot_id"], message[1], now=now)
                 continue

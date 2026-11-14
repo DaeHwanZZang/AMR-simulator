@@ -28,8 +28,10 @@ public:
         }
     }
     bool ok() const { return ok_; }
-    void publish(const std::string& topic, const std::string& payload, int qos = 1) {
-        mosquitto_publish(mosq_, nullptr, topic.c_str(), (int)payload.size(), payload.c_str(), qos, false);
+    // retain = true 면 브로커가 마지막 값을 보관한다 (빈 payload + retain = 보관된 값 삭제)
+    void publish(const std::string& topic, const std::string& payload, int qos = 1, bool retain = false) {
+        mosquitto_publish(mosq_, nullptr, topic.c_str(), (int)payload.size(), payload.empty() ? nullptr : payload.c_str(), qos,
+                          retain);
         std::this_thread::sleep_for(std::chrono::milliseconds(150));  // wait_for_publish 근사
     }
 

@@ -25,6 +25,7 @@ struct LocalPlanConfig {
     double rejoin_ahead = 0.5;   // m, 장애물이 사라진 뒤 nominal 위 이만큼 앞 지점으로 복귀한다
     double plan_margin = 0.15;   // m, 우회 계획 때 장애물을 이만큼 더 키운다 (막힘 판정보다 넉넉히 비켜 가려고)
     double sample_step = 0.1;    // m
+    double shortcut_gain = 1.0;  // m, 합류점을 거치는 것보다 nominal 뒤쪽으로 바로 가는 편이 이만큼 넘게 짧으면 그쪽으로 간다
 };
 
 // nominal(폴리라인)에서 로봇에 가장 가까운 구간 번호 (progress 이후, 앞쪽 일부만 본다). 단조 증가.

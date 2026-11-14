@@ -6,7 +6,7 @@ matplotlib 버전(`tools/map_viewer.py`)을 대체하는 실시간 뷰어. PySid
 QGraphicsView 기반 — GoCart Viz 같은 로봇 시각화 툴의 표준 구성이다.
 
 **이 모듈도 로봇을 시뮬레이션하지 않는다.** 여전히 순수 표시 레이어다.
-matplotlib 버전과 똑같이 로봇이 보고한 값만 그리고, 아무것도 발행하지 않는다.
+matplotlib 버전과 똑같이 로봇이 보고한 값만 그린다. 발행은 장애물 배치/취소(b/u 키)뿐이다.
 MQTT 구독/파싱은 `tools/fleet_monitor.py` 의 `FleetMonitor` 를 그대로 재사용한다
 (그쪽은 처음부터 렌더러에 의존하지 않게 짜여 있었다 — `update_robot()` /
 `set_connection()` 두 메서드만 호출한다).
@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -65,6 +66,9 @@ WP_PASSED_DIST = 0.20      # 로봇이 경유점에 이만큼(m) 안으로 오�
 FORCE_ALERT = 5.0          # 벽 접촉력(N)이 이보다 크면 GT 윤곽을 빨갛게
 GT_COLOR = "#00e5ff"       # 참 위치(ground truth) 표시 색
 ODOM_COLOR = "#ffd60a"     # 보정 전 순수 오도메트리 표시 색
+OBSTACLE_PX = 3            # 클릭으로 놓는 장애물 한 변 (맵 픽셀)
+CLICK_SLOP_PX = 4          # 누른 자리에서 이만큼(화면 px) 안에서 뗐으면 드래그가 아니라 클릭
+PLACED_COLOR = "#ff9f0a"   # 뷰어가 놓은 장애물 표시 색
 
 # zone 타입별 색 — vendor zone_meta.json 을 그리는 용도 (표시 전용, 로봇 내비게이션엔
 # 관여 안 한다 — 그쪽은 fms_server 가 grid 에 구워서 각 로봇이 직접 받는다)
@@ -276,7 +280,7 @@ class _RobotItem:
         self.goal_label.setZValue(7)
         scene.addItem(self.goal_label)
 
-        # Global 예상 경로 (얇은 선: 허가된 구간 실선, 아직 주행 허가 없는 뒤쪽은 점선) -- 굵은 Local(추종) 경로와 구분
+        # Global 경로 (지금 향하는 노드 구간의 정상 경로, 얇은 선) -- 굵은 Local(추종) 경로와 구분
         g_pen = QPen(color.lighter(160))
         g_pen.setWidthF(1.0)
         g_pen.setCosmetic(True)
@@ -284,12 +288,6 @@ class _RobotItem:
         self.global_item.setPen(g_pen)
         self.global_item.setZValue(2.8)
         scene.addItem(self.global_item)
-        g2_pen = QPen(g_pen)
-        g2_pen.setStyle(Qt.DotLine)
-        self.global_rest_item = QGraphicsPathItem()
-        self.global_rest_item.setPen(g2_pen)
-        self.global_rest_item.setZValue(2.8)
-        scene.addItem(self.global_rest_item)
         # 로컬 계획 반경 (점선 원) + 우회 합류점(Local 목표, 마름모)
         r_pen = QPen(QColor("#ffd60a"))
         r_pen.setWidthF(1.0)
@@ -373,7 +371,7 @@ class _RobotItem:
         self.obstacle_items: list[QGraphicsRectItem] = []
 
     def remove(self, scene: QGraphicsScene) -> None:
-        for item in (self.global_item, self.global_rest_item, self.radius_item, self.local_goal_item,
+        for item in (self.global_item, self.radius_item, self.local_goal_item,
                      self.body, self.label, self.path_item, self.leg_item, self.wp_item, self.goal_item,
                      self.goal_label, self.trail_item, self.odom, self.gt, self.gt_label, self.gt_trail_item, self.vel_item, *self.obstacle_items):
             scene.removeItem(item)
@@ -452,7 +450,7 @@ class _RobotItem:
         self.goal_label.setOpacity(alpha)
 
     def update_navigation_items(self, meta, view: RobotView, show_global: bool, show_local: bool, alpha: float) -> None:
-        """Global 예상 경로(얇은 선), 로컬 계획 반경, 우회 합류점. 지난 부분은 로봇에 가장 가까운 점까지 잘라 낸다."""
+        """Global 경로(현재 구간, 얇은 선), 로컬 계획 반경, 우회 합류점. 지난 부분은 로봇에 가장 가까운 점까지 잘라 낸다."""
         empty = QPainterPath()
         nav = view.nav
         pts = (nav or {}).get("global_path") or []
@@ -466,25 +464,13 @@ class _RobotItem:
                     best, start_i = d, i
                 if d > best + 25.0 and i > start_i + 50:
                     break
-            rel = int(nav.get("released_points", len(pts)))
-            solid, dotted = QPainterPath(), QPainterPath()
-            cur = world_to_scene(meta, view.dx, view.dy)
-            solid.moveTo(cur)
+            path = QPainterPath(world_to_scene(meta, view.dx, view.dy))
             for i in range(start_i, len(pts)):
-                q = world_to_scene(meta, pts[i][0], pts[i][1])
-                if i < rel:
-                    solid.lineTo(q)
-                else:
-                    if i == max(rel, start_i):
-                        dotted.moveTo(world_to_scene(meta, *pts[i - 1]) if i > 0 else q)
-                    dotted.lineTo(q)
-            self.global_item.setPath(solid)
-            self.global_rest_item.setPath(dotted)
+                path.lineTo(world_to_scene(meta, pts[i][0], pts[i][1]))
+            self.global_item.setPath(path)
             self.global_item.setOpacity(alpha)
-            self.global_rest_item.setOpacity(alpha)
         else:
             self.global_item.setPath(empty)
-            self.global_rest_item.setPath(empty)
 
         radius = float((nav or {}).get("plan_radius") or 0.0)
         active = show_local and nav is not None and nav.get("order_id") and radius > 0
@@ -659,6 +645,15 @@ class MapCanvas(QGraphicsView):
         self._show_trail = True
         self._show_gt = True
         self._show_odom = True
+        self._show_help = True
+        self._place_mode = False             # b: 켜면 클릭이 장애물 배치
+        # 월드 장애물 (sim/v1/world/obstacles, 모든 로봇/뷰어가 공유). id -> {x, y, width, height, map_id, item}.
+        # 구독 결과로만 채운다: 이 뷰어가 놓은 것도 브로커를 한 바퀴 돌아와서 그려진다 (다른 뷰어/도구가 놓은 것도 같이 보인다)
+        self._world: dict[str, dict] = {}
+        self._placed: list[str] = []         # 이 뷰어가 놓은 obstacle_id -- 놓은 순서, u 로 뒤에서부터 취소
+        self._press_pos = None
+        # (obstacle_id, rect | None) -> bool. fleet_monitor_qt 가 MQTT 발행 함수를 꽂는다. None 이면 배치 불가
+        self.publish_world: Optional[Callable[[str, Optional[dict]], bool]] = None
         self._follow: Optional[str] = None   # 시점을 따라다닐 로봇 id (f 로 순환, 드래그하면 해제)
         # robot_id -> 그 로봇의 가장 최근 이벤트 한 줄. 예전엔 deque 로 모든 로봇의
         # 이벤트를 시간순으로 쌓아서, 화면에 안 남은 지 오래된 로봇의 옛날 이벤트가
@@ -824,6 +819,13 @@ class MapCanvas(QGraphicsView):
 
         self.title_label = hud_label()
         self.legend_label = hud_label()
+        self.help_label = hud_label()
+        self.help_label.setTextFormat(Qt.RichText)
+        self.help_label.setFont(QFont("Menlo, Consolas, monospace", 10))
+        self.help_label.setStyleSheet(
+            "background-color: rgba(14,14,18,215); color: #e6e6ea; "
+            "padding: 8px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,40);"
+        )
         self._update_title()
         self._update_legend()
 
@@ -848,6 +850,8 @@ class MapCanvas(QGraphicsView):
         text = f"{self.map_label}  —  {m.width_m:g} x {m.height_m:g} m  @ {m.resolution:g} m/px"
         if self._follow:
             text += f"   [follow {self._follow}]"
+        if self._place_mode:
+            text += f"   [장애물 배치 ON: 클릭 = {OBSTACLE_PX}x{OBSTACLE_PX}px]"
         if self.status_note:
             text += f"   {self.status_note}"
         self.title_label.setText(text)
@@ -855,9 +859,62 @@ class MapCanvas(QGraphicsView):
     def _update_legend(self) -> None:
         legend = "■ OCCUPIED   ■ UNKNOWN   ■ FREE"
         if self._zone_items:
-            legend += "     ▨ PROHIBIT   ▨ ELEVATOR   ▨ SLOW   ▨ ONEWAY  (z 토글)"
-        legend += "\n키: t 경로  n Global경로(얇은선)  m 계획반경/합류점  p 물리패널  l 궤적  o GT(참 위치)  i 순수오도(노란)  f 시점고정  k 지우기  g 격자  r 보기초기화"
+            legend += "     ▨ PROHIBIT   ▨ ELEVATOR   ▨ SLOW   ▨ ONEWAY"
+        if not self._show_help:
+            legend += "     [H] 단축키"
         self.legend_label.setText(legend)
+        self._update_help()
+
+    def _help_groups(self):
+        """(제목, [(키, 설명, 켜짐 여부 또는 None)]) -- 토글 상태를 패널에 같이 보여 준다."""
+        return [
+            ("보기", [
+                ("G", "격자", self._show_grid), ("C", "분류색 / 원본", self._classified),
+                ("Z", "구역", self._show_zones), ("F", "시점 고정(순환)", self._follow is not None),
+                ("R", "보기 초기화", None),
+            ]),
+            ("경로", [
+                ("T", "계획 경로", self._show_planned_path), ("N", "Global 경로", self._show_global),
+                ("M", "계획 반경 / 합류점", self._show_local_plan),
+            ]),
+            ("디버그", [
+                ("P", "물리 패널", self._show_physics_hud), ("L", "지나온 궤적", self._show_trail),
+                ("O", "GT 참 위치", self._show_gt), ("I", "순수 오도메트리", self._show_odom),
+                ("K", "궤적 지우기", None),
+            ]),
+            ("장애물", [
+                ("B", "배치 모드", self._place_mode),
+                ("U", f"직전 취소  ({len(self._placed)}개)", None),
+                ("⇧U", f"전부 지우기  ({len(self._world)}개)", None),
+            ]),
+        ]
+
+    def _update_help(self) -> None:
+        if not self._show_help:
+            self.help_label.setText("")
+            self.help_label.hide()
+            return
+        cap = ("background-color:#3a3a44; color:#ffffff; font-weight:bold;")
+        cells = []
+        for title, rows in self._help_groups():
+            body = [f'<tr><td colspan="3" style="color:#8ab4ff; font-weight:bold; padding-bottom:3px;">{title}</td></tr>']
+            for key, desc, on in rows:
+                dot = ('<span style="color:#30d158;">●</span>' if on else '<span style="color:#6b6b73;">○</span>') \
+                    if on is not None else '<span style="color:#00000000;">○</span>'
+                body.append(
+                    f'<tr><td style="padding:1px 0;"><span style="{cap}">&nbsp;{key}&nbsp;</span></td>'
+                    f'<td style="padding:1px 8px;">{desc}</td><td>{dot}</td></tr>'
+                )
+            cells.append('<td valign="top" style="padding-right:18px;"><table cellspacing="0">' + "".join(body) + "</table></td>")
+        mouse = (
+            '<tr><td colspan="4" style="color:#9a9aa3; padding-top:6px;">'
+            '드래그 이동 · 휠 확대/축소 · B 켠 뒤 클릭 = 장애물 · ⌘Z 도 취소 · '
+            '<span style="color:#30d158;">●</span> 켜짐 <span style="color:#6b6b73;">○</span> 꺼짐 · H 닫기'
+            '</td></tr>'
+        )
+        self.help_label.setText(f'<table cellspacing="0"><tr>{"".join(cells)}</tr>{mouse}</table>')
+        self.help_label.show()
+        self.help_label.adjustSize()
 
     def set_status(self, note: str) -> None:
         if note != self.status_note:
@@ -877,6 +934,8 @@ class MapCanvas(QGraphicsView):
         self._scene.clear()          # 맵/격자/원점/구역/로봇 그림 전부 (C++ 객체가 지워진다)
         self._robot_items.clear()    # 지워진 그림을 다시 만지지 않게 참조도 버린다
         self._zone_items = []
+        for entry in self._world.values():   # 그림은 scene.clear() 로 사라졌다. 장애물 자체는 남아 있으니 아래에서 다시 그린다
+            entry["item"] = None
         self.map = map_model
         self.map_uid = map_uid
         self.map_label = map_label or map_model.metadata.name
@@ -888,6 +947,8 @@ class MapCanvas(QGraphicsView):
         self._build_zones()
         for item in self._zone_items:
             item.setVisible(self._show_zones)
+        for oid in list(self._world):
+            self._draw_world_obstacle(oid)
         self._update_title()
         self._update_legend()
         self._layout_hud()
@@ -902,14 +963,16 @@ class MapCanvas(QGraphicsView):
 
     def _layout_hud(self) -> None:
         # setText() 는 크기를 자동으로 안 늘려준다 — 배치 전에 매번 다시 재야 한다
-        for lbl in (self.title_label, self.legend_label, self.event_label,
+        for lbl in (self.title_label, self.legend_label, self.help_label, self.event_label,
                     self.info_label, self.coord_label, self.physics_label):
             lbl.adjustSize()
 
         vp = self.viewport().rect()
         pad = 8
         self.title_label.move(pad, pad)
-        self.legend_label.move(pad, vp.height() - self.legend_label.height() - pad)
+        help_h = self.help_label.height() + 4 if self._show_help else 0
+        self.help_label.move(pad, vp.height() - self.help_label.height() - pad)
+        self.legend_label.move(pad, vp.height() - self.legend_label.height() - pad - help_h)
         self.event_label.move(pad, self.title_label.geometry().bottom() + 4)
         self.physics_label.move(pad, self.event_label.geometry().bottom() + 6)
         self.physics_label.setVisible(self._show_physics_hud and bool(self.physics_label.text()))
@@ -995,7 +1058,9 @@ class MapCanvas(QGraphicsView):
         view.peak_force = max(view.peak_force, data["wall_force"])
         view.physics = data
         view.physics_at = now
-        self._add_trail(view, data["odom_x"], data["odom_y"])           # 로봇이 보고한 위치 (= State.pose)
+        # 로봇이 보고한 위치 (= State.pose = 보정된 추정). odom_* 는 보정 전 순수 엔코더라 누적 오차로 실제 경로와 벌어진다.
+        # est 가 없는 옛 로봇만 odom 을 쓴다
+        self._add_trail(view, data.get("est_x", data["odom_x"]), data.get("est_y", data["odom_y"]))
         self._add_trail(view, data["x"], data["y"], view.gt_trail)      # 참 위치
 
     @staticmethod
@@ -1174,11 +1239,111 @@ class MapCanvas(QGraphicsView):
         self._layout_hud()
 
     def mousePressEvent(self, event) -> None:
+        self._press_pos = event.position().toPoint() if event.button() == Qt.LeftButton else None
         if self._follow is not None:   # 드래그로 이동하려는 순간 고정을 푼다
             self._follow = None
             self._update_title()
+            self._update_help()
             self._layout_hud()
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        press, self._press_pos = self._press_pos, None
+        if not self._place_mode or press is None or event.button() != Qt.LeftButton:
+            return
+        pos = event.position().toPoint()
+        if (pos - press).manhattanLength() > CLICK_SLOP_PX:   # 드래그였다 -- 화면 이동만
+            return
+        sp = self.mapToScene(pos)
+        # 맵 픽셀 격자에 스냅: scene 좌표 = 픽셀 좌표라서 홀수 크기는 클릭한 픽셀 중심, 짝수 크기는 가장 가까운 픽셀 모서리가 중심
+        if OBSTACLE_PX % 2:
+            cx, cy = math.floor(sp.x()) + 0.5, math.floor(sp.y()) + 0.5
+        else:
+            cx, cy = round(sp.x()), round(sp.y())
+        x, y = scene_to_world(self.map.metadata, cx, cy)
+        self.place_obstacle(x, y)
+
+    # -- 월드 장애물 배치 / 취소 (retained 토픽: 모든 로봇과 뷰어가 같이 본다) ------------
+
+    def _draw_world_obstacle(self, oid: str) -> None:
+        """self._world[oid] 의 그림을 지금 맵에 맞춰 만든다/고친다. 다른 맵의 장애물은 그리지 않는다."""
+        entry = self._world.get(oid)
+        if entry is None:
+            return
+        old = entry.get("item")
+        if old is not None:
+            self._scene.removeItem(old)
+            entry["item"] = None
+        if entry.get("map_id") and self.map_uid and entry["map_id"] != self.map_uid:
+            return
+        res = self.map.metadata.resolution
+        w, h = entry["width"] / res, entry["height"] / res
+        item = QGraphicsRectItem(-w / 2, -h / 2, w, h)
+        pen = QPen(QColor(PLACED_COLOR))
+        pen.setWidthF(1.0)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        c = QColor(PLACED_COLOR)
+        c.setAlpha(170)
+        item.setBrush(QBrush(c))
+        item.setPos(world_to_scene(self.map.metadata, entry["x"], entry["y"]))
+        item.setZValue(4.5)
+        self._scene.addItem(item)
+        entry["item"] = item
+
+    def update_world_obstacle(self, oid: str, rect: Optional[dict]) -> None:
+        """구독으로 들어온 월드 장애물 변경. rect 가 None 이면 삭제."""
+        if rect is None:
+            entry = self._world.pop(oid, None)
+            if entry is not None and entry.get("item") is not None:
+                self._scene.removeItem(entry["item"])
+            if oid in self._placed:
+                self._placed.remove(oid)
+        else:
+            prev = self._world.get(oid)
+            self._world[oid] = {**rect, "item": prev.get("item") if prev else None}
+            self._draw_world_obstacle(oid)
+        self._update_help()
+        self._layout_hud()
+
+    def place_obstacle(self, x: float, y: float) -> None:
+        if not self.map.in_bounds(x, y):
+            self.set_status("[맵 밖에는 못 놓음]")
+            return
+        if self.publish_world is None:
+            self.set_status("[장애물 못 보냄: 브로커에 붙어 있지 않음]")
+            return
+        size = OBSTACLE_PX * self.map.metadata.resolution
+        self._obs_seq = getattr(self, "_obs_seq", 0) + 1
+        oid = f"VIEW-{int(time.time() * 1000)}-{self._obs_seq}"
+        rect = {"x": x, "y": y, "width": size, "height": size}
+        if self.map_uid:
+            rect["map_id"] = self.map_uid   # 다른 층의 로봇은 무시한다
+        if not self.publish_world(oid, rect):
+            self.set_status("[장애물 발행 실패]")
+            return
+        self._placed.append(oid)            # 그림은 구독으로 돌아오면 그려진다
+        self.set_status(f"[장애물 {oid[-6:]} 배치]")
+        self._update_help()
+        self._layout_hud()
+
+    def undo_obstacle(self, all_: bool = False) -> None:
+        if self.publish_world is None:
+            self.set_status("[장애물 못 지움: 브로커에 붙어 있지 않음]")
+            return
+        # u = 이 뷰어가 마지막에 놓은 것, Shift+U = 지금 있는 월드 장애물 전부 (다른 뷰어/도구가 놓은 것 포함)
+        todo = list(self._world) if all_ else self._placed[-1:]
+        if not todo:
+            self.set_status("[취소할 장애물 없음]")
+            return
+        for oid in todo:
+            self.publish_world(oid, None)
+            if oid in self._placed:
+                self._placed.remove(oid)
+        self.set_status(f"[장애물 {len(todo)}개 삭제 요청]")
+        self._update_help()
+        self._layout_hud()
 
     def mouseMoveEvent(self, event) -> None:
         super().mouseMoveEvent(event)
@@ -1195,7 +1360,19 @@ class MapCanvas(QGraphicsView):
 
     def keyPressEvent(self, event) -> None:
         key = event.text().lower()
-        if key == "g":
+        if event.key() == Qt.Key_Z and event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier):
+            self.undo_obstacle()      # Ctrl/Cmd+Z (text() 가 제어문자라 key() 로 본다)
+            return
+        if key == "u":
+            self.undo_obstacle(all_=bool(event.modifiers() & Qt.ShiftModifier))
+            return
+        if key == "h" or key == "?":
+            self._show_help = not self._show_help
+        elif key == "b":
+            self._place_mode = not self._place_mode
+            self.viewport().setCursor(Qt.CrossCursor if self._place_mode else Qt.ArrowCursor)
+            self._update_title()
+        elif key == "g":
             self._show_grid = not self._show_grid
             self._grid_item.setVisible(self._show_grid)
         elif key == "c":
@@ -1232,6 +1409,9 @@ class MapCanvas(QGraphicsView):
             self.reset_view()
         else:
             super().keyPressEvent(event)
+            return
+        self._update_legend()   # 토글 상태를 도움말 패널에 반영
+        self._layout_hud()
 
 
 class FleetViewWindow(QMainWindow):
@@ -1265,6 +1445,9 @@ class FleetViewWindow(QMainWindow):
 
     def update_navigation(self, *a, **kw) -> None:
         self.canvas.update_navigation(*a, **kw)
+
+    def update_world_obstacle(self, *a, **kw) -> None:
+        self.canvas.update_world_obstacle(*a, **kw)
 
     def refresh(self, now: float = 0.0) -> None:
         self.canvas.refresh(now)

@@ -3,7 +3,6 @@
 #pragma once
 
 #include <functional>
-#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -18,6 +17,7 @@
 #include "map_model.hpp"
 #include "path_refine.hpp"
 #include "planner.hpp"
+#include "obstacle_memory.hpp"
 #include "local_planner.hpp"
 #include "physics_world.hpp"
 #include "recorder.hpp"
@@ -42,6 +42,7 @@ public:
     PathRefineParams path_refine;   // enabled=false 가 기본 (A* 결과 그대로 사용)
     bool smooth_enabled = true;     // 곡선 주행 (코너 Bézier + Pure Pursuit). --no-smooth-path 로 끔
     SmoothParams smooth;
+    ObstacleMemory obstacle_memory; // 범위 밖 정지 장애물 기억 (--obstacle-memory)
     LocalPlanner local_planner;     // 장애물 우회 (config.radius = --local-plan-radius)
     double local_plan_rate = 5.0;   // Hz, --local-plan-rate
     CenterlineParams centerline;    // 복도 중앙 주행. enabled=true 가 기본 (--no-center-path 로 끔)
@@ -101,14 +102,18 @@ public:
     // GUI 에서 로봇 크기를 바꿨을 때 물리 상자도 맞춘다. friction/mass 가 0 보다 크면 그 값으로도 바꾼다
     void apply_robot_geometry(double friction = -1.0, double mass = -1.0);
 
+    // 공유 세계 반영 (시뮬 전용): 월드 장애물과 다른 로봇을 obstacle_field 에 맞춘다 (없어진 것은 지운다).
+    // main 루프가 tick 직전에 부른다. 이후는 다른 장애물과 같은 경로를 탄다 (감지 -> 기억 -> 우회/대기, 충돌 판정).
+    // 다른 맵(map_id 가 둘 다 있고 다름)의 것은 무시한다.
+    void sync_world(const std::vector<WorldObstacle>& world, const std::vector<PeerRobot>& peers);
+
     // -- 매 tick --
     void tick(double dt);
 
     State build_state(long long header_id, double timestamp) const;
     // 뷰어/GUI 디버그용 물리 관측값 (fms/v1/{id}/physics). 프로토콜이 아니다
     PhysicsDebug build_physics(long long header_id, double timestamp) const;
-    // Global 예상 경로 + Local 계획 상태 (sim/v1/{id}/navigation). 바뀌었을 때(+하트비트)만 값이 있다.
-    // 미래 구간 계획은 여기서 tick 당 최대 2 구간씩 이어서 한다 (main 이 매 tick 부른다).
+    // Global 경로(현재 구간) + Local 계획 상태 (sim/v1/{id}/navigation). 바뀌었을 때(+하트비트)만 값이 있다.
     std::optional<NavigationDebug> take_navigation(long long header_id, double timestamp);
 
     // GUI/콘솔 설정 변경 (IDLE 일 때만 허용, main 이 호출)
@@ -158,18 +163,16 @@ private:
     double since_local_plan_ = 1.0;
     double since_global_replan_ = 1.0;  // 로컬 우회가 안 될 때 구간 전체 재계획(장애물 반영)을 시도하는 간격
     std::optional<Action> acting_;
+    std::vector<LoadInfo> loads_;              // 싣고 있는 적재물 (PICK/DROP 완료 기준)
+    void update_loads(const Action& action);
     double acting_elapsed_ = 0.0;
 
-    // Global 예상 경로 캐시: 노드 번호 -> 그 노드까지의 구간 (정적 맵 기준, 이전 노드 끝점에서 시작).
-    // 현재 구간은 leg_nominal_ 을 쓴다. Order/맵이 바뀌면 비운다. 주행 판단에는 쓰이지 않는다 (표시 전용).
-    struct GlobalLeg { bool ok = false; std::string error; std::vector<std::pair<double, double>> path; };
-    std::map<int, GlobalLeg> global_cache_;
+    // Global 경로 = 지금 향하는 노드 하나까지의 정상 경로(leg_nominal_) + 액션 직선 꼬리. 다음 구간은 도착한 뒤 replan() 이 만든다.
+    // 표시 전용이다 (sim/v1/{id}/navigation). 구간이 바뀌거나 Order/맵이 바뀌면 version 을 올린다.
     int nav_version_ = 0;
     std::string nav_sig_ = "?";
     double nav_sent_at_ = -1e9;
-    void invalidate_global() { global_cache_.clear(); ++nav_version_; }
-    GlobalLeg plan_global_leg(std::pair<double, double> start, int node_index);
-    std::pair<double, double> node_end_point(const OrderNode& n) const;   // 노드 액션까지 끝난 뒤 로봇이 있는 곳
+    void nav_changed() { ++nav_version_; }
     std::vector<std::pair<double, double>> node_tail(const OrderNode& n) const;  // 구간 목표 뒤에 이어지는 직선 (도킹 진입, STRAIGHT)
 
     // 경로계획 없는 직선 이동 (STRAIGHT 액션, DOCK/PARK 진입, 언도킹). 있으면 tick 이 이것만 돌린다.
@@ -213,6 +216,10 @@ private:
     bool handle_obstacles(double dt, const std::vector<DynamicObstacle>& detected);
     void restore_nominal();
     bool check_collision(double x, double y, double prev_x, double prev_y);
+    // 동적 장애물/다른 로봇과 몸체가 겹쳤는가 (참 자세 원판 vs 장애물 몸체, 감지 여부와 무관).
+    // 움직이는 중에 새로 겹치면 FATAL COLLISION 을 올리고 true. 서 있을 때 와서 닿은 것, 이미 겹쳐 있던 것은 넘어간다.
+    bool check_obstacle_contact(bool moving);
+    std::set<std::string> colliding_ids_;  // 지금 몸체가 겹쳐 있는 장애물 (같은 접촉으로 오류를 반복하지 않게)
     void tick_logic(double dt);
     void record_sample(double dt);
     void tick_action(double dt);

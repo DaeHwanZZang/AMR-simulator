@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <stdexcept>
 
 namespace fms {
@@ -21,6 +22,20 @@ double DynamicObstacle::distance_to(double px, double py) const {
     double cx = std::max(x - hw, std::min(px, x + hw));
     double cy = std::max(y - hh, std::min(py, y + hh));
     return std::hypot(px - cx, py - cy);
+}
+
+bool DynamicObstacle::overlaps_disc(double cx, double cy, double r) const {
+    if (body_radius > 0) return std::hypot(cx - x, cy - y) < r + body_radius;
+    return distance_to(cx, cy) < r;
+}
+
+const char* to_string(ObstacleSource s) {
+    switch (s) {
+        case ObstacleSource::MANUAL: return "MANUAL";
+        case ObstacleSource::SIM: return "SIM";
+        case ObstacleSource::ROBOT: return "ROBOT";
+    }
+    return "?";
 }
 
 bool DynamicObstacle::step(double dt) {
@@ -116,6 +131,16 @@ void DynamicObstacleField::add_manual(const std::string& id, double x, double y,
 void DynamicObstacleField::clear(const std::optional<std::string>& id) {
     if (!id) obstacles.clear();
     else obstacles.erase(*id);
+}
+
+void DynamicObstacleField::sync_external(const std::string& prefix, const std::vector<DynamicObstacle>& items) {
+    for (auto it = obstacles.begin(); it != obstacles.end();) {
+        const bool ours = it->first.compare(0, prefix.size(), prefix) == 0;
+        const bool keep = !ours || std::any_of(items.begin(), items.end(),
+                                               [&](const DynamicObstacle& o) { return o.obstacle_id == it->first; });
+        it = keep ? std::next(it) : obstacles.erase(it);
+    }
+    for (auto& o : items) obstacles[o.obstacle_id] = o;
 }
 
 std::vector<DynamicObstacle> DynamicObstacleField::detected(double x, double y, double sensor_range) const {

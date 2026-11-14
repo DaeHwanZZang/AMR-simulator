@@ -520,10 +520,6 @@ std::string NavigationDebug::to_json_string() const {
         cJSON_AddItemToArray(path, p);
     }
     cJSON_AddItemToObject(root, "global_path", path);
-    cJSON_AddNumberToObject(root, "released_points", released_points);
-    cJSON_AddBoolToObject(root, "truncated", truncated);
-    cJSON_AddNumberToObject(root, "failed_node", failed_node);
-    cJSON_AddStringToObject(root, "failed_reason", failed_reason.c_str());
     cJSON_AddBoolToObject(root, "detour_active", detour_active);
     if (has_local_goal) {
         cJSON* g = cJSON_CreateArray();
@@ -596,6 +592,9 @@ std::string PhysicsDebug::to_json_string() const {
     cJSON_AddNumberToObject(root, "max_wheel_torque", r5(max_wheel_torque));
     cJSON_AddNumberToObject(root, "max_velocity", r5(max_velocity));
     cJSON_AddNumberToObject(root, "max_acceleration", r5(max_acceleration));
+    cJSON_AddNumberToObject(root, "width", r5(width));
+    cJSON_AddNumberToObject(root, "length", r5(length));
+    cJSON_AddStringToObject(root, "map_id", map_id.c_str());
     cJSON_AddNumberToObject(root, "path_points", path_points);
     cJSON_AddNumberToObject(root, "path_remaining", r5(path_remaining));
     if (has_goal) {
@@ -667,6 +666,15 @@ std::string State::to_json_string() const {
     cJSON* errs = cJSON_CreateArray();
     for (auto& e : errors) cJSON_AddItemToArray(errs, e.to_json());
     cJSON_AddItemToObject(root, "errors", errs);
+
+    cJSON* lds = cJSON_CreateArray();
+    for (auto& l : loads) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "tray", l.tray.c_str());
+        cJSON_AddStringToObject(item, "payload_id", l.payload_id.c_str());
+        cJSON_AddItemToArray(lds, item);
+    }
+    cJSON_AddItemToObject(root, "loads", lds);
 
     cJSON* obs = cJSON_CreateArray();
     for (auto& o : detected_obstacles) cJSON_AddItemToArray(obs, o.to_json());
@@ -747,14 +755,42 @@ int InstantAction::get_int(const std::string& key, int def) const {
 
 bool InstantAction::has(const std::string& key) const { return param_has(params, key); }
 
+// -- Factsheet ----------------------------------------------------------
+
+std::string Factsheet::to_json_string() const {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "version", version.c_str());
+    cJSON_AddNumberToObject(root, "header_id", (double)header_id);
+    cJSON_AddNumberToObject(root, "timestamp", timestamp);
+    cJSON_AddStringToObject(root, "robot_id", robot_id.c_str());
+    cJSON_AddStringToObject(root, "model", model.c_str());
+    cJSON_AddNumberToObject(root, "width", width);
+    cJSON_AddNumberToObject(root, "length", length);
+    cJSON_AddNumberToObject(root, "max_speed", max_speed);
+    cJSON_AddNumberToObject(root, "trays", trays);
+    cJSON* acts = cJSON_CreateArray();
+    for (auto a : actions) cJSON_AddItemToArray(acts, cJSON_CreateString(to_string(a).c_str()));
+    cJSON_AddItemToObject(root, "actions", acts);
+    cJSON_AddStringToObject(root, "protocol_version", PROTOCOL_VERSION);
+    cJSON_AddBoolToObject(root, "traffic_control", traffic_control);
+    cJSON_AddBoolToObject(root, "reports_loads", reports_loads);
+    char* txt = cJSON_PrintUnformatted(root);
+    std::string result(txt);
+    free(txt);
+    cJSON_Delete(root);
+    return result;
+}
+
 // -- 토픽 헬퍼 ------------------------------------------------------------
 
 std::string topic_order(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/order"; }
 std::string topic_state(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/state"; }
 std::string topic_connection(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/connection"; }
+std::string topic_factsheet(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/factsheet"; }
 std::string topic_physics(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/physics"; }
 std::string topic_sim_navigation(const std::string& id) { return "sim/v1/" + id + "/navigation"; }
 std::string topic_instant(const std::string& id) { return std::string(TOPIC_PREFIX) + "/" + id + "/instant"; }
 std::string topic_sim_teleport(const std::string& id) { return "sim/v1/" + id + "/teleport"; }
+std::string topic_sim_world_obstacle(const std::string& id) { return std::string(TOPIC_SIM_WORLD_OBSTACLES_PREFIX) + id; }
 
 }  // namespace fms

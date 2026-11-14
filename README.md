@@ -26,7 +26,8 @@
 ```bash
 brew install mosquitto cjson qt
 robot/tools/setup_mujoco.sh                # 최초 1회: MuJoCo 를 robot/third_party/mujoco/ 에 설치 (brew 패키지가 없다)
-make -C robot                       # build/bin/{robot_client,send_order,place_obstacle,obstacle_zone}
+make -C robot                       # build/bin/{robot_client,send_order,place_obstacle,obstacle_zone,plan_bench}
+make -C robot test                  # 단위 테스트 (브로커 불필요)
 ```
 
 ### Ubuntu (배포 타깃)
@@ -129,8 +130,59 @@ build/bin/send_order AMR-001 --path 14.75,5,3.14159 --order-id p1 --action PARK 
 ### 장애물 우회
 
 센서 반경(기본 3 m) 안에서 동적 장애물이 경로를 막으면, 서지 않고 달리면서 로봇 중심 반경 5 m 창에서 우회 경로를 다시 계획해 갈아탄다(`--local-plan-radius`, `--local-plan-rate`).
+우회로가 반대편으로 돌아 들어가 목적지 쪽을 먼저 지나게 되면, 장애물 뒤 합류점까지 갔다 되돌아오지 않고 정상 경로의 뒤쪽 지점으로 바로 간다.
+센서 반경을 벗어난 정지 장애물은 `--obstacle-memory` 초(기본 30, 0=끔) 동안 기억해 계획에 포함한다 (갈림길 왕복 방지). 센서 반경 안에서 안 보이면 치워진 것으로 보고 바로 잊고, 움직이는 장애물은 기억하지 않는다. 만료 뒤 같은 자리에서 다시 보이면 기억 시간이 2배(최대 `--obstacle-memory-max` 300 s)가 된다.
 장애물이 사라지면 원래 경로로 복귀한다. 우회로가 창 안에 없으면 구간 전체를 장애물을 반영해 다시 계획해서 다른 길로 가고(1 초 간격 재시도), 길이 아예 없으면 막힌 지점 앞에서 서서 기다리다가 치워지면 간다.
 장애물은 현재 감지된 위치만 쓰고 이동을 예측하지 않는다(가로지르는 장애물에는 늦게 반응할 수 있다). 구조는 CLAUDE.md "장애물 우회".
+
+### 로봇 간 인식 / 월드 장애물 / 장애물 충돌
+
+로봇은 프로세스가 따로지만 같은 브로커에 붙은 로봇끼리 서로를 본다. 각 로봇이 다른 로봇의 `fms/v1/{id}/physics`(참 자세, 몸체 크기)를
+구독해 장애물로 다루므로, 서 있는 로봇은 돌아가고 마주 오는 로봇과는 비켜 지나간다. `State.detected_obstacles` 에도 실린다.
+끄려면 `--no-robot-detect`.
+
+**월드 장애물**은 모든 로봇과 뷰어가 같이 보는 장애물이다. 장애물 하나가 retained 토픽 하나(`sim/v1/world/obstacles/{id}`, JSON
+`x y width height`, 빈 페이로드 = 삭제)라서 나중에 뜬 로봇도 받는다. 뷰어의 `b` 배치 모드와 아래 명령이 이 토픽을 쓴다.
+로봇 하나에게만 보이는 장애물(`INJECT_OBSTACLE`, `place_obstacle ROBOT_ID ...`)도 그대로 있다. 끄려면 `--no-world-obstacles`.
+
+```bash
+# 리포 루트에서
+build/bin/place_obstacle --world --x 10 --y 6 --width 0.6 --height 0.6 --obstacle-id box
+build/bin/place_obstacle --world --clear --obstacle-id box
+```
+
+장애물과 다른 로봇은 통과할 수 없다. 달리는 중에 몸체(반지름 `width/2 - 0.04` 원판)가 장애물이나 다른 로봇과 겹치면 FATAL `COLLISION`
+(`hit obstacle <id>` / `hit robot <id>`)이 나고 오더를 버린다. 서 있는 로봇에 장애물이 와서 닿은 것은 오류가 아니다.
+
+한계: 이동 예측이 없어서 두 로봇이 같은 시각에 직각으로 교차하면 늦게 반응해 `COLLISION` 이 나거나 맞닿은 채 서로 기다린다
+(`scripts/scenarios/crossing.json`). 통과 폭이 없는 복도에서 마주치면 둘 다 기다린다. 이런 상황은 FMS 교통 관제가 막아야 한다.
+
+### 다중 로봇 시나리오 (`tools/run_scenario.py`)
+
+시나리오 파일(JSON) 하나를 무인으로 돌리고 기대 결과를 검사한다. 자체 브로커(빈 포트)를 띄우고 로봇 N 대를 실행한 뒤 시각에 맞춰
+월드 장애물과 오더를 보낸다. 종료 코드는 전부 통과 0, 아니면 1.
+
+```bash
+# 리포 루트에서
+.venv/bin/python tools/run_scenario.py scripts/scenarios/head_on.json --viewer   # 뷰어 창을 같이 띄운다
+.venv/bin/python tools/run_scenario.py scripts/scenarios/parked.json --time-scale 4
+```
+
+| 시나리오 | 내용 |
+|---|---|
+| `head_on` | 넓은 홀에서 두 로봇이 정면으로 마주 보고 자리를 바꾼다 |
+| `parked` | 직선 경로 한가운데 서 있는 로봇을 돌아간다 |
+| `late_join` | 월드 장애물을 먼저 놓고 로봇을 나중에 띄운다 |
+| `crossing_staggered` | 직각으로 만나는 경로를 3 초 차이로 지난다 |
+| `crossing` | 같은 시각에 직각으로 교차한다. **알려진 한계라 지금은 실패한다** |
+
+형식(`robots`, `obstacles`, `orders`, `expect`, 시각은 시뮬 초)은 `tools/run_scenario.py` 맨 위 설명에 있다. 런처에는 "다중 로봇 시나리오" 항목이 있다.
+
+### 시간 배속 (`--time-scale`)
+
+`robot_client --time-scale 4` 는 벽시계보다 4 배 빨리 돈다 (tick 을 벽시계 12.5 ms 마다 돌리고 한 tick 의 시뮬 시간은 그대로 50 ms).
+시험이나 장시간 주행을 빨리 볼 때 쓴다. 같이 도는 로봇은 같은 값이어야 하고, 타임스탬프는 벽시계 그대로라 FMS 연동 때는 1 로 둔다.
+CPU 가 못 따라가면 배속만 낮아진다.
 
 ### 텍스트 스크립트로 job 만들기 (`send_order --script`)
 
@@ -213,7 +265,7 @@ build/bin/send_order AMR-001 --script scripts/examples/demo_job.txt             
 기록 CSV 에는 `x y theta` (GT), `odom_*` (보정 전), `est_*` (보정된 추정) 가 모두 있다. 노이즈에도 경유점 방위가 흔들리지 않도록
 `kinematics.cpp` 가 5 cm 안의 경유점은 건너뛰고 2 cm 안이면 방위를 유지한다.
 
-**Global 예상 경로 (`navigation` 토픽)**: 로봇이 `sim/v1/{id}/navigation` (retained)으로 현재 위치부터 Order 마지막 노드까지의 예상 경로(정적 맵 기준, 중간 노드 순서대로)와 로컬 계획 상태(우회 중 여부, 합류점, 계획 반경)를 변경 시에만 발행한다. 표시 전용이다. 뷰어는 Global 을 얇은 선(주행 허가 전 구간은 점선), 실제 추종 경로(`State.local_path`)를 굵은 선으로 그리고, 계획 반경과 합류점을 보인다. 키 `n` Global 토글, `m` 반경/합류점 토글.
+**Global 경로 (`navigation` 토픽)**: 로봇이 `sim/v1/{id}/navigation` (retained)으로 지금 향하는 노드 하나까지의 정상 경로(a->b->c 이면 b 로 가는 동안 a->b 만, 도착하면 b->c)와 로컬 계획 상태(우회 중 여부, 합류점, 계획 반경)를 변경 시에만 발행한다. 표시 전용이다. 뷰어는 Global 을 얇은 선, 실제 추종 경로(`State.local_path`)를 굵은 선으로 그리고, 계획 반경과 합류점을 보인다. 장애물이 없으면 둘은 같은 경로다. 키 `n` Global 토글, `m` 반경/합류점 토글.
 
 **뷰어 물리 디버그**: 로봇이 `fms/v1/{id}/physics` 토픽으로 tick 마다(20 Hz) 물리 관측값을 발행한다. `State` 는 `extra=forbid` 라
 필드를 더할 수 없어서 따로 뺐고, 프로토콜이 아니라서 FMS 와 맞출 필요가 없다 (뷰어만 읽는다). 내용: 실제 자세/속도(`v_fwd`, `v_lat`, `yaw_rate`),
@@ -242,12 +294,14 @@ GT 와 벌어진 만큼이 누적 오차다 (패널 `error`). 보정 알고리�
 | `wall_force`, `ghost` | 몸체-벽 최대 접촉력(N), 벽 안 시작 여부 |
 | `battery`, `charging`, `detected_obstacles`, `error` | 배터리, 감지 장애물 수, 첫 오류 종류 |
 
-물리가 아닌 것: 동적 장애물은 사각형 좌표일 뿐 물리 객체가 아니다 (로봇이 밀지 못하고 센서 반경으로만 인식). 로봇끼리는
-프로세스가 따로라 서로 부딪히지 않는다. 라이다/IMU 센서는 없다.
+물리가 아닌 것: 동적 장애물과 다른 로봇은 물리 엔진 객체가 아니다 (밀거나 밀리지 않고 센서 반경으로만 인식). 대신 몸체가 겹치면
+기하 판정으로 `COLLISION` 을 올린다 (위 "로봇 간 인식 / 월드 장애물 / 장애물 충돌"). 라이다/IMU 센서는 없다.
 
 디버깅: `AMR_PHYSICS_DUMP=파일` 환경변수를 주면 마지막으로 컴파일한 MJCF 를 그 파일에 쓴다 (파이썬 `mujoco` 로 열어 볼 수 있다).
+단위 테스트: `make -C robot test` (스키마, 맵, 경로계획, 로컬 우회, 장애물 기억, 위치추정. MQTT 와 물리 없이 1 초 안쪽).
 통합 테스트: `.venv/bin/python robot/tests/physics_test.py [시나리오...]` (empty_hall1 에서 이동/직선/도킹/충돌/일시정지/
-벽 안 시작/저마찰/장거리/동적 장애물, 약 8분).
+벽 안 시작/저마찰/장거리/동적 장애물/장애물 충돌/로봇 간 인식/월드 장애물 등, 전체 약 20 분. `AMR_TEST_TIME_SCALE=4` 로 배속할 수 있다).
+경로계획 시간은 `build/bin/plan_bench MAP X0 Y0 X1 Y1` 로 잰다.
 
 ### 통합 런처 (`tools/launcher.py`)
 
@@ -407,9 +461,10 @@ Qt 는 메인스레드 전용이라 `--gui` 주면 tick/MQTT 루프를 백그라
 
 
 ## known issue
- - 경로 결정장애 이슈
-    A to B에 2가지 갈림길이 존재할 때 로컬 패스플래닝은 동적 장애물을 센서 인식 범위 내에서만 기억하기 때문에 2가지 갈림길에 모두 동적 장애물이 존재할 경우 왔다 갔다 무한 반복하는 현상 발생함
-    대응 방안: 동적 장애물을 일정 시간 메모리에 기록함. (맹점: 말그대로 동적 장애물 이기 때문에 메모리 시간을 어떻게 부여할지 고민 필요)
+ - 경로 결정장애 이슈 (해결: 장애물 기억)
+    예전에는 센서 범위 밖으로 나간 장애물을 바로 잊어 갈림길 양쪽이 막히면 왔다 갔다 반복했다. 이제 정지 장애물을 `--obstacle-memory` 동안 기억한다.
+    남은 한계: 치워진 장애물도 기억 시간 동안은 피한다 (로봇은 치워졌는지 알 수 없다). 모든 길이 막힌 채 계속 있으면 기억이 만료될 때마다 확인하러 가며, 간격은 적응형으로 30 -> 60 -> ... -> 300 s 로 늘어난다.
 
-- 로봇 자체를 장애물로 인식 필요
-    실제 환경에서는 다수의 로봇이 서로 장애물로 인식해야함. 물론 fms의 관제를 통해 부딪히는 상황이 없어야 하지만 시뮬레이션 자체에서 로봇이 겹쳐지는 상황은 프로그램 자체의 신뢰성을 떨어뜨림
+- 로봇 자체를 장애물로 인식 (해결: 로봇 간 인식)
+    예전에는 로봇끼리 서로를 못 봐서 겹쳐 지나갔다. 이제 같은 브로커의 로봇을 장애물로 인식해 피하고, 몸체가 겹치면 `COLLISION` 이 난다.
+    남은 한계: 이동 예측이 없어서 같은 시각에 직각으로 교차하면 늦게 반응한다 (`scripts/scenarios/crossing.json` 이 실패한다). 통과 폭이 없는 복도에서 마주치면 둘 다 기다린다. FMS 관제로 막아야 하는 상황이다.

@@ -57,6 +57,12 @@ bool inside_any(LpPoint p, const std::vector<LpRect>& obstacles, double margin) 
     return false;
 }
 
+double polyline_length(const std::vector<LpPoint>& p) {
+    double len = 0.0;
+    for (size_t i = 0; i + 1 < p.size(); ++i) len += std::hypot(p[i + 1].first - p[i].first, p[i + 1].second - p[i].second);
+    return len;
+}
+
 // nominal 에서 cand 호 길이 이후의 꼭짓점들을 tail 로 붙인다
 void append_tail(std::vector<LpPoint>& out, const std::vector<LpPoint>& nominal, const Sampled& s, double after_arc) {
     for (size_t k = 0; k < s.vertex_arc.size(); ++k)
@@ -121,11 +127,13 @@ std::optional<std::vector<LpPoint>> LocalPlanner::detour(
     if (inside_any(s.pts[cand], inflated_obs, margin)) return std::nullopt;
 
     auto dist_pos = [&](size_t i) { return std::hypot(s.pts[i].first - pos.first, s.pts[i].second - pos.second); };
+    bool short_rejoin = false;  // 창이 좁아 rejoin_margin 을 못 채웠다 (합류점이 장애물에 바짝 붙는다)
     if (dist_pos(cand) > config.radius * 0.9) {  // 창 밖: 창 안에서 막힘 구간 뒤쪽으로 가장 먼 자유 지점
         size_t pick = N;
         for (size_t j = ie; j < N; ++j)
             if (dist_pos(j) <= config.radius * 0.9 && !inside_any(s.pts[j], inflated_obs, margin)) pick = j;
         if (pick == N) return std::nullopt;
+        short_rejoin = pick < cand;
         cand = pick;
     }
     LpPoint goal = (cand == N - 1) ? nominal.back() : s.pts[cand];
@@ -136,10 +144,50 @@ std::optional<std::vector<LpPoint>> LocalPlanner::detour(
     } catch (const PlanningError&) {
         return std::nullopt;
     }
+    // 합류점은 장애물 바로 뒤 nominal 위에 잡는다. 그런데 우회로가 반대편으로 돌아 들어가면 nominal 뒤쪽(심하면 목적지)을
+    // 지나쳐 합류점까지 갔다가 되돌아오게 된다. 창 안에서 nominal 의 가장 뒤쪽 자유 지점으로 바로 가는 경로가
+    // "합류점 경유 + nominal 을 따라 그 지점까지" 보다 확실히 짧으면 그 경로를 쓴다 (구간은 노드 하나라 nominal 중간을 건너뛰어도 된다).
+    size_t far = cand;
+    for (size_t j = cand + 1; j < N; ++j)
+        if (dist_pos(j) <= config.radius * 0.9 && !inside_any(s.pts[j], inflated_obs, margin)) far = j;
+    if (far > cand) {
+        LpPoint far_goal = (far == N - 1) ? nominal.back() : s.pts[far];
+        try {
+            auto direct = plan_path_window(map, pos, far_goal, pos, config.radius, robot_width, robot_length, inflated_obs, allowed, clearance, centering);
+            if (polyline_length(direct) + config.shortcut_gain < polyline_length(path) + (s.arc[far] - s.arc[cand])) {
+                path = std::move(direct);
+                cand = far;
+            }
+        } catch (const PlanningError&) {
+        }
+    }
+    // 합류점이 장애물에 바짝 붙으면 거기서 nominal 로 급하게 꺾는 코너(+ 수 cm 토막 구간)가 생겨 로봇이 그 자리에서 헌팅한다.
+    // 이때는 합류점(과 그 앞 경유점)을 건너뛰고 nominal 의 다음 꼭짓점으로 곧장 간다 (직선 시야가 열려 있는 만큼만).
+    if (short_rejoin) {
+        const LpPoint* next = nullptr;
+        for (size_t k = 0; k < s.vertex_arc.size() && !next; ++k)
+            if (s.vertex_arc[k] > s.arc[cand] + 1e-6) next = &nominal[s.seg + 1 + k];
+        if (next) {
+            const auto& grid = static_planning_grid(map, robot_width + (smooth ? 2 * smooth->extra_clearance : 0.0));
+            const int w = map.metadata.width_px, h = map.metadata.height_px;
+            auto sees = [&](LpPoint a, LpPoint b) {
+                double len = std::hypot(b.first - a.first, b.second - a.second);
+                int n = std::max(1, (int)std::ceil(len / (map.metadata.resolution * 0.5)));
+                for (int k = 0; k <= n; ++k) {
+                    double t = (double)k / n, x = a.first + t * (b.first - a.first), y = a.second + t * (b.second - a.second);
+                    auto [px, py] = map.world_to_pixel(x, y);
+                    if (px < 0 || px >= w || py < 0 || py >= h || grid[(size_t)py * w + px] != 2 || inside_any({x, y}, inflated_obs, margin)) return false;
+                }
+                return true;
+            };
+            while (path.size() > 1 && sees(path[path.size() - 2], *next)) path.pop_back();
+        }
+    }
     append_tail(path, nominal, s, s.arc[cand]);
 
     if (smooth) {
-        const auto& grid = static_planning_grid(map, robot_width);
+        // 곡선은 smooth_path 처럼 A* 팽창보다 extra_clearance 만큼 더 넉넉한 벽 여유를 요구한다 (좁은 복도 모퉁이에서 추종 오차로 벽을 스치지 않게)
+        const auto& grid = static_planning_grid(map, robot_width + 2 * smooth->extra_clearance);
         const int w = map.metadata.width_px, h = map.metadata.height_px;
         auto free_at = [&](double x, double y) {
             auto [px, py] = map.world_to_pixel(x, y);
@@ -174,7 +222,14 @@ std::optional<std::vector<LpPoint>> LocalPlanner::rejoin(
     }
     std::vector<LpPoint> path = {pos, target};
     append_tail(path, nominal, s, s.arc[idx]);
-    if (smooth) path = smooth_polyline(path, free_at, map.metadata.resolution, *smooth);
+    if (smooth) {
+        const auto& wide = static_planning_grid(map, robot_width + 2 * smooth->extra_clearance);  // 곡선은 벽 여유를 더 둔다 (detour 와 같다)
+        auto free_wide = [&](double x, double y) {
+            auto [px, py] = map.world_to_pixel(x, y);
+            return px >= 0 && px < w && py >= 0 && py < h && wide[(size_t)py * w + px] == 2;
+        };
+        path = smooth_polyline(path, free_wide, map.metadata.resolution, *smooth);
+    }
     return path;
 }
 

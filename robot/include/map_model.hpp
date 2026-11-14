@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fms {
@@ -13,6 +14,13 @@ namespace fms {
 struct OccupancyZone {
     std::string id;
     double cx, cy, ux, uy, half_width, half_height;
+};
+
+// 감속 구역 (annotations.json 의 type=slow). 구역 안에서는 speed_limit(m/s) 이하로 달린다. 주행을 막지는 않는다.
+struct SlowZone {
+    std::string id;
+    std::vector<std::pair<double, double>> polygon;
+    double speed_limit;
 };
 
 // 값 자체가 python classify_grid() 의 코드값과 같다: 0=OCCUPIED, 1=UNKNOWN, 2=FREE
@@ -38,6 +46,9 @@ public:
     MapMetadata metadata;
     std::string base_dir;
     std::vector<OccupancyZone> occupancy_zones;
+    std::vector<SlowZone> slow_zones;
+    // (x, y) 에서 허용되는 최고 속도. 감속 구역 밖이면 +inf, 여러 구역이 겹치면 가장 낮은 값.
+    double speed_limit_at(double x, double y) const;
     bool traffic_blocked(double x, double y, double margin,
                          const std::vector<std::string>& allowed = {}) const;
 

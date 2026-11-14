@@ -391,6 +391,15 @@ class BatteryInfo(BaseModel):
     )
 
 
+class LoadInfo(BaseModel):
+    """로봇이 싣고 있는 적재물 하나. PICK 이 끝나면 생기고 DROP 이 끝나면 사라진다."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tray: str = Field(description="적재 칸. 로봇이 싣는 순서로 채운다 (예: T1, T2)")
+    payload_id: str = Field(min_length=1)
+
+
 class State(FmsMessage):
     """로봇 주기 상태 보고. FMS 가 아는 로봇의 유일한 진실."""
 
@@ -449,6 +458,10 @@ class State(FmsMessage):
 
     battery: BatteryInfo
     errors: list[ErrorInfo] = Field(default_factory=list)
+    loads: list[LoadInfo] = Field(
+        default_factory=list,
+        description="지금 싣고 있는 적재물 (PICK/DROP 완료 기준). 보고하지 않는 구형 클라이언트는 빈 목록",
+    )
 
     detected_obstacles: list[ObstacleInfo] = Field(
         default_factory=list,
@@ -547,6 +560,27 @@ class InstantAction(FmsMessage):
 
 
 # =============================================================================
+# Factsheet : Robot -> FMS  (retain=True, 접속할 때 한 번)
+# =============================================================================
+
+class Factsheet(FmsMessage):
+    """로봇 사양 보고. 바뀌지 않는 값이라 State 에 싣지 않고 retained 토픽으로 한 번만 낸다.
+
+    FMS 는 이걸로 후보를 거른다 (지원 액션). 보고하지 않는 구형 클라이언트는 State 값으로 대신 판단한다.
+    """
+
+    model: str = "unknown"
+    width: float = Field(default=0.5, gt=0)
+    length: float = Field(default=0.7, gt=0)
+    max_speed: float = Field(default=1.0, gt=0, description="최고 속도 m/s")
+    trays: int = Field(default=0, ge=0, description="적재 칸 수")
+    actions: list[ActionType] = Field(default_factory=list, description="수행할 수 있는 액션")
+    protocol_version: str = PROTOCOL_VERSION
+    traffic_control: bool = Field(default=False, description="점유 존 경로 차단 지원")
+    reports_loads: bool = Field(default=False, description="State.loads 를 보고하는가")
+
+
+# =============================================================================
 # 토픽 헬퍼
 # =============================================================================
 
@@ -569,6 +603,10 @@ def topic_instant(robot_id: str) -> str:
     return f"{TOPIC_PREFIX}/{robot_id}/instant"
 
 
+def topic_factsheet(robot_id: str) -> str:
+    return f"{TOPIC_PREFIX}/{robot_id}/factsheet"
+
+
 def topic_physics(robot_id: str) -> str:
     """로봇 물리 디버그 토픽. 프로토콜이 아니라 뷰어 전용이다 (State 는 extra=forbid 라 필드를 못 더한다).
     FMS 는 읽을 필요가 없고 스키마를 맞출 필요도 없다. 페이로드는 pydantic 으로 검증하지 않고 dict 로 쓴다."""
@@ -577,4 +615,5 @@ def topic_physics(robot_id: str) -> str:
 
 TOPIC_STATE_ALL = f"{TOPIC_PREFIX}/+/state"
 TOPIC_CONNECTION_ALL = f"{TOPIC_PREFIX}/+/connection"
+TOPIC_FACTSHEET_ALL = f"{TOPIC_PREFIX}/+/factsheet"
 TOPIC_PHYSICS_ALL = f"{TOPIC_PREFIX}/+/physics"

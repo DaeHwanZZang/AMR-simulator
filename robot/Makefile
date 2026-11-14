@@ -33,15 +33,20 @@ LDFLAGS := -L $(BREW)/opt/mosquitto/lib -L $(BREW)/opt/cjson/lib -lmosquitto -lc
 CORE_SRC := src/schemas.cpp src/map_model.cpp src/kinematics.cpp src/localizer.cpp \
             src/dynamic_obstacles.cpp src/planner.cpp src/executor.cpp src/comm.cpp \
             src/map_sync.cpp src/path_refine.cpp src/physics_world.cpp src/recorder.cpp \
-            src/scan_matcher.cpp src/chargers.cpp src/local_planner.cpp
+            src/scan_matcher.cpp src/chargers.cpp src/local_planner.cpp src/obstacle_memory.cpp
 CORE_OBJ := $(addprefix $(OBJ)/,$(CORE_SRC:.cpp=.o))
 GUI_OBJ := $(OBJ)/src/gui.o
 MAIN_OBJ := $(OBJ)/src/main.o
 SCHEMAS_OBJ := $(OBJ)/src/schemas.o
-TOOL_BINS := $(BIN)/send_order $(BIN)/place_obstacle $(BIN)/obstacle_zone
+TOOL_BINS := $(BIN)/send_order $(BIN)/place_obstacle $(BIN)/obstacle_zone $(BIN)/plan_bench
+
+# 단위 테스트 (tests/unit/*.cpp, 프레임워크 없음). MQTT 브로커 없이 돈다. 파일을 추가하면 여기에 넣는다.
+UNIT_SRC := tests/unit/main.cpp tests/unit/test_schemas.cpp tests/unit/test_map_planner.cpp \
+            tests/unit/test_obstacles.cpp tests/unit/test_localizer.cpp
+UNIT_OBJ := $(addprefix $(OBJ)/,$(UNIT_SRC:.cpp=.o))
 
 .SECONDARY:
-.PHONY: all clean tools
+.PHONY: all clean tools test
 
 all: $(BIN)/robot_client tools
 
@@ -57,6 +62,19 @@ $(OBJ)/src/physics_world.o: | $(MUJOCO_HDR)
 
 tools: $(TOOL_BINS)
 
+# 경로계획 벤치: planner 가 맵/거리 장을 쓰므로 코어 오브젝트를 전부 링크한다 (MQTT 접속은 하지 않는다)
+$(BIN)/plan_bench: $(OBJ)/tools/plan_bench.o $(CORE_OBJ)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(MUJOCO_LDFLAGS)
+
+$(BIN)/unit_tests: $(UNIT_OBJ) $(CORE_OBJ)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(MUJOCO_LDFLAGS)
+
+# 리포 루트에서 실행한다 (테스트가 maps/ 를 상대 경로로 읽는다). 실패가 있으면 종료 코드 1
+test: $(BIN)/unit_tests
+	cd .. && build/bin/unit_tests
+
 $(BIN)/%: $(OBJ)/tools/%.o $(SCHEMAS_OBJ)
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
@@ -66,7 +84,8 @@ $(OBJ)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 DEPS := $(CORE_OBJ:.o=.d) $(MAIN_OBJ:.o=.d) $(GUI_OBJ:.o=.d) \
-        $(addprefix $(OBJ)/tools/,send_order.d place_obstacle.d obstacle_zone.d)
+        $(addprefix $(OBJ)/tools/,send_order.d place_obstacle.d obstacle_zone.d plan_bench.d) \
+        $(UNIT_OBJ:.o=.d)
 -include $(DEPS)
 
 clean:

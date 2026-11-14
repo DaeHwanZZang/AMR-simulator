@@ -1,123 +1,15 @@
 """물리(MuJoCo) 통합 테스트. empty_hall1 에서 robot_client 를 실제로 띄워 MQTT 로 시험한다.
 
-리포 루트에서: .venv/bin/python tools/physics_test.py [시나리오 이름...]
-시나리오: move straight dock collision pause ghost lowfric slip loop longrun obstacle dockint gui topic estimate localization unlocalized charger battery default (생략하면 전부)
-mosquitto 를 자체 포트(18851)로 띄우므로 이미 떠 있는 브로커와 부딪히지 않는다. 로봇 로그와 기록 CSV 는 임시 폴더에 남는다.
+리포 루트에서: .venv/bin/python robot/tests/physics_test.py [시나리오 이름...]
+시나리오 이름은 맨 아래 ALL 참고 (생략하면 전부).
+mosquitto 를 자체 포트(18851, 쓰는 중이면 빈 포트)로 띄우므로 이미 떠 있는 브로커와 부딪히지 않는다. 로봇 로그와 기록 CSV 는 임시 폴더에 남는다.
+AMR_TEST_TIME_SCALE=N 이면 로봇을 N 배속으로 돌린다 (기본 1). 헬퍼(Robot, 브로커, check)는 simharness.py 에 있다.
 """
-import csv, glob, json, math, os, re, shutil, signal, subprocess, sys, tempfile, threading, time
+import json, math, os, re, shutil, signal, subprocess, sys, time
 
 import paho.mqtt.client as mqtt
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SCR = tempfile.mkdtemp(prefix="physics_test_")
-os.environ["PATH"] = os.environ.get("PATH", "") + ":/opt/homebrew/sbin:/usr/local/sbin"  # mosquitto 위치 (macOS brew)
-PORT = 18851
-MAP = f"{REPO}/maps/empty_hall1/fms_map.json"
-REC = f"{SCR}/rec_test"
-
-results = []
-procs = []
-
-
-def check(name, ok, detail=""):
-    results.append((name, ok, detail))
-    print(("PASS " if ok else "FAIL ") + name + (f"  [{detail}]" if detail else ""), flush=True)
-
-
-class Robot:
-    def __init__(self, rid, x, y, theta=0.0, extra=(), record=True, mapfile=MAP, localize=True, require=True):
-        self.rid = rid
-        self.state = None
-        self.states = []
-        self.lock = threading.Lock()
-        cmd = [f"{REPO}/build/bin/robot_client", "--id", rid, "--port", str(PORT), "--x", str(x), "--y", str(y),
-               "--theta", str(theta), "--seed", "1", "--speed-noise", "0"]
-        if mapfile:
-            cmd += ["--map", mapfile]
-        if record:
-            cmd += ["--record", REC]
-        if require:  # B 시나리오는 힌트로 위치를 잡는 흐름. 기본(플래그 없음) 동작은 default_localized 가 따로 본다
-            cmd += ["--require-localization"]
-        cmd += list(extra)
-        self.log = open(f"{SCR}/{rid}.log", "w")
-        self.p = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT, cwd=REPO)
-        procs.append(self.p)
-        self.c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-        self.c.on_message = self._on
-        self.c.connect("localhost", PORT)
-        self.c.subscribe(f"fms/v1/{rid}/state")
-        self.c.loop_start()
-        self.wait(lambda s: True, 10, "first state")
-        if localize and mapfile:
-            # 켜자마자는 UNLOCALIZED. 시작 자세를 힌트로 줘서 스캔 매칭으로 위치를 잡는다
-            self.hint(x, y, theta)
-            if self.wait(lambda s: s["localization"] == "LOCALIZED", 10) is None:
-                print(f"  ({rid}: localization failed: {self.state and self.state.get('errors')})")
-
-    def _on(self, c, u, msg):
-        s = json.loads(msg.payload)
-        with self.lock:
-            self.state = s
-            self.states.append(s)
-
-    def wait(self, cond, timeout, what=""):
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            with self.lock:
-                s = self.state
-            if s is not None and cond(s):
-                return s
-            time.sleep(0.05)
-        return None
-
-    def order(self, oid, path, action=None, params=(), upd=0):
-        a = [f"{REPO}/build/bin/send_order", self.rid, "--port", str(PORT), "--order-id", oid, "--update", str(upd), "--path"] + path
-        if action:
-            a += ["--action", action]
-            for p in params:
-                a += ["--param", p]
-        r = subprocess.run(a, capture_output=True, text=True)
-        if r.returncode != 0:
-            print("send_order failed", r.stdout, r.stderr)
-        return r.returncode == 0
-
-    def instant(self, kind):
-        subprocess.run([f"{REPO}/build/bin/send_order", self.rid, "--port", str(PORT), "--instant", kind], capture_output=True)
-
-    def hint(self, x, y, theta=0.0):
-        subprocess.run([f"{REPO}/build/bin/send_order", self.rid, "--port", str(PORT), "--instant", "INIT_POSITION",
-                        "--param", f"x={x}", "--param", f"y={y}", "--param", f"theta={theta}"], capture_output=True)
-
-    def pose(self):
-        return self.state["pose"]
-
-    def idle_done(self, oid, timeout):
-        """오더 oid 가 끝나(IDLE 이고 order_id 없음) 기다린다"""
-        def done(s):
-            return s["state"] in ("IDLE", "ERROR", "CHARGING") and s["order_id"] is None
-        time.sleep(0.5)
-        return self.wait(done, timeout)
-
-    def stop(self):
-        self.c.loop_stop()
-        self.p.send_signal(signal.SIGTERM)
-        try:
-            self.p.wait(3)
-        except Exception:
-            self.p.kill()
-        self.log.close()
-
-    def csv_rows(self):
-        files = sorted(glob.glob(f"{REC}/{self.rid}_*.csv"))
-        if not files:
-            return []
-        # 로봇이 쓰는 중에 읽으면 마지막 줄이 잘려 있다 (빈 칸 = None). 그런 줄은 버린다
-        return [r for r in csv.DictReader(open(files[-1])) if None not in r.values()]
-
-
-def dist(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
+from simharness import *  # noqa: F401,F403  (Robot, check, dist, REPO, SCR, PORT, MAP, REC, TIME_SCALE, results, procs, ...)
 
 def adiff(a, b):
     d = a - b
@@ -478,8 +370,11 @@ def test_longrun():
     r.stop()
 
 
-def _place(rid, oid_x, oid_y, w, h):
-    subprocess.run([f"{REPO}/build/bin/place_obstacle", rid, "--port", str(PORT), "--x", str(oid_x), "--y", str(oid_y), "--width", str(w), "--height", str(h)], capture_output=True)
+def _place(rid, oid_x, oid_y, w, h, oid=None):
+    a = [f"{REPO}/build/bin/place_obstacle", rid, "--port", str(PORT), "--x", str(oid_x), "--y", str(oid_y), "--width", str(w), "--height", str(h)]
+    if oid:
+        a += ["--obstacle-id", oid]
+    subprocess.run(a, capture_output=True)
 
 
 def _clear(rid):
@@ -510,6 +405,111 @@ def test_obstacle():
     r.stop()
 
 
+def test_collide_obstacle():
+    """장애물도 물리적으로 있다: 설 수 없는 거리에 갑자기 나타나면 COLLISION. 서 있는 로봇 위에 놓인 것은 로봇 오류가 아니다."""
+    r = Robot("K1", 3, 6)
+    time.sleep(0.5)
+    _place("K1", 3, 6, 0.4, 0.4, oid="on-top")   # 서 있는 로봇 몸체와 겹치게 놓는다
+    time.sleep(1.5)
+    check("collide_obstacle: an obstacle dropped on a standing robot is not an error", r.state["state"] != "ERROR", f"errors={r.state['errors']}")
+    _clear("K1")
+    r.order("k1", ["30,6,0"])
+    s = r.wait(lambda s: s["pose"]["x"] > 8 and s["velocity"] > 0.8, 30)
+    check("collide_obstacle: cruising", s is not None)
+    # 로봇 0.6 m 앞에 홀을 가로막는 벽(두께 0.4): 제동거리보다 가까워서 설 수도 돌아갈 수도 없다
+    _place("K1", r.pose()["x"] + 0.6, 6, 0.4, 200.0, oid="wall")
+    s = r.wait(lambda s: s["state"] == "ERROR", 10)
+    errs = [e for e in (s or {}).get("errors", []) if e["error_type"] == "COLLISION"]
+    check("collide_obstacle: driving into an obstacle raises COLLISION", bool(errs) and "obstacle wall" in errs[0]["description"],
+          f"errors={(s or {}).get('errors')}")
+    check("collide_obstacle: order is dropped", s is not None and s["order_id"] is None)
+    # 겹친 채로 오류를 지워도 같은 접촉으로 다시 오류가 나지 않고, 치우면 다시 간다
+    r.instant("RESET_ERROR")
+    time.sleep(1.0)
+    check("collide_obstacle: no repeated error while still touching", r.state["state"] != "ERROR", f"errors={r.state['errors']}")
+    _clear("K1")
+    r.order("k2", ["30,6,0"])
+    s = r.idle_done("k2", 90)
+    p = r.pose()
+    check("collide_obstacle: drives again after the obstacle is removed", s is not None and dist((p["x"], p["y"]), (30, 6)) < 0.05, f"pose={p} state={r.state['state']}")
+    r.stop()
+
+
+def test_robots():
+    """로봇끼리 서로를 장애물로 본다: 서 있는 로봇을 돌아가고, 마주 오는 로봇과 겹치지 않고 지나간다."""
+    # 1) 서 있는 로봇: P1 의 직선 경로 한가운데 P2 가 서 있다
+    a = Robot("P1", 5, 6)
+    b = Robot("P2", 12, 6)
+    a.order("p1", ["20,6,0"])
+    s = a.idle_done("p1", 90)
+    p = a.pose()
+    check("robots: drives around a parked robot and arrives", s is not None and s["state"] == "IDLE" and dist((p["x"], p["y"]), (20, 6)) < 0.05,
+          f"pose={p} state={a.state['state']} errors={a.state['errors']}")
+    with a.lock:
+        saw = any(st.get("detected_obstacles") for st in a.states)
+        dev = max(abs(st["pose"]["y"] - 6) for st in a.states)
+    check("robots: the parked robot is reported as a detected obstacle", saw)
+    check("robots: path deviates around the parked robot (> 0.3 m)", dev > 0.3, f"max |dy|={dev:.2f}")
+    sep = min_separation(a, b)
+    check("robots: bodies never overlap while passing (center distance > 0.45 m)", sep > 0.45, f"min={sep:.2f}")
+    check("robots: the parked robot is not disturbed", b.state["state"] == "IDLE" and not b.state["errors"], f"errors={b.state['errors']}")
+    # 2) 정면 교차: 서로 자리를 바꾼다
+    with a.lock, b.lock:
+        a.truths.clear(); b.truths.clear()
+    a.order("p2", ["12,6,3.14"])
+    b.order("q2", ["20,6,0"])
+    sa = a.idle_done("p2", 120)
+    sb = b.idle_done("q2", 120)
+    pa, pb = a.pose(), b.pose()
+    check("robots: head-on, both arrive", sa is not None and sb is not None and dist((pa["x"], pa["y"]), (12, 6)) < 0.05 and dist((pb["x"], pb["y"]), (20, 6)) < 0.05,
+          f"a={pa} {a.state['state']} {a.state['errors']} b={pb} {b.state['state']} {b.state['errors']}")
+    sep = min_separation(a, b)
+    check("robots: head-on, bodies never overlap (center distance > 0.45 m)", sep > 0.45, f"min={sep:.2f}")
+    # 3) 꺼진 로봇은 세계에서 사라진다
+    b.stop()
+    time.sleep(1.0)
+    check("robots: a robot that shut down is no longer detected", not a.state.get("detected_obstacles"), f"detected={a.state.get('detected_obstacles')}")
+    a.stop()
+
+
+def test_world():
+    """월드 장애물 (retained sim/v1/world/obstacles): 로봇이 뜨기 전에 놓은 것도 보이고, 지우면 사라진다."""
+    world_place("box1", 10, 6, 0.6, 0.6)
+    try:
+        r = Robot("W1", 5, 6)   # 장애물을 놓은 뒤에 뜬다 (예전 INJECT_OBSTACLE 방식으로는 못 받던 경우)
+        r.order("w1", ["12.5,6,0"])   # 도착해도 장애물이 센서 범위(3 m) 안이다
+        s = r.idle_done("w1", 90)
+        p = r.pose()
+        check("world: a robot started after the obstacle was placed avoids it and arrives",
+              s is not None and s["state"] == "IDLE" and dist((p["x"], p["y"]), (12.5, 6)) < 0.05, f"pose={p} state={r.state['state']} errors={r.state['errors']}")
+        with r.lock:
+            dev = max(abs(st["pose"]["y"] - 6) for st in r.states)
+            seen = any(st.get("detected_obstacles") for st in r.states)
+        check("world: detour around the world obstacle (> 0.3 m off the straight line)", dev > 0.3 and seen, f"max |dy|={dev:.2f} seen={seen}")
+        # 센서 범위 안에서 지우면 곧바로 사라지고 돌아올 때는 직선으로 간다
+        # (범위 밖에서 지우면 로봇은 알 수 없어서 장애물 기억 시간 동안 계속 피한다: memory 시나리오)
+        world_clear("box1")
+        time.sleep(1.0)
+        with r.lock:
+            n0 = len(r.states)
+        r.order("w2", ["5,6,3.14"])
+        s = r.idle_done("w2", 90)
+        with r.lock:
+            back = r.states[n0:]
+        dev = max(abs(st["pose"]["y"] - 6) for st in back)
+        check("world: after clearing, drives straight back", s is not None and dev < 0.15 and not any(st.get("detected_obstacles") for st in back), f"max |dy|={dev:.2f}")
+        # --no-world-obstacles 면 무시한다
+        r.stop()
+        world_place("box2", 10, 6, 0.6, 0.6)
+        r2 = Robot("W2", 5, 6, extra=["--no-world-obstacles"])
+        time.sleep(1.0)
+        check("world: --no-world-obstacles ignores world obstacles", not r2.state.get("detected_obstacles"), f"detected={r2.state.get('detected_obstacles')}")
+        r2.stop()
+    finally:
+        world_clear("box1")
+        world_clear("box2")
+
+
 def test_reroute():
     """로컬 창(5 m) 안에 우회로가 없어도 구간 전체를 다시 계획해 다른 길로 간다 (gui_map 0,0 -> 10.26,10.23, 8.3,0 에 1.5x3 상자)."""
     m = f"{REPO}/maps/gui_map/fms_map.json"
@@ -524,6 +524,68 @@ def test_reroute():
     with open(f"{SCR}/G1.log") as f:
         log = f.read()
     check("reroute: the leg was replanned around the obstacle", "rerouted the whole leg" in log or "detour around" in log)
+    r.stop()
+
+
+def _both_blocked(rid, extra):
+    """gui_map 0,0 -> 10.26,10.23: 8.3,0 상자로 남쪽 길(x~3.4)로 돌게 한 뒤 그 길도 막는다. 로봇이 동쪽 원래 길(x>5, y<3)로 되돌아가는지(왕복) 본다."""
+    m = f"{REPO}/maps/gui_map/fms_map.json"
+    r = Robot(rid, 0, 0, mapfile=m, extra=extra)
+    r.order(rid + "o", ["10.26,10.23,0"])
+    r.wait(lambda s: s["pose"]["x"] > 3, 30)
+    _place(rid, 8.3, 0, 1.5, 3.0)
+    r.wait(lambda s: s["pose"]["y"] > 1.5 and s["pose"]["x"] < 4.0, 40)   # 남쪽 길로 접어들었다
+    _place(rid, 3.4, 5.0, 3.0, 3.0)
+    t0 = time.time()
+    xmax = 0.0   # 동쪽 원래 길(x>5, y<3)로 되돌아간 정도
+    while time.time() - t0 < 40:
+        q = r.pose()
+        if q["y"] < 3.0:
+            xmax = max(xmax, q["x"])
+        time.sleep(0.2)
+    with open(f"{SCR}/{rid}.log") as f:
+        log = f.read()
+    return r, xmax, log
+
+
+def test_memory():
+    """장애물 기억: 양쪽 길이 다 막혀도 방금 피한 길로 되돌아가 왕복하지 않는다. 기억을 끄면(--obstacle-memory 0) 되돌아간다 (비교)."""
+    r, xmax, log = _both_blocked("M1", [])
+    check("memory: does not flip back to the blocked east route", xmax < 5.0 and r.state["state"] != "ERROR", f"xmax={xmax:.2f}")
+    check("memory: out-of-range obstacle is remembered", "obstacle remembered" in log)
+    # 앞 장애물을 치우면 (기억 중인 쪽은 그대로) 남쪽 길로 도착한다
+    _clear("M1")   # 로봇은 치워졌는지 모른다: 범위 안에서 다시 보고 확인하면 풀린다
+    s = r.idle_done("M1o", 120)
+    p = r.pose()
+    check("memory: arrives after the blocking obstacles are removed", s is not None and dist((p["x"], p["y"]), (10.26, 10.23)) < 0.05, f"pose={p}")
+    r.stop()
+    r, xmax0, log0 = _both_blocked("M0", ["--obstacle-memory", "0"])
+    check("memory: without memory the robot flips back east (control)", xmax0 >= 5.0, f"xmax={xmax0:.2f}")
+    r.stop()
+
+
+def test_shortcut():
+    """우회 경로가 목적지를 지나쳐 합류점까지 갔다가 되돌아오지 않는다 (gui_map 14.9,0 -> 14.9,3.4, 동쪽 복도를 막음).
+    정상 경로는 블록 동쪽으로 돈다. 막히면 서쪽으로 돌아 아래 복도의 목적지에 바로 서야 한다 (예전엔 장애물 뒤 합류점 x~16 까지 갔다 왔다)."""
+    m = f"{REPO}/maps/gui_map/fms_map.json"
+    r = Robot("K1", 14.9, 0, mapfile=m)
+    r.order("sc1", ["14.9,3.4,0"])
+    went_east = r.wait(lambda s: s["pose"]["x"] > 15.6, 20) is not None
+    _place("K1", 16.35, 1.92, 0.95, 0.1)
+    xmax = 0.0   # 아래 복도(y > 2.8)에서 동쪽으로 간 최대 x
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        s = r.state
+        if s["pose"]["y"] > 2.8:
+            xmax = max(xmax, s["pose"]["x"])
+        if s["state"] in ("IDLE", "ERROR") and s["order_id"] is None and time.time() - t0 > 1:
+            break
+        time.sleep(0.05)
+    p = r.pose()
+    took = time.time() - t0
+    check("shortcut: nominal route goes east first (test setup)", went_east)
+    check("shortcut: arrives at the goal", dist((p["x"], p["y"]), (14.9, 3.4)) < 0.05 and r.state["state"] == "IDLE", f"pose={p} t={took:.1f}s")
+    check("shortcut: does not overshoot the goal to the old rejoin point", 0 < xmax < 15.3, f"xmax in lower corridor={xmax:.2f}")
     r.stop()
 
 
@@ -646,7 +708,7 @@ def test_physics_topic():
 
 
 def test_navigation():
-    """sim/v1/{id}/navigation: Global 예상 경로가 마지막 노드까지 중간 노드를 거쳐 이어지고, 우회 중엔 detour_active, 끝나면 비운다."""
+    """sim/v1/{id}/navigation: Global 경로는 바로 앞 노드 구간만, 도착 뒤 다음 구간. 우회 중엔 detour_active, 끝나면 비운다."""
     m = f"{REPO}/maps/gui_map/fms_map.json"
     r = Robot("N1", 0, 0, mapfile=m)
     got = []
@@ -663,12 +725,18 @@ def test_navigation():
         time.sleep(0.1)
     d = got[-1]
     gp = d["global_path"]
-    check("navigation: global path published for the order", d["order_id"] == "n1" and d["status"] == "READY" and len(gp) > 5, f"status={d['status']} n={len(gp)}")
+    check("navigation: global path published for the order", d["order_id"] == "n1" and d["status"] == "READY" and len(gp) > 1, f"status={d['status']} n={len(gp)}")
     if gp:
-        check("navigation: global path ends at the last node", dist(gp[-1], (10.26, 10.23)) < 0.05, f"end={gp[-1]}")
-        check("navigation: global path passes the middle node in order", min(dist(p, (3, 0)) for p in gp) < 0.05 and
-              min(range(len(gp)), key=lambda i: dist(gp[i], (3, 0))) < min(range(len(gp)), key=lambda i: dist(gp[i], (10.26, 10.23))))
-        check("navigation: plan radius reported", abs(d["plan_radius"] - 3.0) < 1e-6 or d["plan_radius"] > 0, f"radius={d['plan_radius']}")
+        check("navigation: only the next node is planned (a->b, not b->c)", dist(gp[-1], (3, 0)) < 0.05 and min(dist(p, (10.26, 10.23)) for p in gp) > 3,
+              f"end={gp[-1]}")
+        check("navigation: plan radius reported", d["plan_radius"] > 0, f"radius={d['plan_radius']}")
+    # (3,0) 도착 뒤 다음 구간(b->c)이 생긴다
+    t0 = time.time()
+    while time.time() - t0 < 30 and not (got[-1]["global_path"] and dist(got[-1]["global_path"][-1], (10.26, 10.23)) < 0.05):
+        time.sleep(0.1)
+    d = got[-1]
+    check("navigation: next leg is planned after arriving at the node", d["global_path"] and dist(d["global_path"][-1], (10.26, 10.23)) < 0.05,
+          f"end={d['global_path'][-1] if d['global_path'] else None}")
     r.wait(lambda s: s["pose"]["x"] > 4, 30)
     _place("N1", 8.3, 0, 1.5, 3.0)
     t0 = time.time()
@@ -760,7 +828,8 @@ def test_script():
     r = Robot("S1", 3, 3)
     path = f"{SCR}/job.txt"
     open(path, "w").write("0 START\n1 MOVE 5 3 0   // x y th\n2 WAIT 1\n3 PICK 1\n4 MOVE 5 6 1.57\n5 END\n")
-    run = subprocess.run([f"{REPO}/build/bin/send_order", "S1", "--port", str(PORT), "--script", path], capture_output=True, text=True)
+    # --order-id 를 고정한다 (기본값은 파일명-HHMMSS 라 action_id 를 예측할 수 없다)
+    run = subprocess.run([f"{REPO}/build/bin/send_order", "S1", "--port", str(PORT), "--order-id", "job", "--script", path], capture_output=True, text=True)
     check("script: published", run.returncode == 0, run.stderr.strip())
     s = r.idle_done("job", 60)
     p = r.pose()
@@ -787,7 +856,7 @@ ALL = {
     "move": test_move, "straight": test_straight, "dock": test_dock_park, "collision": test_collision,
     "default": test_default_localized, "script": test_script, "curve": test_curve, "lazy": test_lazy_plan,
     "pause": test_pause_cancel, "ghost": test_ghost_start, "lowfric": test_low_friction, "slip": test_normal_slip_small,
-    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "reroute": test_reroute, "navigation": test_navigation, "detour": test_detour, "detour_clear": test_detour_clear, "zone": test_zone_obstacles, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
+    "loop": test_loop_map, "longrun": test_longrun, "obstacle": test_obstacle, "collide_obstacle": test_collide_obstacle, "robots": test_robots, "world": test_world, "reroute": test_reroute, "memory": test_memory, "shortcut": test_shortcut, "navigation": test_navigation, "detour": test_detour, "detour_clear": test_detour_clear, "zone": test_zone_obstacles, "dockint": test_dock_interrupt, "gui": test_gui_offscreen, "topic": test_physics_topic, "estimate": test_estimated_pose, "localization": test_localization, "unlocalized": test_unlocalized, "charger": test_charger, "battery": test_battery,
 }
 
 if __name__ == "__main__":
@@ -797,9 +866,7 @@ if __name__ == "__main__":
     print(f"로그/기록 폴더: {SCR}")
     names = sys.argv[1:] or list(ALL)
     shutil.rmtree(REC, ignore_errors=True)
-    mq = subprocess.Popen(["mosquitto", "-p", str(PORT)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    procs.append(mq)
-    time.sleep(1.0)
+    start_broker()
     try:
         for n in names:
             print(f"== {n}", flush=True)
@@ -808,11 +875,7 @@ if __name__ == "__main__":
             except Exception as e:  # noqa
                 check(f"{n}: exception", False, repr(e))
     finally:
-        for p in procs:
-            try:
-                p.kill()
-            except Exception:
-                pass
+        stop_all()
     bad = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(bad)}/{len(results)} PASS")
     sys.exit(1 if bad else 0)

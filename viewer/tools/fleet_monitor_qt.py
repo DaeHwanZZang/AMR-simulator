@@ -27,6 +27,10 @@ FMS 번들). 따라가는 로봇의 맵이 바뀌면 화면 맵을 바꾸고, �
     k             궤적/피크값 지우기
     f             시점 고정 (로봇1 -> 로봇2 ... -> 해제 순환). 드래그하면 해제, 스크롤 줌은 유지
     r             보기 초기화 (맵 전체)
+    h             단축키 도움말 패널 토글
+    b             장애물 배치 모드 토글 -- 켜고 맵을 클릭하면 3x3 맵 픽셀 사각형을 월드 장애물로 놓는다
+                  (retained sim/v1/world/obstacles/{id}: 모든 로봇이 같이 보고, 나중에 뜬 로봇/뷰어도 받는다)
+    u / Cmd+Z     이 뷰어가 직전에 놓은 장애물 삭제.  Shift+U 는 지금 있는 월드 장애물 전부 (다른 뷰어/도구가 놓은 것 포함)
 """
 
 from __future__ import annotations
@@ -178,6 +182,8 @@ def main() -> int:
         log.error("브로커 접속 실패 (%s:%d): %s — mosquitto 가 떠 있는지 확인",
                   args.host, args.port, e)
         return 1
+
+    window.canvas.publish_world = monitor.publish_world_obstacle
 
     follower = None
     if follow:

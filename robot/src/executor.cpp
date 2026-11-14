@@ -45,6 +45,8 @@ bool segment_intersects_rect(double ax, double ay, double bx, double by, double 
 }
 
 constexpr double kMaxTickDt = 0.1;  // s
+// 이 속도(m/s)보다 빠르게 가는 중에 장애물이 몸체와 겹치면 충돌로 본다. 그보다 느리면(서 있으면) 장애물이 와서 닿은 것이다
+constexpr double kContactMovingSpeed = 0.05;
 
 }  // namespace
 
@@ -184,7 +186,8 @@ void OrderExecutor::set_map(const MapModel* new_map, std::string map_uid, std::s
     physics->set_map(new_map);
     clearance_.reset();
     matcher_.reset();
-    invalidate_global();
+    obstacle_memory.clear();  // 맵이 바뀌면 좌표계가 다르다
+    nav_changed();
     chargers_ = new_map ? load_chargers(new_map->base_dir) : std::vector<Charger>{};
     if (other_map && require_localization) set_unlocalized("map changed");
     current_map_uid_ = std::move(map_uid);
@@ -251,7 +254,7 @@ bool OrderExecutor::accept_order(const Order& order) {
     order_update_id_ = order.order_update_id;
     nodes_ = order.nodes;
     current_index_ = 0;
-    invalidate_global();
+    nav_changed();
     action_states_.clear();
     for (auto& n : nodes_)
         if (n.action) set_action_status(n.action->action_id, ActionStatus::WAITING);
@@ -270,7 +273,7 @@ bool OrderExecutor::apply_order_update(const Order& order) {
     size_t old_len = nodes_.size();
     order_update_id_ = order.order_update_id;
     nodes_ = order.nodes;
-    invalidate_global();
+    nav_changed();
     for (auto& n : nodes_) {
         if (!n.action) continue;
         bool known = std::any_of(action_states_.begin(), action_states_.end(),
@@ -386,6 +389,38 @@ void OrderExecutor::handle_instant(const InstantAction& action) {
     }
 }
 
+void OrderExecutor::sync_world(const std::vector<WorldObstacle>& world, const std::vector<PeerRobot>& peers) {
+    auto same_map = [&](const std::string& map_id) {
+        return map_id.empty() || current_map_uid_.empty() || map_id == current_map_uid_;
+    };
+    std::vector<DynamicObstacle> items;
+    for (auto& w : world) {
+        if (!same_map(w.map_id)) continue;
+        DynamicObstacle o;
+        o.obstacle_id = "world:" + w.id;
+        o.x = w.x; o.y = w.y; o.width = w.width; o.height = w.height;
+        o.source = ObstacleSource::MANUAL;
+        items.push_back(std::move(o));
+    }
+    obstacle_field.sync_external("world:", items);
+
+    items.clear();
+    for (auto& p : peers) {
+        if (p.id == robot_id || !same_map(p.map_id)) continue;
+        DynamicObstacle o;
+        o.obstacle_id = "robot:" + p.id;
+        o.x = p.x; o.y = p.y;
+        // 감지/계획용 사각형 = 회전한 length x width 몸체의 축 정렬 경계 상자 (장애물 표현이 축 정렬 사각형뿐이라 보수적으로 잡는다)
+        const double c = std::abs(std::cos(p.theta)), sn = std::abs(std::sin(p.theta));
+        o.width = p.length * c + p.width * sn;
+        o.height = p.length * sn + p.width * c;
+        o.source = ObstacleSource::ROBOT;
+        o.body_radius = body_disc_radius(p.width);  // 충돌 판정은 그 로봇의 물리 충돌 원판으로
+        items.push_back(std::move(o));
+    }
+    obstacle_field.sync_external("robot:", items);
+}
+
 void OrderExecutor::tick(double dt) {
     // 경로계획 등으로 루프가 길게 막혔다 돌아오면 dt 가 크다 (A* 가 수백 ms 걸린다). 물리/궤적이 한 번에
     // 크게 움직이지 않도록 자른다. 막혀 있던 시간은 시뮬레이션에서 건너뛴다.
@@ -416,11 +451,21 @@ void OrderExecutor::record_sample(double dt) {
 void OrderExecutor::tick_logic(double dt) {
     // 센서가 보는 거리 안에서 설 수 있는 속도로 제한한다: v^2 / (2 a) <= sensor_range - 0.5 (여유 20% 포함)
     kinematics.speed_cap = std::sqrt(2.0 * 0.8 * std::max(kinematics.max_deceleration, 1e-3) * std::max(0.0, sensor_range - 0.5));
+    // 감속 구역(annotations.json type=slow) 안에서는 그 구역의 speed_limit 을 넘지 않는다.
+    if (map) kinematics.speed_cap = std::min(kinematics.speed_cap, map->speed_limit_at(kinematics.x, kinematics.y));
     tick_localization(dt);
     check_battery();
     obstacle_field.tick(dt);
+    // 장애물이 움직여서(또는 새로 놓여서) 몸체와 겹쳤는가. 달리는 중이면 충돌, 서 있었으면 로봇 잘못이 아니라 넘어간다.
+    if (check_obstacle_contact(std::abs(physics->telemetry().v_fwd) > kContactMovingSpeed)) {
+        kinematics.brake(dt);
+        battery.step(dt, 0.0);
+        return;
+    }
     auto detected = update_detections();
     last_detected_ = detected;
+    obstacle_memory.update(dt, kinematics.x, kinematics.y, sensor_range, detected, robot_id);
+    const auto known = obstacle_memory.known(detected);  // 보이는 것 + 범위 밖 기억 (계획/복귀 판단용)
 
     if (motion_inhibited()) {
         battery.step(dt, 0.0);
@@ -465,7 +510,7 @@ void OrderExecutor::tick_logic(double dt) {
             return;
         }
     }
-    if (handle_obstacles(dt, detected)) return;
+    if (handle_obstacles(dt, known)) return;
 
     double prev_x = physics->x(), prev_y = physics->y();  // 충돌 롤백은 참 자세 기준
     auto kin_state = kinematics.step(dt);
@@ -491,6 +536,7 @@ bool OrderExecutor::check_collision(double, double, double prev_x, double prev_y
         raise_fatal(e);
         return true;
     }
+    if (check_obstacle_contact(true)) return true;
     if (map == nullptr || map->is_free(x, y)) return false;
     CellType cell = map->cell_at(x, y);
     log::error("[%s] collision: (%.2f, %.2f), stopping at (%.2f, %.2f), order %s aborted", robot_id.c_str(), x, y, prev_x,
@@ -499,6 +545,29 @@ bool OrderExecutor::check_collision(double, double, double prev_x, double prev_y
     ErrorInfo e; e.error_type = "COLLISION"; e.level = ErrorLevel::FATAL;
     e.description = "(" + std::to_string(x) + ", " + std::to_string(y) + ") is an " +
                      std::string(cell == CellType::OCCUPIED ? "OCCUPIED" : "UNKNOWN") + " cell";
+    raise_fatal(e);
+    return true;
+}
+
+bool OrderExecutor::check_obstacle_contact(bool moving) {
+    const double x = physics->x(), y = physics->y();
+    const double r = body_disc_radius(robot_width);
+    std::set<std::string> now;
+    const DynamicObstacle* hit = nullptr;
+    for (auto& [id, o] : obstacle_field.obstacles) {
+        if (!o.overlaps_disc(x, y, r)) continue;
+        now.insert(id);
+        if (!hit && !colliding_ids_.count(id)) hit = &o;
+    }
+    colliding_ids_ = std::move(now);
+    if (!hit || !moving) return false;
+    const bool robot = hit->source == ObstacleSource::ROBOT;
+    log::error("[%s] collision: hit %s %s at (%.2f, %.2f), order %s aborted", robot_id.c_str(),
+               robot ? "robot" : "obstacle", hit->obstacle_id.c_str(), x, y, order_id_.c_str());
+    ErrorInfo e; e.error_type = "COLLISION"; e.level = ErrorLevel::FATAL;
+    char desc[160];
+    std::snprintf(desc, sizeof desc, "hit %s %s at (%.2f, %.2f)", robot ? "robot" : "obstacle", hit->obstacle_id.c_str(), x, y);
+    e.description = desc;
     raise_fatal(e);
     return true;
 }
@@ -517,7 +586,7 @@ std::vector<DynamicObstacle> OrderExecutor::update_detections() {
         if (!detected_obstacle_ids_.count(o.obstacle_id))
             log::info("[%s] obstacle detected: %s (%.2f, %.2f) %.2fx%.2f source=%s", robot_id.c_str(),
                       o.obstacle_id.c_str(), o.x, o.y, o.width, o.height,
-                      o.source == ObstacleSource::MANUAL ? "MANUAL" : "SIM");
+                      to_string(o.source));
     }
     for (auto& id : detected_obstacle_ids_)
         if (!now_ids.count(id)) log::info("[%s] obstacle no longer detected: %s", robot_id.c_str(), id.c_str());
@@ -590,7 +659,7 @@ bool OrderExecutor::handle_obstacles(double dt, const std::vector<DynamicObstacl
             auto path = plan_segment_path(&obs);
             kinematics.set_path(path, smooth_enabled);
             kinematics.set_final_theta(nodes_[segment_.back()].position.theta);
-            if (!detour_active_) log::info("[%s] rerouted the whole leg around %zu obstacle(s)", robot_id.c_str(), rects.size());
+            log::info("[%s] rerouted the whole leg around %zu obstacle(s)", robot_id.c_str(), rects.size());
             detour_active_ = true;
             return false;
         } catch (const PlanningError& e) {
@@ -681,6 +750,7 @@ void OrderExecutor::tick_action(double dt) {
     acting_elapsed_ += dt;
     if (acting_elapsed_ < acting_->duration) return;
     set_action_status(acting_->action_id, ActionStatus::FINISHED);
+    update_loads(*acting_);
     log::info("[%s] action complete: %s (%s)", robot_id.c_str(), acting_->action_id.c_str(),
               to_string(acting_->action_type).c_str());
     acting_ = std::nullopt;
@@ -851,6 +921,8 @@ std::vector<std::pair<double, double>> OrderExecutor::plan_segment_path(
         const auto& target = targets[k];
         const auto& allowed = nodes_[segment_[k]].allowed_zone_ids;
         if ((centerline.enabled || path_refine.enabled) && !clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
+        // 로컬 우회의 곡선화가 쓰는 넓은 팽창 grid 를 미리 만들어 둔다 (캐시됨. 큰 맵에서 첫 우회 tick 이 1 초 넘게 멈추지 않게)
+        if (smooth_enabled) static_planning_grid(*map, robot_width + 2 * smooth.extra_clearance);
         // 복도 중앙 주행은 동적 장애물 회피 경로에도 쓴다 (장애물은 grid 에서 막히고, 거리 장은 벽 기준 선호만 준다).
         auto seg = plan_path(*map, start, target, robot_width, robot_length, dynamic_obstacles, &allowed,
                              clearance_.get(), &centerline);
@@ -956,7 +1028,7 @@ void OrderExecutor::clear_order() {
     battery.charging = docked_charging();
     leg_nominal_.clear();
     detour_active_ = false;
-    invalidate_global();
+    nav_changed();
     set_base(idle_state());
 }
 
@@ -1028,6 +1100,7 @@ void OrderExecutor::tick_localization(double dt) {
 
 bool OrderExecutor::force_relocalize(double x, double y, double theta) {
     docked_.reset();  // 다른 곳으로 옮겼으니 도킹은 풀린다
+    obstacle_memory.clear();
     clear_order();
     kinematics.emergency_stop();
     kinematics.set_pose(x, y, &theta);
@@ -1058,6 +1131,7 @@ bool OrderExecutor::sim_teleport(double x, double y, double theta, const std::st
         return false;
     }
     docked_.reset();
+    obstacle_memory.clear();
     clear_order();
     kinematics.emergency_stop();
     kinematics.set_pose(x, y, &theta);
@@ -1070,56 +1144,19 @@ bool OrderExecutor::sim_teleport(double x, double y, double theta, const std::st
     return true;
 }
 
-std::pair<double, double> OrderExecutor::node_end_point(const OrderNode& n) const {
-    if (n.action) {
-        switch (n.action->action_type) {
-            case ActionType::DOCK:
-            case ActionType::PARK: return approach_point(n);  // 다음 이동은 언도킹으로 시작한다
-            case ActionType::STRAIGHT: {
-                double d = param_double(n.action->params, "distance", 0.0);
-                return {n.position.x + d * std::cos(n.position.theta), n.position.y + d * std::sin(n.position.theta)};
-            }
-            default: break;
-        }
-    }
-    return {n.position.x, n.position.y};
-}
-
 std::vector<std::pair<double, double>> OrderExecutor::node_tail(const OrderNode& n) const {
     std::vector<std::pair<double, double>> tail;
     if (!n.action) return tail;
     auto t = n.action->action_type;
     if (t == ActionType::DOCK || t == ActionType::PARK) tail.emplace_back(n.position.x, n.position.y);  // 접근점 -> 진입 완료 자세
-    else if (t == ActionType::STRAIGHT) tail.push_back(node_end_point(n));
+    else if (t == ActionType::STRAIGHT) {
+        double d = param_double(n.action->params, "distance", 0.0);
+        tail.emplace_back(n.position.x + d * std::cos(n.position.theta), n.position.y + d * std::sin(n.position.theta));
+    }
     return tail;
 }
 
-OrderExecutor::GlobalLeg OrderExecutor::plan_global_leg(std::pair<double, double> start, int node_index) {
-    GlobalLeg leg;
-    const OrderNode& n = nodes_[node_index];
-    bool docking = n.action && (n.action->action_type == ActionType::DOCK || n.action->action_type == ActionType::PARK);
-    std::pair<double, double> target = docking ? approach_point(n) : std::make_pair(n.position.x, n.position.y);
-    try {
-        if (map == nullptr) {
-            leg.path = {start, target};
-        } else {
-            if ((centerline.enabled || path_refine.enabled) && !clearance_) clearance_ = std::make_unique<ClearanceField>(*map);
-            leg.path = plan_path(*map, start, target, robot_width, robot_length, nullptr, &n.allowed_zone_ids,
-                                 clearance_.get(), &centerline);
-            if (smooth_enabled)
-                leg.path = smooth_path(*map, leg.path, robot_width, robot_length, nullptr, &n.allowed_zone_ids, smooth);
-        }
-        for (auto& p : node_tail(n)) leg.path.push_back(p);
-        leg.ok = true;
-    } catch (const PlanningError& e) {
-        leg.error = e.what();
-    }
-    return leg;
-}
-
 std::optional<NavigationDebug> OrderExecutor::take_navigation(long long header_id, double timestamp) {
-    constexpr int kLookahead = 16;      // 현재 노드부터 이만큼 앞까지 계산한다
-    constexpr int kBudgetPerTick = 2;   // tick 당 새로 계획하는 구간 수 (tick 을 오래 막지 않으려고)
     NavigationDebug nav;
     nav.header_id = header_id;
     nav.timestamp = timestamp;
@@ -1130,50 +1167,13 @@ std::optional<NavigationDebug> OrderExecutor::take_navigation(long long header_i
     nav.plan_rate = local_plan_rate;
     nav.detour_active = detour_active_;
 
-    if (!order_id_.empty() && !nodes_.empty()) {
+    // Global = 지금 향하는 노드 하나까지의 정상 경로. 움직이는 구간이 없으면(액션 중, 노드 대기) 비어 있다.
+    if (!order_id_.empty() && current_index_ < (int)nodes_.size() && !segment_.empty() && !leg_nominal_.empty()) {
         nav.status = "READY";
-        auto& g = nav.global_path;
-        auto append = [&](const std::vector<std::pair<double, double>>& pts) {
-            for (auto& p : pts)
-                if (g.empty() || std::hypot(p.first - g.back().first, p.second - g.back().second) > 1e-6) g.push_back(p);
-        };
-        const int n_nodes = (int)nodes_.size();
-        const int last = std::min(n_nodes, current_index_ + kLookahead);
-        nav.truncated = last < n_nodes;
-        std::pair<double, double> start = {kinematics.x, kinematics.y};
-        int i = current_index_;
-        bool released_run = true;
-        auto mark_released = [&](int idx) {
-            if (released_run && nodes_[idx].released) nav.released_points = (int)g.size();
-            else released_run = false;
-        };
-        if (i < n_nodes && !segment_.empty() && !leg_nominal_.empty()) {   // 지금 주행 중인 구간의 정상 경로
-            append(leg_nominal_);
-            append(node_tail(nodes_[i]));
-            start = node_end_point(nodes_[i]);
-            mark_released(i);
-            ++i;
-        } else if (i > 0 && i <= n_nodes) {
-            start = node_end_point(nodes_[i - 1]);
-        }
-        int budget = kBudgetPerTick;
-        for (; i < last; ++i) {
-            auto it = global_cache_.find(i);
-            if (it == global_cache_.end()) {
-                if (budget-- <= 0) { nav.status = "PLANNING"; break; }
-                it = global_cache_.emplace(i, plan_global_leg(start, i)).first;
-                ++nav_version_;
-            }
-            if (!it->second.ok) {
-                nav.status = "PARTIAL";
-                nav.failed_node = i;
-                nav.failed_reason = it->second.error;
-                break;
-            }
-            append(it->second.path);
-            start = node_end_point(nodes_[i]);
-            mark_released(i);
-        }
+        nav.global_path = leg_nominal_;
+        for (auto& p : node_tail(nodes_[current_index_]))
+            if (std::hypot(p.first - nav.global_path.back().first, p.second - nav.global_path.back().second) > 1e-6)
+                nav.global_path.push_back(p);
     }
     nav.version = nav_version_;
 
@@ -1242,6 +1242,9 @@ PhysicsDebug OrderExecutor::build_physics(long long header_id, double timestamp)
     d.wall_force = w.wall_force;
     d.ghost = w.ghost;
     d.collided = kinematics.collided();
+    d.width = robot_width;
+    d.length = robot_length;
+    d.map_id = current_map_uid_;
     d.at_rest = physics->at_rest();
     d.straight = kinematics.straight_active();
 
@@ -1268,6 +1271,24 @@ PhysicsDebug OrderExecutor::build_physics(long long header_id, double timestamp)
         d.goal_y = k.local_path.back().second;
     }
     return d;
+}
+
+// PICK 이 끝나면 싣고 DROP 이 끝나면 내린다. State.loads 로 보고해 FMS 가 장부와 대조한다.
+void OrderExecutor::update_loads(const Action& action) {
+    if (!action.payload_id || action.payload_id->empty()) return;
+    if (action.action_type == ActionType::PICK) {
+        for (const auto& l : loads_) if (l.payload_id == *action.payload_id) return;
+        // 비어 있는 가장 낮은 칸 번호를 쓴다.
+        for (int n = 1;; ++n) {
+            const std::string tray = "T" + std::to_string(n);
+            bool used = false;
+            for (const auto& l : loads_) if (l.tray == tray) { used = true; break; }
+            if (!used) { loads_.push_back(LoadInfo{tray, *action.payload_id}); break; }
+        }
+    } else if (action.action_type == ActionType::DROP) {
+        for (auto it = loads_.begin(); it != loads_.end(); ++it)
+            if (it->payload_id == *action.payload_id) { loads_.erase(it); break; }
+    }
 }
 
 State OrderExecutor::build_state(long long header_id, double timestamp) const {
@@ -1305,6 +1326,7 @@ State OrderExecutor::build_state(long long header_id, double timestamp) const {
     for (auto& [aid, st] : action_states_) s.action_states.push_back(ActionProgress{aid, st});
     s.battery = battery.info();
     s.errors = errors_;
+    s.loads = loads_;
     for (auto& o : last_detected_)
         s.detected_obstacles.push_back(ObstacleInfo{std::round(o.x * 10000) / 10000,
                                                       std::round(o.y * 10000) / 10000, o.width, o.height});

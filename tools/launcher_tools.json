@@ -41,7 +41,11 @@
         {"if": "gui", "args": ["--gui"]},
         {"if": "path_refine", "args": ["--path-refine"]},
         {"if": "no_smooth", "args": ["--no-smooth-path"]},
+        {"if": "no_robot_detect", "args": ["--no-robot-detect"]},
+        {"if": "no_world_obstacles", "args": ["--no-world-obstacles"]},
+        "--time-scale", "{time_scale}",
         "--local-plan-radius", "{local_plan_radius}", "--local-plan-rate", "{local_plan_rate}",
+        "--obstacle-memory", "{obstacle_memory}",
         {"if": "obstacle_zone", "args": [
           "--obstacle-zone", "{obstacle_zone}",
           "--obstacle-spawn-interval", "{obstacle_spawn_interval}",
@@ -63,6 +67,9 @@
         {"key": "gui", "label": "제어판(GUI) 창", "type": "bool", "default": false},
         {"key": "no_smooth", "label": "곡선 주행 끄기 (코너마다 정지·회전)", "type": "bool", "default": false},
         {"key": "path_refine", "label": "PSO 경로 다듬기", "type": "bool", "default": false},
+        {"key": "no_robot_detect", "label": "다른 로봇 인식 끄기 (서로 못 보고 겹쳐 지나간다)", "type": "bool", "default": false},
+        {"key": "no_world_obstacles", "label": "월드 장애물 무시 (뷰어 b 로 놓은 것)", "type": "bool", "default": false},
+        {"key": "time_scale", "label": "시간 배속 (1=실시간, 같이 도는 로봇은 같은 값)", "type": "float", "default": 1.0},
         {"group": "물리", "key": "robot_width", "label": "로봇 폭 (m)", "type": "float", "default": 0.5},
         {"group": "물리", "key": "robot_length", "label": "로봇 길이 (m)", "type": "float", "default": 0.7},
         {"group": "물리", "key": "max_velocity", "label": "최대 속도 (m/s)", "type": "float", "default": 1.2},
@@ -83,6 +90,7 @@
         {"group": "물리", "key": "record", "label": "데이터 기록 폴더 (비우면 꺼짐)", "type": "str", "default": ""},
         {"group": "물리", "key": "local_plan_radius", "label": "장애물 우회 계획 반경 (m)", "type": "float", "default": 5.0},
         {"group": "물리", "key": "local_plan_rate", "label": "장애물 우회 계획 주기 (Hz)", "type": "float", "default": 5.0},
+        {"group": "물리", "key": "obstacle_memory", "label": "장애물 기억 시간 (s, 0=끔)", "type": "float", "default": 30.0},
         {"group": "물리", "key": "sensor_range", "label": "장애물 감지 반경 (m)", "type": "float", "default": 3.0},
         {"group": "물리", "key": "log_level", "label": "로그 레벨", "type": "choice", "choices": ["DEBUG", "INFO", "WARNING"], "default": "INFO"},
         {"group": "동적 장애물 (구역을 비우면 꺼짐)", "key": "obstacle_zone", "label": "구역 XMIN,YMIN,XMAX,YMAX", "type": "str", "default": ""},
@@ -145,6 +153,27 @@
       "stop_timeout_s": 15,
       "params": [
         {"key": "scenarios", "label": "시나리오 이름 1개 (비우면 전체)", "type": "str", "default": ""}
+      ]
+    },
+    {
+      "id": "unit_test",
+      "name": "단위 테스트 (make -C robot test)",
+      "mode": "oneshot",
+      "cmd": ["make", "-C", "robot", "test"],
+      "stop_timeout_s": 10
+    },
+    {
+      "id": "scenario",
+      "name": "다중 로봇 시나리오 (run_scenario.py)",
+      "mode": "oneshot",
+      "cmd": ["{python}", "tools/run_scenario.py", "{scenario}", "--time-scale", "{time_scale}",
+              {"if": "viewer", "args": ["--viewer"]}],
+      "needs_build": "build/bin/robot_client",
+      "stop_timeout_s": 15,
+      "params": [
+        {"key": "scenario", "label": "시나리오 파일 (리포 루트 기준)", "type": "str", "default": "scripts/scenarios/head_on.json"},
+        {"key": "time_scale", "label": "시간 배속", "type": "float", "default": 1.0},
+        {"key": "viewer", "label": "뷰어 창 띄우기", "type": "bool", "default": true}
       ]
     },
     {

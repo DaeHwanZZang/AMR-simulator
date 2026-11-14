@@ -50,6 +50,11 @@ struct Args {
     bool path_refine = false;
     double local_plan_radius = 5.0;       // 로컬 계획(장애물 우회) 반경 (m)
     double local_plan_rate = 5.0;         // 로컬 계획 주기 (Hz)
+    double obstacle_memory = 30.0;        // 범위 밖 정지 장애물 기억 시간 (s, 0=끔)
+    double obstacle_memory_max = 300.0;   // 적응형 최대
+    double time_scale = 1.0;              // 시간 배속 (1 = 실시간). 시험/장시간 주행용
+    bool robot_detect = true;             // 다른 로봇을 장애물로 인식 (fms/v1/+/physics 구독)
+    bool world_obstacles = true;          // 월드 장애물 (sim/v1/world/obstacles/+ 구독)
     bool smooth_path = true;              // 곡선 주행 (코너 Bézier + Pure Pursuit)
     bool center_path = true;              // 복도 중앙 주행 (A* 벽 근접 페널티)
     double center_weight = 6.0, center_reach = 1.5;
@@ -114,6 +119,14 @@ bool parse_args(int argc, char** argv, Args& a) {
         else if (k == "--path-refine") a.path_refine = true;
         else if (k == "--local-plan-radius") a.local_plan_radius = std::stod(next(i));
         else if (k == "--local-plan-rate") a.local_plan_rate = std::stod(next(i));
+        else if (k == "--obstacle-memory") a.obstacle_memory = std::stod(next(i));
+        else if (k == "--obstacle-memory-max") a.obstacle_memory_max = std::stod(next(i));
+        else if (k == "--no-robot-detect") a.robot_detect = false;
+        else if (k == "--no-world-obstacles") a.world_obstacles = false;
+        else if (k == "--time-scale") {
+            a.time_scale = std::stod(next(i));
+            if (!(a.time_scale > 0)) throw std::runtime_error("--time-scale must be > 0");
+        }
         else if (k == "--no-smooth-path") a.smooth_path = false;
         else if (k == "--no-center-path") a.center_path = false;
         else if (k == "--center-weight") a.center_weight = std::stod(next(i));
@@ -144,8 +157,12 @@ bool parse_args(int argc, char** argv, Args& a) {
                 "  --battery-low P (기본 20, WARNING LOW_BATTERY) --battery-critical P (기본 5, FATAL + DOCK 오더만)\n"
                 "  --require-localization (UNLOCALIZED 로 시작, INIT_POSITION 힌트/제어판 전에는 오더 거절. 기본은 시작 자세에서 바로 LOCALIZED)\n"
                 "  --seed N --speed-noise R --log-level LV --gui\n"
+                "  --no-robot-detect (다른 로봇을 장애물로 인식하지 않는다. 기본은 인식: 서로 피하고, 부딪히면 COLLISION)\n"
+                "  --no-world-obstacles (뷰어/도구가 놓은 월드 장애물 sim/v1/world/obstacles 를 무시한다)\n"
+                "  --time-scale N (시간 배속, 기본 1 = 실시간. 같이 도는 로봇은 같은 값이어야 한다. FMS 연동 때는 1)\n"
                 "  --path-refine (A* 경로를 PSO 로 다듬기, 기본 꺼짐)\n"
                 "  --local-plan-radius M (장애물 우회 계획 반경, 기본 5) --local-plan-rate HZ (기본 5)\n"
+                "  --obstacle-memory SEC (범위 밖 정지 장애물 기억, 기본 30, 0=끔. 같은 자리에서 다시 보이면 2배) --obstacle-memory-max SEC (기본 300)\n"
                 "  --no-smooth-path (곡선 주행 끄기 = 코너마다 정지·회전, 비교용)\n"
                 "  --no-center-path (복도 중앙 주행 끄기 = 최단 경로) --center-weight W (기본 6) --center-reach M (기본 1.5)\n"
                 "  --friction MU (바퀴-바닥 마찰계수, 기본 0.8. 낮으면 슬립이 생긴다) --mass KG (기본 60)\n"
@@ -329,6 +346,8 @@ int main(int argc, char** argv) {
     executor.smooth_enabled = args.smooth_path;
     executor.local_planner.config.radius = args.local_plan_radius;
     executor.local_plan_rate = args.local_plan_rate;
+    executor.obstacle_memory.config.base_ttl = args.obstacle_memory;
+    executor.obstacle_memory.config.max_ttl = args.obstacle_memory_max;
     executor.centerline.enabled = args.center_path;
     executor.centerline.weight = args.center_weight;
     executor.centerline.reach = args.center_reach;
@@ -340,6 +359,17 @@ int main(int argc, char** argv) {
     executor.map_sync = &map_sync;
 
     RobotComm comm(args.id, args.host, args.port);
+    {
+        // 로봇 사양 보고 (retained). FMS 가 지원 액션으로 후보를 거르고 점유 존 지원을 판정한다.
+        Factsheet sheet;
+        sheet.width = args.robot_width;
+        sheet.length = args.robot_length;
+        sheet.max_speed = args.max_velocity;
+        sheet.actions = {ActionType::PICK, ActionType::DROP, ActionType::CHARGE, ActionType::WAIT,
+                         ActionType::STRAIGHT, ActionType::DOCK, ActionType::PARK};
+        comm.set_factsheet(sheet);
+    }
+    comm.enable_world(args.world_obstacles, args.robot_detect);
     if (!comm.connect()) {
         log::error("[%s] broker connection failed (%s:%d) -- is mosquitto running?", args.id.c_str(),
                    args.host.c_str(), args.port);
@@ -358,7 +388,7 @@ int main(int argc, char** argv) {
     };
     constexpr double TICK_PERIOD = 0.05;
     constexpr double STATE_PERIOD = 0.2;
-    Ticker ticker(clock, TICK_PERIOD);
+    Ticker ticker(clock, TICK_PERIOD, args.time_scale);  // 배속이면 벽시계로 더 자주 돌고 dt 는 시뮬 시간
     ticker.reset();
 
     std::atomic<bool> stop_flag{false};
@@ -393,6 +423,7 @@ int main(int argc, char** argv) {
                 executor.set_map(synced_map.get(), ready->map_uid, ready->map_version);
             }
             while (auto cmd = command_queue.pop()) dispatch_gui_command(executor, comm, map_sync, *cmd);
+            executor.sync_world(comm.snapshot_world(), comm.snapshot_peers());  // 월드 장애물 + 다른 로봇 (꺼져 있으면 빈 목록)
             executor.tick(dt);
             since_state += dt;
             if (auto nav = executor.take_navigation(comm.next_header_id(), clock.now())) comm.publish_navigation(*nav);

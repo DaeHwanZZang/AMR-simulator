@@ -138,7 +138,7 @@ class ZoneType(str, Enum):
     ELEVATOR = "elevator"     # 엘리베이터 구역. 위치 표시용, 호출/탑승 제어는 별도
     PICKUP = "pickup"         # 픽업스테이션 구역. 적재 장치 위치 표시용. 굽지 않고 동작도 없다
     OCCUPANCY = "occupancy"   # 한 대씩 통과하는 점유 존. 정적 이미지에 굽지 않는다
-    SLOW = "slow"             # 감속 구역 (미구현, 예약)
+    SLOW = "slow"             # 감속 구역. 로봇이 구역 안에서 speed_limit 이하로 달린다 (굽지 않는다)
     ONEWAY = "oneway"         # 일방통행 (미구현, 예약)
 
     @classmethod
@@ -171,9 +171,13 @@ class Zone(BaseModel):
     type: ZoneType = ZoneType.PROHIBIT
     polygon: list[Point] = Field(min_length=3, description="꼭짓점 목록 (닫힘은 암묵적)")
     gates: list[TrafficGate] = Field(default_factory=list)
+    speed_limit: Optional[float] = Field(default=None, gt=0, le=10,
+                                         description="감속 구역(slow)의 최고 속도 m/s. 다른 구역에는 없다")
 
     @model_validator(mode="after")
     def _check_polygon(self) -> "Zone":
+        if (self.type == ZoneType.SLOW) != (self.speed_limit is not None):
+            raise ValueError("speed_limit 은 감속 구역(slow)에만, 그리고 반드시 지정해야 한다")
         if self.type == ZoneType.OCCUPANCY:
             rectangle_frame(self.polygon)
             if not self.gates or len({g.gate_id for g in self.gates}) != len(self.gates):

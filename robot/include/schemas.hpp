@@ -182,6 +182,12 @@ struct Order {
 // State : Robot -> FMS
 // =============================================================================
 
+// 싣고 있는 적재물 하나. PICK 이 끝나면 생기고 DROP 이 끝나면 사라진다 (common/schemas.py LoadInfo).
+struct LoadInfo {
+    std::string tray;        // 싣는 순서로 채운다: T1, T2, ...
+    std::string payload_id;
+};
+
 struct State {
     std::string version = PROTOCOL_VERSION;
     long long header_id = 0;
@@ -221,7 +227,28 @@ struct State {
 
     BatteryInfo battery;
     std::vector<ErrorInfo> errors;
+    std::vector<LoadInfo> loads;      // 지금 싣고 있는 적재물 (FMS 가 장부와 대조한다)
     std::vector<ObstacleInfo> detected_obstacles;
+
+    std::string to_json_string() const;
+};
+
+// =============================================================================
+// Factsheet : Robot -> FMS  (fms/v1/{id}/factsheet, retained, 접속할 때 한 번)
+// =============================================================================
+// 바뀌지 않는 로봇 사양. FMS 가 후보 필터(지원 액션)와 점유 존 지원 판정에 쓴다 (common/schemas.py Factsheet).
+struct Factsheet {
+    std::string version = PROTOCOL_VERSION;
+    long long header_id = 0;
+    double timestamp = 0.0;
+    std::string robot_id;
+    std::string model = "amr-sim";
+    double width = 0.5, length = 0.7;
+    double max_speed = 1.0;
+    int trays = 2;
+    std::vector<ActionType> actions;
+    bool traffic_control = true;
+    bool reports_loads = true;
 
     std::string to_json_string() const;
 };
@@ -296,6 +323,9 @@ struct PhysicsDebug {
     // 설정
     double friction = 0, mass = 0, wheel_radius = 0, track = 0, max_wheel_torque = 0;
     double max_velocity = 0, max_acceleration = 0;
+    // 몸체 크기와 지금 맵. 다른 로봇이 이 토픽을 듣고 이 로봇을 장애물로 인식한다 (로봇 간 인식, comm.cpp)
+    double width = 0, length = 0;
+    std::string map_id;  // 비어 있으면 맵 uid 없음 (--map 으로 직접 읽은 맵)
 
     // 경로
     int path_points = 0;
@@ -309,7 +339,7 @@ struct PhysicsDebug {
 // =============================================================================
 // NavigationDebug : Robot -> 뷰어 (프로토콜 밖)
 // =============================================================================
-// Global 예상 경로(현재 위치부터 Order 의 남은 노드를 순서대로 잇는 정적 맵 기준 경로)와 Local 계획 상태.
+// Global 경로(지금 향하는 노드 하나까지의 정상 경로, 다음 구간은 도착한 뒤 생긴다)와 Local 계획 상태.
 // sim/v1/{id}/navigation, retained. 변경 시(+ 5 s 하트비트)만 발행하고 Order 종료/취소 땐 status=IDLE 과 빈 경로로 비운다.
 // 실제로 추종하는 경로는 State.local_path 다 (여기는 예상 경로).
 struct NavigationDebug {
@@ -318,13 +348,9 @@ struct NavigationDebug {
     std::string robot_id;
     std::string order_id;             // 비어 있으면 Order 없음
     int version = 0;                  // Global 경로가 바뀔 때마다 증가
-    std::string status = "IDLE";      // IDLE | READY | PLANNING(계속 계산 중) | PARTIAL(어느 구간 계획 실패)
+    std::string status = "IDLE";      // IDLE(움직이는 구간 없음) | READY(global_path 있음)
     int current_index = 0;            // 지금 향하는 노드 번호
     std::vector<std::pair<double, double>> global_path;
-    int released_points = 0;          // global_path 앞쪽 이만큼이 released 노드까지의 구간 (뒤는 아직 주행 허가 없음)
-    bool truncated = false;           // 노드가 많아 앞쪽 일부만 계산했다
-    int failed_node = -1;             // 계획에 실패한 노드 번호 (없으면 -1)
-    std::string failed_reason;
     bool detour_active = false;       // Local 우회/재경로 중
     bool has_local_goal = false;
     double local_goal_x = 0, local_goal_y = 0;  // 우회 경로가 정상 경로에 합류하는 지점
@@ -334,14 +360,39 @@ struct NavigationDebug {
     std::string to_json_string() const;
 };
 
+// =============================================================================
+// 공유 세계 (시뮬 전용, 프로토콜 밖)
+// =============================================================================
+// 로봇 프로세스는 서로 독립이라, 모두가 같이 보는 장애물과 서로의 몸체는 MQTT 로 맞춘다 (comm.cpp 가 받고 executor.sync_world 가 반영).
+// 월드 장애물: sim/v1/world/obstacles/{id} (retained). 뷰어/도구가 놓는다.
+struct WorldObstacle {
+    std::string id;
+    double x = 0, y = 0, width = 0.4, height = 0.4;  // 중심, 크기 (m)
+    std::string map_id;                               // 비어 있으면 맵 구분 없음
+};
+// 다른 로봇: 그 로봇의 fms/v1/{id}/physics 에서 읽은 참 자세와 몸체 크기.
+struct PeerRobot {
+    std::string id;
+    double x = 0, y = 0, theta = 0;
+    double width = 0.5, length = 0.7;
+    std::string map_id;
+};
+
 constexpr const char* TOPIC_PREFIX = "fms/v1";
 
 std::string topic_order(const std::string& robot_id);
 std::string topic_state(const std::string& robot_id);
 std::string topic_connection(const std::string& robot_id);
+std::string topic_factsheet(const std::string& robot_id);
 std::string topic_instant(const std::string& robot_id);
 std::string topic_sim_teleport(const std::string& robot_id);  // sim/v1/{id}/teleport (시뮬 전용, 프로토콜 밖)
 std::string topic_physics(const std::string& robot_id);
 std::string topic_sim_navigation(const std::string& robot_id);  // sim/v1/{id}/navigation (디버그, retained)
+// 월드 장애물 (시뮬 전용, 프로토콜 밖). 장애물 하나당 retained 토픽 하나: JSON {x, y, width, height, map_id?}, 빈 페이로드 = 삭제.
+// 모든 로봇과 뷰어가 구독해서 같은 장애물을 본다 (나중에 뜬 로봇도 retained 로 받는다).
+std::string topic_sim_world_obstacle(const std::string& obstacle_id);  // sim/v1/world/obstacles/{id}
+constexpr const char* TOPIC_SIM_WORLD_OBSTACLES_PREFIX = "sim/v1/world/obstacles/";
+constexpr const char* TOPIC_SIM_WORLD_OBSTACLES_ALL = "sim/v1/world/obstacles/+";
+constexpr const char* TOPIC_PHYSICS_ALL = "fms/v1/+/physics";
 
 }  // namespace fms

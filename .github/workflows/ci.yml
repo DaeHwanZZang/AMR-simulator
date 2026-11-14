@@ -1,0 +1,66 @@
+# 빌드 + 단위 테스트 (macOS, Ubuntu) + 통합 테스트 일부 (macOS).
+# 통합 테스트(robot/tests/physics_test.py)는 로봇을 실제로 띄워 실시간으로 돌리므로 여기서는 빠르고 안정적인 것만 고른다.
+# 전체 회귀는 로컬에서 돌린다: .venv/bin/python robot/tests/physics_test.py
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install mosquitto cjson qt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python venv
+        run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+      - name: MuJoCo
+        run: robot/tools/setup_mujoco.sh
+      - name: Build
+        run: make -C robot -j3
+      - name: Unit tests
+        run: make -C robot test
+      - name: Planner benchmark (정보용)
+        run: build/bin/plan_bench maps/gachon/fms_map.json 45.5 30 84 30 --repeat 3
+      - name: Integration tests (일부)
+        env:
+          AMR_TEST_TIME_SCALE: "2"
+          AMR_TEST_SCRATCH: ${{ runner.temp }}/physics_test
+        run: .venv/bin/python robot/tests/physics_test.py move straight dock collision curve collide_obstacle world robots
+      - name: Upload robot logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: physics-test-logs-macos
+          path: ${{ runner.temp }}/physics_test/*.log
+          if-no-files-found: ignore
+
+  ubuntu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang build-essential libmosquitto-dev libcjson-dev qt6-base-dev pkg-config \
+            mosquitto jq curl unzip python3-venv python3-pip
+      - name: Python venv
+        run: python3 -m venv .venv && .venv/bin/pip install pip --upgrade
+      - name: MuJoCo
+        run: robot/tools/setup_mujoco.sh
+      - name: Build
+        run: make -C robot -j4
+      - name: Unit tests
+        run: make -C robot test

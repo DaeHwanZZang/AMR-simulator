@@ -4,21 +4,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <map>
+#include <new>
 #include <queue>
-#include <unordered_map>
-#include <unordered_set>
 
 namespace fms {
 
 namespace {
 
 using Px = std::pair<int, int>;
-
-struct PxHash {
-    size_t operator()(const Px& p) const { return (size_t)p.first * 73856093u ^ (size_t)p.second * 19349663u; }
-};
 
 const std::vector<std::tuple<int, int, double>> kNeighbors = {
     {1, 0, 1.0}, {-1, 0, 1.0}, {0, 1, 1.0}, {0, -1, 1.0},
@@ -28,37 +24,63 @@ const std::vector<std::tuple<int, int, double>> kNeighbors = {
 // 정적 팽창 grid 캐시. 맵은 런타임에 안 바뀐다고 가정한다 (planner.py 의 _inflation_cache 와 동일 목적)
 std::map<std::pair<const MapModel*, int>, std::vector<uint8_t>> g_inflation_cache;
 
-std::vector<uint8_t> inflate(const std::vector<uint8_t>& grid, int w, int h, int radius_px) {
-    if (radius_px <= 0) return grid;
-    std::vector<bool> blocked(grid.size());
-    for (size_t i = 0; i < grid.size(); ++i) blocked[i] = grid[i] != 2;
-    std::vector<bool> result = blocked;
+}  // namespace
 
-    for (int dy = -radius_px; dy <= radius_px; ++dy) {
-        for (int dx = -radius_px; dx <= radius_px; ++dx) {
-            if ((dx == 0 && dy == 0) || dx * dx + dy * dy > radius_px * radius_px) continue;
-            int src_y0 = std::max(0, dy), src_y1 = h + std::min(0, dy);
-            int src_x0 = std::max(0, dx), src_x1 = w + std::min(0, dx);
-            int dst_y0 = std::max(0, -dy), dst_x0 = std::max(0, -dx);
-            for (int sy = src_y0, ty = dst_y0; sy < src_y1; ++sy, ++ty) {
-                for (int sx = src_x0, tx = dst_x0; sx < src_x1; ++sx, ++tx) {
-                    if (blocked[(size_t)sy * w + sx]) result[(size_t)ty * w + tx] = true;
-                }
-            }
+// 비-FREE 칸을 반지름 radius_px 원판으로 팽창시킨다: 어떤 칸에서 (dx, dy), dx^2 + dy^2 <= radius_px^2 안에
+// 비-FREE 칸이 있으면 그 칸은 0 이 된다 (맵 밖은 막힘으로 치지 않는다). tools/clean_map.py inflate_free 와 같은 규칙.
+// 구현: 행마다 "같은 행에서 가장 가까운 비-FREE 칸까지의 가로 거리"를 구해 두고, 세로 오프셋 dy 마다 그 행의 가로 거리가
+// 원판의 가로 반폭 floor(sqrt(r^2 - dy^2)) 이하인지 본다. 원판의 모든 오프셋으로 grid 를 밀어 OR 하던 예전 구현과 결과가
+// 같고 (tests/unit 이 무차별 대입과 비교한다), gachon(3872x2272) 에서 수 초 -> 수십 ms 다.
+std::vector<uint8_t> inflate_grid(const std::vector<uint8_t>& grid, int w, int h, int radius_px) {
+    if (radius_px <= 0) return grid;
+    const int cap = radius_px + 1;
+    std::vector<uint16_t> hdist(grid.size());
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* src = grid.data() + (size_t)y * w;
+        uint16_t* row = hdist.data() + (size_t)y * w;
+        int d = cap;
+        for (int x = 0; x < w; ++x) {
+            d = src[x] != 2 ? 0 : std::min(cap, d + 1);
+            row[x] = (uint16_t)d;
+        }
+        d = cap;
+        for (int x = w - 1; x >= 0; --x) {
+            d = src[x] != 2 ? 0 : std::min(cap, d + 1);
+            if (d < row[x]) row[x] = (uint16_t)d;
         }
     }
-    std::vector<uint8_t> out = grid;
-    for (size_t i = 0; i < out.size(); ++i)
-        if (result[i]) out[i] = 0;
+    std::vector<uint16_t> half(2 * radius_px + 1);  // dy 별 원판 가로 반폭
+    for (int dy = -radius_px; dy <= radius_px; ++dy) {
+        int k = 0;
+        while ((k + 1) * (k + 1) + dy * dy <= radius_px * radius_px) ++k;
+        half[dy + radius_px] = (uint16_t)k;
+    }
+    std::vector<uint8_t> out((size_t)w * h);
+    std::vector<uint8_t> hit(w);
+    for (int y = 0; y < h; ++y) {
+        std::fill(hit.begin(), hit.end(), 0);
+        for (int dy = -radius_px; dy <= radius_px; ++dy) {
+            const int yy = y + dy;
+            if (yy < 0 || yy >= h) continue;
+            const uint16_t* row = hdist.data() + (size_t)yy * w;
+            const uint16_t k = half[dy + radius_px];
+            for (int x = 0; x < w; ++x) hit[x] |= (uint8_t)(row[x] <= k);
+        }
+        const uint8_t* src = grid.data() + (size_t)y * w;
+        uint8_t* dst = out.data() + (size_t)y * w;
+        for (int x = 0; x < w; ++x) dst[x] = hit[x] ? 0 : src[x];  // 비-FREE 칸은 hdist 0 이라 항상 hit
+    }
     return out;
 }
+
+namespace {
 
 const std::vector<uint8_t>& get_inflated_grid(const MapModel& map_model, int radius_px) {
     auto key = std::make_pair(&map_model, radius_px);
     auto it = g_inflation_cache.find(key);
     if (it != g_inflation_cache.end()) return it->second;
     const auto& grid = map_model.classify_grid();
-    auto inflated = inflate(grid, map_model.metadata.width_px, map_model.metadata.height_px, radius_px);
+    auto inflated = inflate_grid(grid, map_model.metadata.width_px, map_model.metadata.height_px, radius_px);
     return g_inflation_cache.emplace(key, std::move(inflated)).first->second;
 }
 
@@ -143,51 +165,90 @@ std::vector<Px> simplify_within(const std::vector<Px>& path_px, const std::vecto
     return result;
 }
 
+// A* 작업 버퍼. 칸 번호(y * w + x)로 바로 찾는 평면 배열이고 스레드마다 하나를 계속 다시 쓴다.
+// 큰 맵(수백만 칸)에서 호출마다 초기화하지 않도록 세대 스탬프를 쓴다: mark[i] == gen * 2 면 이번 탐색에서 g 가 있고,
+// gen * 2 + 1 이면 닫혔다. calloc 으로 받아서 탐색이 지나가지 않은 영역은 실제 메모리를 쓰지 않는다.
+struct AstarScratch {
+    double* g = nullptr;
+    int32_t* parent = nullptr;
+    uint32_t* mark = nullptr;
+    size_t capacity = 0;
+    uint32_t gen = 0;
+
+    ~AstarScratch() { release(); }
+    void release() {
+        std::free(g); std::free(parent); std::free(mark);
+        g = nullptr; parent = nullptr; mark = nullptr; capacity = 0;
+    }
+    void begin(size_t cells) {
+        if (cells > capacity || gen >= 0x7ffffff0u) {
+            const size_t want = std::max(cells, capacity);
+            release();
+            g = (double*)std::calloc(want, sizeof(double));
+            parent = (int32_t*)std::calloc(want, sizeof(int32_t));
+            mark = (uint32_t*)std::calloc(want, sizeof(uint32_t));
+            if (!g || !parent || !mark) { release(); throw std::bad_alloc(); }
+            capacity = want;
+            gen = 0;
+        }
+        ++gen;
+    }
+};
+
 // cell_factor(px, py) >= 1: 그 칸에 들어가는 이동 비용 배수. nullptr 이면 1 (최단 경로).
 // 배수가 1 이상이므로 유클리드 휴리스틱은 그대로 허용(admissible)이다.
+// 힙에 넣는 순서와 비용 계산은 예전 해시맵 구현과 같아서 같은 입력이면 같은 경로가 나온다.
+template <class Factor>
 std::optional<std::vector<Px>> astar(Px start, Px goal, const std::vector<uint8_t>& grid, int w, int h,
-                                     const std::function<double(int, int)>* cell_factor = nullptr) {
+                                     const Factor* cell_factor) {
     auto drivable = [&](int px, int py) {
         return px >= 0 && px < w && py >= 0 && py < h && grid[(size_t)py * w + px] == 2;
     };
-    auto heuristic = [](Px a, Px b) { return std::hypot(a.first - b.first, a.second - b.second); };
+    auto heuristic = [&](int x, int y) { return std::hypot(x - goal.first, y - goal.second); };
+    auto index = [&](int x, int y) { return (int32_t)(y * w + x); };
 
-    using Entry = std::pair<double, Px>;
+    thread_local AstarScratch scratch;
+    scratch.begin((size_t)w * h);
+    double* const g = scratch.g;
+    int32_t* const parent = scratch.parent;
+    uint32_t* const mark = scratch.mark;
+    const uint32_t seen = scratch.gen * 2, closed = seen + 1;
+
+    using Entry = std::pair<double, int32_t>;
     auto cmp = [](const Entry& a, const Entry& b) { return a.first > b.first; };
     std::priority_queue<Entry, std::vector<Entry>, decltype(cmp)> open(cmp);
-    open.push({0.0, start});
-    std::unordered_map<Px, Px, PxHash> came_from;
-    std::unordered_map<Px, double, PxHash> g_score;
-    g_score[start] = 0.0;
-    std::unordered_set<Px, PxHash> visited;
+    const int32_t start_i = index(start.first, start.second), goal_i = index(goal.first, goal.second);
+    open.push({0.0, start_i});
+    g[start_i] = 0.0;
+    parent[start_i] = -1;
+    mark[start_i] = seen;
 
     while (!open.empty()) {
-        auto [_, current] = open.top();
+        const int32_t current = open.top().second;
         open.pop();
-        if (visited.count(current)) continue;
-        visited.insert(current);
+        if (mark[current] == closed) continue;
+        mark[current] = closed;
 
-        if (current == goal) {
-            std::vector<Px> path = {current};
-            while (came_from.count(current)) {
-                current = came_from[current];
-                path.push_back(current);
-            }
+        if (current == goal_i) {
+            std::vector<Px> path;
+            for (int32_t i = current; i >= 0; i = parent[i]) path.push_back({i % w, i / w});
             std::reverse(path.begin(), path.end());
             return path;
         }
-        int cx = current.first, cy = current.second;
+        const int cx = current % w, cy = current / w;
+        const double g_current = g[current];
         for (auto& [dx, dy, cost] : kNeighbors) {
-            int nx = cx + dx, ny = cy + dy;
-            Px neighbor{nx, ny};
-            if (visited.count(neighbor) || !drivable(nx, ny)) continue;
+            const int nx = cx + dx, ny = cy + dy;
+            if (!drivable(nx, ny)) continue;
+            const int32_t neighbor = index(nx, ny);
+            if (mark[neighbor] == closed) continue;
             if (dx != 0 && dy != 0 && !(drivable(cx + dx, cy) && drivable(cx, cy + dy))) continue;
-            double tentative = g_score[current] + cost * (cell_factor ? (*cell_factor)(nx, ny) : 1.0);
-            auto it = g_score.find(neighbor);
-            if (it == g_score.end() || tentative < it->second) {
-                came_from[neighbor] = current;
-                g_score[neighbor] = tentative;
-                open.push({tentative + heuristic(neighbor, goal), neighbor});
+            const double tentative = g_current + cost * (cell_factor ? (*cell_factor)(nx, ny) : 1.0);
+            if (mark[neighbor] != seen || tentative < g[neighbor]) {
+                parent[neighbor] = current;
+                g[neighbor] = tentative;
+                mark[neighbor] = seen;
+                open.push({tentative + heuristic(nx, ny), neighbor});
             }
         }
     }
@@ -252,7 +313,7 @@ std::vector<std::pair<double, double>> plan_path(
                           && centering->reach > 0;
     // 벽에서 먼 칸일수록 싸다. 복도에서는 가운데가 가장 싸고, reach 밖(넓은 홀)은 모두 같은 비용이다.
     const double reach_px = centered ? centering->reach / res : 0.0;
-    std::function<double(int, int)> factor = [&](int px, int py) {
+    auto factor = [&](int px, int py) {
         double d = std::min(clearance->dist_at(px, py), reach_px);
         double gap = 1.0 - d / reach_px;
         return 1.0 + centering->weight * gap * gap;
@@ -330,7 +391,7 @@ std::vector<std::pair<double, double>> plan_path_window(
 
     const bool centered = clearance && centering && centering->enabled && centering->weight > 0 && centering->reach > 0;
     const double reach_px = centered ? centering->reach / res : 0.0;
-    std::function<double(int, int)> factor = [&](int px, int py) {
+    auto factor = [&](int px, int py) {
         double d = std::min(clearance->dist_at(px + x0, py + y0), reach_px);
         double gap = 1.0 - d / reach_px;
         return 1.0 + centering->weight * gap * gap;

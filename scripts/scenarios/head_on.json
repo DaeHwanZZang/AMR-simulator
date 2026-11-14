@@ -1,0 +1,19 @@
+{
+  "_설명": "넓은 홀에서 두 로봇이 정면으로 마주 보고 서로의 자리로 간다. 겹치지 않고 비켜 지나가야 한다.",
+  "map": "maps/empty_hall1/fms_map.json",
+  "timeout": 120,
+  "robots": [
+    {"id": "A", "x": 5, "y": 6, "theta": 0},
+    {"id": "B", "x": 20, "y": 6, "theta": 3.14}
+  ],
+  "orders": [
+    {"robot": "A", "at": 1, "path": ["20,6,0"]},
+    {"robot": "B", "at": 1, "path": ["5,6,3.14"]}
+  ],
+  "expect": [
+    {"robot": "A", "pose": [20, 6], "tol": 0.05},
+    {"robot": "B", "pose": [5, 6], "tol": 0.05},
+    {"no_fatal": true},
+    {"min_separation": 0.45}
+  ]
+}
