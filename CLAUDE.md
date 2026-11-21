@@ -34,6 +34,9 @@ FMS(`fms_server`)는 형제 폴더 `../AMR-fms` 별도 리포(private)에 있고
 - 기존 org 리포 `GC-WAYPOINT/AMR_client` 는 원래 `upstream`(fetch 전용, push URL `DISABLED`)으로 썼다. 현재 로컬 클론에는 이 remote 가 없다. 필요하면 다시 추가한다:
   `git remote add upstream <URL> && git remote set-url --push upstream DISABLED`
 - org 에 반영할 버전은 수동으로 가져간다 (cherry-pick/patch). C++ 클라이언트는 `robot/` 아래에 있어 org 루트 레이아웃과 경로가 다르다. 뽑을 때 `git format-patch --relative=robot <범위>` 로 접두를 떼고 org 에서 `git am` 한다.
+- **브랜치 운영 (2026-11-21~)**: `main` = 개인 개발. `collab` = 팀 협업용 안정판. `collab` 은 안정 태그(`v1.x`) 시점만 `--ff-only` 로 올리고 개발 커밋을 직접 얹지 않는다. 시뮬레이터는 사용자 혼자 개발하고 팀은 받아 쓰기만 하므로 팀 PR 은 받지 않는다 (요청은 org Issue).
+- `org` remote = `GC-WAYPOINT/AMR-simulator` (팀이 보는 곳). `collab` 만 내보낸다.
+  릴리스: `git tag -a v1.x` (main) → `git switch collab && git merge --ff-only v1.x` → `git push origin collab` → `git push org collab:main` (+ `git push org v1.x`). org 로 push 하기 전에는 사용자 확인을 받는다.
 - `viewer/`, `broker/` 는 `git subtree` 로 원본 이력을 보존해 합쳤다. 기준 태그 `v1.1` = PSO 작업 직전.
 
 ## 명령 (리포 루트에서 실행)
